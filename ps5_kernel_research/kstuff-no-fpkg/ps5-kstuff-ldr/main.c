@@ -111,8 +111,14 @@ int main() {
     uintptr_t* hack = (uintptr_t*)(hacky_args + sizeof(payload_args_t));
     *hack = (uintptr_t)&kernel_dynlib_dlsym;
 
+    printf("ldr: entry=%p base=%p e_entry=0x%lx\n", (void*)entry, base, (unsigned long)ehdr->e_entry);
+    printf("ldr: hack[0x30]=0x%lx hack[0x38]=0x%lx\n",
+           *(unsigned long*)(hacky_args + 0x30),
+           *(unsigned long*)(hacky_args + 0x38));
+    printf("ldr: calling entry...\n");
     entry(hacky_args);
-    
+    printf("ldr: entry returned, payloadout=%d\n", *args->payloadout);
+
     if(*args->payloadout == 0) {
         puts("patching app.db");
         *args->payloadout = patch_app_db();
