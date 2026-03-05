@@ -18,7 +18,7 @@ extern void* (*kernel_dynlib_dlsym)(int pid, unsigned int handle, const char* sy
 extern int (*f_usleep)(unsigned int usec);
 extern int (*printf)(const char* fmt, ...);
 
-#define sleepy_printf(fmt, ...) do { printf(fmt, ##__VA_ARGS__); f_usleep(100* 1000); } while(0)
+#define sleepy_printf(fmt, ...) do { /*printf(fmt, ##__VA_ARGS__); f_usleep(100* 1000);*/ } while(0)
 
 #define PS5_KSTUFF_LDR_BASE 0x0000000926100000
 
@@ -1032,7 +1032,6 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d, void* (*t_kernel_dynl
 
 
     kmemzero((void*)shared_area, 4096);
-
     uint64_t uelf_virt_base = (find_empty_pml4_index(0) << 39) | (-1ull << 48);
     uint64_t dmem_virt_base = (find_empty_pml4_index(1) << 39) | (-1ull << 48);
     shared_area = virt2phys(shared_area) + dmem_virt_base;
