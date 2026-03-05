@@ -108,18 +108,30 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
         regs[RIP] = (uint64_t)copyin;
     }
     else if (nr == 6)
-    {   
+    {
         LOG("Handling kmalloc kekcall\n");
         //
         // malloc with rwx
+        // Build custom frame: doreti_iret -> TRAP_KEKCALL,5 handler
+        // which stores malloc result in td_retval and restores debug regs
         //
-        kpoke64(regs[RDI]+td_retval, 0);
+        uint64_t td = regs[RDI]; // save thread pointer before overwriting
+        uint64_t stack_frame[14] = {
+            (uint64_t)doreti_iret,
+            MKTRAP(TRAP_KEKCALL, 5),
+            [12] = td, // save td for return value storage
+        };
+        read_dbgregs(stack_frame+6);
+        push_stack(regs, stack_frame, sizeof(stack_frame));
+
+        kpoke64(td+td_retval, 0);
         regs[RDI] = args[RDI];
         regs[RSI] = (uint64_t) M_something;
         regs[RDX] = 0x1;
         regs[RIP] = (uint64_t) malloc;
 
-        start_syscall_with_dbgregs(regs, dbgregs_for_kfunction_fixes);
+        set_pcb_dbregs();
+        write_dbgregs(dbgregs_for_kfunction_fixes);
     } 
     else if (nr == 7)
     {
@@ -215,5 +227,19 @@ void handle_kekcall_trap(uint64_t* regs, uint32_t trap)
         if(trap == 3 && !(uint32_t)regs[RAX])
             kpoke64(stack_frame[5]+td_retval, kpeek64(stack_frame[6]+td_retval));
         regs[RIP] = stack_frame[13];
+    }
+    else if(trap == 5)
+    {
+        // Return from kekcall nr=6 (malloc with RWX)
+        // RAX has the malloc result, store it in td_retval and set RAX=0
+        // Stack layout after pop (shifted by 1 due to doreti_iret consumed by ret):
+        //   [0]=MKTRAP, [1..4]=0, [5..10]=saved_dr, [11]=td, [12]=0, [13]=syscall_after
+        uint64_t stack_frame[14];
+        pop_stack(regs, stack_frame, sizeof(stack_frame));
+        uint64_t td = stack_frame[11];
+        kpoke64(td+td_retval, regs[RAX]); // store malloc result in td_retval
+        regs[RAX] = 0; // success error code
+        write_dbgregs(stack_frame+5); // restore original debug regs
+        regs[RIP] = stack_frame[13]; // return to syscall_after
     }
 }
