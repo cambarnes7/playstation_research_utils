@@ -106,13 +106,12 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    memset(hacky_args, 0, 0x200);
     memcpy(hacky_args, args, sizeof(payload_args_t));
     uintptr_t* hack = (uintptr_t*)(hacky_args + sizeof(payload_args_t));
     *hack = (uintptr_t)&kernel_dynlib_dlsym;
 
     entry(hacky_args);
-
+    
     if(*args->payloadout == 0) {
         puts("patching app.db");
         *args->payloadout = patch_app_db();
