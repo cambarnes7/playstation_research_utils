@@ -2,6 +2,7 @@
 *.elf.*
 *.map
 *.o
+*.a
 *.bin
 *.bin.*
 uelf
