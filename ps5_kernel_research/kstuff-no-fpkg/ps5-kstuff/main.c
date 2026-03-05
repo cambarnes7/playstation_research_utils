@@ -1032,6 +1032,13 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d, void* (*t_kernel_dynl
 
 
     kmemzero((void*)shared_area, 4096);
+
+    // Allocate kernel memory for the uelf log buffer
+    uint64_t uelf_log_buffer = (uint64_t)kmalloc(4096);
+    kmemzero((void*)uelf_log_buffer, 4096);
+    uint64_t uelf_log_pos = (uint64_t)kmalloc(8);
+    kmemzero((void*)uelf_log_pos, 8);
+
     uint64_t uelf_virt_base = (find_empty_pml4_index(0) << 39) | (-1ull << 48);
     uint64_t dmem_virt_base = (find_empty_pml4_index(1) << 39) | (-1ull << 48);
     shared_area = virt2phys(shared_area) + dmem_virt_base;
@@ -1058,6 +1065,9 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d, void* (*t_kernel_dynl
         ".ist4"+zero,
         ".pcpu"+zero,
         "shared_area"+zero,
+        "uelf_log_buffer_kptr"+zero,
+        "uelf_log_buffer_size"+zero,
+        "uelf_log_buffer_pos_kptr"+zero,
         ".tss"+zero,
         ".uelf_cr3"+zero,
         ".uelf_entry"+zero,
@@ -1084,6 +1094,9 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d, void* (*t_kernel_dynl
         0x1239,                // .ist4
         0x1234,                // .pcpu
         shared_area,           // shared_area
+        uelf_log_buffer,       // uelf_log_buffer_kptr
+        0x1000,                // uelf_log_buffer_size
+        uelf_log_pos,          // uelf_log_buffer_pos_kptr
         0x123a,                // .tss
         0x1235,                // .uelf_cr3
         0x1236,                // .uelf_entry
