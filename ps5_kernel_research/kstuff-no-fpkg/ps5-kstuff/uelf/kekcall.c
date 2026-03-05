@@ -135,17 +135,18 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
     } 
     else if (nr == 7)
     {
-        // kproc_create
+        // kproc_create(func, arg, newpp, flags, pages, fmt, ...)
+        // args[RDI]=func, args[RSI]=arg, args[RDX]=kproc_name
+        // fmt is the 6th parameter (R9), NOT a variadic arg
         printf("Calling kproc_create on address %lx\n", args[RDI]);
         kpoke64(regs[RDI]+td_retval, 0);
-        regs[RDI] = args[RDI];
-        regs[RSI] = args[RSI];
-        regs[RDX] = 0;
-        regs[RCX] = 0;
-        regs[R8] = 0;
-        regs[R9] = 0;
-        kpoke64(regs[RSP] + 0x10, args[RDX]);
-        
+        regs[RDI] = args[RDI];      // func = exec_code
+        regs[RSI] = args[RSI];      // arg = kthread_args
+        regs[RDX] = 0;              // newpp = NULL
+        regs[RCX] = 0;              // flags = 0
+        regs[R8] = 0;               // pages = 0
+        regs[R9] = args[RDX];       // fmt = kproc_name
+
         regs[RIP] = (uint64_t) kproc_create;
 
     }

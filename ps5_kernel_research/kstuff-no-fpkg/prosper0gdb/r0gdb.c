@@ -1144,7 +1144,9 @@ uint64_t r0gdb_kmem_alloc(size_t sz) {
 
 uint64_t r0gdb_kproc_create(uint64_t kfn, uint64_t kthread_args, uint64_t kproc_name)
 {
-    return r0gdb_kfncall(offsets.kproc_create, kfn, kthread_args, 0, 0, 0, 0, kproc_name);
+    // kproc_create(func, arg, newpp, flags, pages, fmt)
+    // fmt is the 6th param (R9), kproc_name goes there directly
+    return r0gdb_kfncall(offsets.kproc_create, kfn, kthread_args, 0, 0, 0, kproc_name);
 }
 
 
