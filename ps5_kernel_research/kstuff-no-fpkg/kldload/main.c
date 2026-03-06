@@ -995,18 +995,11 @@ static void _kldload(void* data, size_t data_size)
         }
 
         printf("\n=== END DMAP PIVOT SCAN ===\n");
-    } else if (magic == 0x53524350) { /* "SRCP" - suspend register capture */
+    } else if (magic == 0x53524350) { /* "SRCP" - suspend register capture / persistence test */
         uint32_t status = (uint32_t)(readback[0] >> 32);
-        uint32_t call_count = ((uint32_t*)&readback[5])[0];
-        uint32_t hooked_slot = ((uint32_t*)&readback[5])[1];
         uint64_t ktext = readback[2];
         uint64_t kdata = readback[1];
         uint64_t apic_addr = readback[3];
-
-        static const char* rnames[] = {
-            "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "R8 ",
-            "R9 ", "R10", "R11", "R12", "R13", "R14", "R15", "RSP", "FLG"
-        };
 
         static const char* slot_names[] = {
             "create", "init", "xapic_mode", "is_x2apic",
@@ -1019,27 +1012,25 @@ static void _kldload(void* data, size_t data_size)
             "slot26", "slot27"
         };
 
-        printf("\n=== SUSPEND REGISTER CAPTURE ===\n");
+        /* Detect v4 persistence test: slot 2 unchanged (readback[122] == readback[123])
+         * and marker_base at [34] is a ktext addr */
+        int is_v4 = (readback[122] == readback[123]) &&
+                     (readback[34] >= ktext && readback[34] < kdata) &&
+                     (readback[36] != 0); /* has test slot data */
+
+        printf("\n=== SUSPEND %s ===\n",
+               is_v4 ? "PERSISTENCE TEST (v4)" : "REGISTER CAPTURE");
         printf("  status:        %s\n",
                status == 1 ? "ARMED FOR SUSPEND" :
-               status == 0xAAAA ? "CAPTURING..." :
+               status == 0xAAAA ? "IN PROGRESS..." :
                status == 0xFF ? "ERROR" : "unknown");
         printf("  kdata_base:    %#lx\n", kdata);
         printf("  ktext_base:    %#lx\n", ktext);
         printf("  apic_ops @:    %#lx\n", apic_addr);
         printf("  orig xapic:    %#lx (ktext+%#lx)\n", readback[4], readback[4] - ktext);
-        printf("  armed_target:  %#lx", readback[34]);
-        if (readback[34] >= ktext && readback[34] < kdata)
-            printf(" (ktext+%#lx)", readback[34] - ktext);
-        else if ((readback[34] >> 40) == 0xffffff)
-            printf(" (heap - capture_stub trampoline)");
-        printf("\n");
-        printf("  capture_stub:  %#lx\n", readback[35]);
-        printf("  captures:      %u (hooked slot %u = %s)\n", call_count,
-               hooked_slot, hooked_slot < 28 ? slot_names[hooked_slot] : "?");
 
-        /* Show apic_ops table dump */
-        printf("\n  --- apic_ops table dump ---\n");
+        /* Show apic_ops table dump (pre-modification snapshot) */
+        printf("\n  --- apic_ops table (pre-modification snapshot) ---\n");
         for (int i = 0; i < 28; i++) {
             uint64_t ptr = readback[6 + i];
             if (ptr == 0) continue;
@@ -1047,124 +1038,86 @@ static void _kldload(void* data, size_t data_size)
                    i, slot_names[i], ptr, ptr - ktext);
         }
 
-        /* Register captures */
-        for (uint32_t c = 0; c < call_count && c < 4; c++) {
-            printf("\n  --- Capture %u (registers at apic_ops[%u] entry) ---\n",
-                   c, hooked_slot);
-            for (int i = 0; i < 17; i++) {
-                uint64_t val = readback[36 + c * 17 + i];
-                const char* note = "";
-                if (i == 16) {
-                    printf("    %s: %#018lx\n", rnames[i], val);
-                    continue;
-                }
-                if (val == apic_addr)
-                    note = " <-- apic_ops table! PIVOT CANDIDATE";
-                else if (val >= apic_addr && val <= apic_addr + 0xE0)
-                    note = " <-- inside apic_ops! PIVOT CANDIDATE";
-                else if (val >= ktext && val < kdata)
-                    note = " [ktext]";
-                else if (val >= kdata && val < kdata + 0x10000000)
-                    note = " [kdata]";
-                else if ((val >> 40) == 0xffffff)
-                    note = " [kern_heap]";
-                else if ((val >> 40) == 0xffffd7 || (val >> 40) == 0xffffe0 ||
-                         (val >> 40) == 0xffff80 || (val >> 40) == 0xffffee)
-                    note = " [dmap/kernel]";
-                printf("    %s: %#018lx%s\n", rnames[i], val, note);
+        if (is_v4) {
+            /* v4: kdata persistence test */
+            printf("\n  --- Persistence Test Markers ---\n");
+            printf("  marker_base:   %#lx (ktext+%#lx)\n",
+                   readback[34], readback[34] - ktext);
+            printf("  apic_ops[2]:   %#lx (UNCHANGED) %s\n",
+                   readback[122],
+                   readback[122] == readback[4] ? "[OK - original]" : "[MODIFIED!]");
+
+            /* Test slot results */
+            struct { int slot; const char* name; int base_idx; } tests[] = {
+                {0, "create",  36},
+                {1, "init",    39},
+                {7, "set_id",  42},
+            };
+            printf("\n  --- Marker Slots (safe, not called during resume) ---\n");
+            int all_ok = 1;
+            for (int t = 0; t < 3; t++) {
+                uint64_t orig = readback[tests[t].base_idx];
+                uint64_t marker = readback[tests[t].base_idx + 1];
+                uint64_t rb = readback[tests[t].base_idx + 2];
+                int write_ok = (rb == marker);
+                if (!write_ok) all_ok = 0;
+                printf("  slot[%d] %-8s: orig=%#lx marker=%#lx readback=%#lx %s\n",
+                       tests[t].slot, tests[t].name,
+                       orig, marker, rb,
+                       write_ok ? "[WRITE OK]" : "[WRITE FAILED]");
             }
-        }
 
-        /* Stability analysis across captures */
-        if (call_count >= 2) {
-            printf("\n  --- Stability Analysis (across %u captures) ---\n", call_count);
-            for (int i = 0; i < 16; i++) {
-                int stable = 1;
-                uint64_t first = readback[36 + i];
-                for (uint32_t c = 1; c < call_count && c < 4; c++) {
-                    if (readback[36 + c * 17 + i] != first) {
-                        stable = 0;
-                        break;
-                    }
-                }
-                if (stable && first != 0)
-                    printf("    %s: STABLE at %#018lx%s\n", rnames[i], first,
-                           (first == apic_addr || (first >= apic_addr && first <= apic_addr + 0xE0))
-                           ? " *** PIVOT TARGET ***" : "");
+            /* kdata marker results */
+            printf("\n  --- kdata Markers (near apic_ops) ---\n");
+            printf("  past_table @%#lx: wrote=%#lx readback=%#lx %s\n",
+                   readback[45], readback[46], readback[47],
+                   readback[46] == readback[47] ? "[OK]" : "[FAILED]");
+            if (readback[49] != 0) {
+                printf("  before_table @%#lx: wrote=%#lx readback=%#lx %s\n",
+                       readback[48], readback[49], readback[50],
+                       readback[49] == readback[50] ? "[OK]" : "[FAILED]");
+            } else {
+                printf("  before_table @%#lx: SKIPPED (held important data)\n",
+                       readback[48]);
             }
-        }
 
-        /* Suspend arming status */
-        printf("\n  --- Suspend Arming ---\n");
-        printf("  apic_ops[2] armed: %#lx\n", readback[122]);
-        printf("  apic_ops[2] readback: %#lx %s\n", readback[123],
-               readback[122] == readback[123] ? "[WRITE OK]" : "[WRITE FAILED]");
-        printf("  sentinel: %#lx %s\n", readback[104],
-               readback[104] == 0xdeadbeefcafe0005ULL ? "[OK]" : "[MISSING]");
+            printf("\n  sentinel: %#lx %s\n", readback[104],
+                   readback[104] == 0xdeadbeefcafe0005ULL ? "[OK]" : "[MISSING]");
+            printf("  second sentinel: %#lx %s\n", readback[121],
+                   readback[121] == 0xfeedface00000005ULL ? "[OK]" : "[MISSING]");
 
-        /* Phase 1 probe metadata */
-        printf("\n  Phase 1 probe info:\n");
-        uint64_t slots_tried = readback[105];
-        uint64_t slots_hit = readback[106];
-        uint64_t first_hit = readback[107];
-        printf("    slots_tried: %#lx", slots_tried);
-        if (slots_tried) {
-            printf(" (");
-            for (int i = 0; i < 28; i++)
-                if ((slots_tried >> i) & 1)
-                    printf("%s(%d) ", i < 28 ? slot_names[i] : "?", i);
-            printf(")");
-        }
-        printf("\n    slots_hit:   %#lx\n", slots_hit);
-        printf("    first_hit:   %#lx\n", first_hit);
-        printf("    second sentinel: %#lx %s\n", readback[121],
-               readback[121] == 0xfeedface00000005ULL ? "[OK]" : "[MISSING]");
-
-        if (status == 1) {
-            if ((readback[34] >> 40) == 0xffffff)
-                printf("\n  >>> apic_ops[2] ARMED with capture_stub trampoline (heap) <<<\n");
-            else
-                printf("\n  >>> apic_ops[2] ARMED with ktext target <<<\n");
-            printf("  >>> capture_stub → saves regs → calls original xapic_mode <<<\n");
-            printf("  >>> Enter rest mode now to test suspend! <<<\n");
-            printf("  >>> After resume: run KTST restore (fw_ver=3) to clean up <<<\n");
-        }
-
-        /* Pivot recommendation based on register analysis */
-        if (call_count > 0) {
-            printf("\n  --- Pivot Recommendation ---\n");
-            int found_pivot = 0;
-            for (int i = 0; i < 16; i++) {
-                uint64_t val = readback[36 + i];
-                if (val == apic_addr || (val >= apic_addr && val <= apic_addr + 0xE0)) {
-                    int stable = 1;
-                    for (uint32_t c = 1; c < call_count && c < 4; c++) {
-                        if (readback[36 + c * 17 + i] != val) {
-                            stable = 0;
-                            break;
-                        }
-                    }
-                    if (stable || call_count == 1) {
-                        printf("    %s = %#lx (apic_ops%+ld)\n",
-                               rnames[i], val, (long)(val - apic_addr));
-                        printf("    => Need: xchg rsp, %s; ret  (or equivalent pivot)\n",
-                               i == 0 ? "rax" : i == 1 ? "rbx" : i == 2 ? "rcx" :
-                               i == 3 ? "rdx" : i == 4 ? "rsi" : i == 5 ? "rdi" :
-                               i == 6 ? "rbp" : i == 7 ? "r8"  : i == 8 ? "r9"  :
-                               i == 9 ? "r10" : i == 10 ? "r11" : i == 11 ? "r12" :
-                               i == 12 ? "r13" : i == 13 ? "r14" : "r15");
-                        printf("    => ROP chain goes at apic_ops+offset as function pointers\n");
-                        found_pivot = 1;
-                    }
-                }
+            if (status == 1) {
+                printf("\n  >>> SAFE PERSISTENCE TEST ARMED <<<\n");
+                printf("  >>> apic_ops[2] is UNTOUCHED — resume will work normally <<<\n");
+                printf("  >>> Enter rest mode, then after resume: <<<\n");
+                printf("  >>>   1. Re-run etaHEN exploit <<<\n");
+                printf("  >>>   2. Send kldload.elf <<<\n");
+                printf("  >>>   3. Read back apic_ops slots 0,1,7 to check persistence <<<\n");
             }
-            if (!found_pivot) {
-                printf("    No register holds apic_ops pointer.\n");
-                printf("    Look for registers with kdata/heap pointers for alternative pivots.\n");
-            }
+        } else {
+            /* Legacy v1-v3 format */
+            uint32_t call_count = ((uint32_t*)&readback[5])[0];
+            uint32_t hooked_slot = ((uint32_t*)&readback[5])[1];
+
+            printf("  captures:      %u (hooked slot %u = %s)\n", call_count,
+                   hooked_slot, hooked_slot < 28 ? slot_names[hooked_slot] : "?");
+            printf("  armed_target:  %#lx", readback[34]);
+            if (readback[34] >= ktext && readback[34] < kdata)
+                printf(" (ktext+%#lx)", readback[34] - ktext);
+            else if ((readback[34] >> 40) == 0xffffff)
+                printf(" (heap - capture_stub trampoline)");
+            printf("\n");
+
+            printf("\n  --- Suspend Arming ---\n");
+            printf("  apic_ops[2] armed: %#lx\n", readback[122]);
+            printf("  apic_ops[2] readback: %#lx %s\n", readback[123],
+                   readback[122] == readback[123] ? "[WRITE OK]" : "[WRITE FAILED]");
+            printf("  sentinel: %#lx %s\n", readback[104],
+                   readback[104] == 0xdeadbeefcafe0005ULL ? "[OK]" : "[MISSING]");
         }
 
-        printf("\n=== END SUSPEND REGISTER CAPTURE ===\n");
+        printf("\n=== END SUSPEND %s ===\n",
+               is_v4 ? "PERSISTENCE TEST" : "REGISTER CAPTURE");
     } else if (magic == 0x4B545354) { /* "KTST" - ktext redirect test */
         uint32_t mode = (uint32_t)(readback[0] >> 32);
         uint64_t ktext = readback[2];
