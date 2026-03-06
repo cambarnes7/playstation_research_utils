@@ -1457,7 +1457,12 @@ int main()
         }
         close(client_fd);
 
-        if (total > 0) {
+        if (total == 4) {
+            /* 4-byte message = fw_ver override command */
+            uint32_t new_fw = *(uint32_t*)buf;
+            printf("[debug] fw_ver override: 0x%x -> 0x%x\n", fw_version, new_fw);
+            fw_version = new_fw;
+        } else if (total > 0) {
             printf("Read %zd bytes!, calling callback...\n", total);
             _kldload(buf, total);
         } else {
