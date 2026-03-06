@@ -1424,12 +1424,15 @@ static void _kldload(void* data, size_t data_size)
         printf("  status:          %s\n",
                status == 1 ? "PASS (onfault works!)" :
                status == 2 ? "NO FAULT (unexpected)" :
-               status == 0xFF ? "ERROR" : "UNKNOWN");
+               status == 0xAAAA ? "THREAD DIED (wrong offset)" :
+               status == 0xFD ? "BAD OFFSET (out of range)" :
+               status == 0xFF ? "ERROR (no PCB)" : "UNKNOWN");
         printf("  kdata_base:      %#lx\n", readback[1]);
         printf("  ktext_base:      %#lx\n", readback[2]);
         printf("  curthread:       %#lx\n", readback[3]);
         printf("  td_pcb:          %#lx\n", readback[4]);
         printf("  onfault offset:  %#lx\n", readback[5]);
+        printf("  prev value:      %#lx\n", readback[9]);
         printf("  recovery addr:   %#lx\n", readback[6]);
         printf("  fault result:    %#lx %s\n", readback[7],
                readback[7] == 0xCAFE0001 ? "(RECOVERED)" : "(no recovery)");
@@ -1442,6 +1445,10 @@ static void _kldload(void* data, size_t data_size)
         if (status == 1) {
             printf("\n  >>> pcb_onfault CONFIRMED at PCB+%#lx <<<\n", readback[5]);
             printf("  >>> Ready for v18 execute-test scanner <<<\n");
+        } else if (status == 0xAAAA) {
+            printf("\n  Offset +%#lx is NOT pcb_onfault (thread crashed)\n",
+                   readback[5]);
+            printf("  Set next offset: printf '\\xNN\\x01\\x00\\x00' | nc PS5 9022\n");
         }
 
         printf("\n=== END PCB_ONFAULT TEST ===\n");

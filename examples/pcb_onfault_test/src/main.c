@@ -1,11 +1,16 @@
 #include <stdint.h>
 
 /*
- * pcb_onfault_test — Verify pcb_onfault offset empirically
+ * pcb_onfault_test v2 — Verify pcb_onfault offset empirically
  *
- * Sets pcb+0x108 to a recovery address, then deliberately faults.
- * If pcb_onfault is correct, the fault handler jumps to recovery
- * instead of panicking. Reports success/failure via output buffer.
+ * Takes the PCB offset to test from args->fw_ver.
+ * Use the fw_ver override command to set the offset before sending:
+ *   printf '\x10\x01\x00\x00' | nc PS5 9022   # test offset 0x110
+ *   nc PS5 9022 < pcb_onfault_test.bin
+ *
+ * Sets pcb+<offset> to a recovery address, then deliberately faults.
+ * If pcb_onfault is at that offset, the fault handler jumps to recovery.
+ * If wrong, the thread dies (but system survives).
  *
  * Output layout (uint64_t indices):
  *   [0]     magic "ONFT" (0x4f4e4654) | status(32)
@@ -17,18 +22,13 @@
  *   [6]     value written to pcb_onfault (recovery address)
  *   [7]     fault test result: 0xCAFE0001 = recovered, 0 = didn't fault
  *   [8]     value read back from faulting address (if no fault)
- *   [9]     eflags/error code if available
- *   [10]    pcb_onfault value AFTER test (should be 0, kernel clears it)
+ *   [9]     pcb value at offset BEFORE write (for diagnostics)
+ *   [10]    pcb_onfault value AFTER test (should be 0 if kernel clears it)
  *   [11]    sentinel 0xdeadbeefcafe0019
  */
 
 #define MAGIC_ONFT  0x4f4e4654  /* "ONFT" */
-
-#define PCPU_ARRAY_OFF  0x64d2280
-#define TD_PCB          0x3f8
-
-/* The offset we're testing */
-#define PCB_ONFAULT_OFF 0x108
+#define TD_PCB      0x3f8
 
 typedef struct {
     uint64_t kdata_base;
@@ -47,14 +47,10 @@ static inline uint64_t read8(uint64_t addr)
     return *(volatile uint64_t*)addr;
 }
 
-static inline void write8(uint64_t addr, uint64_t val)
-{
-    *(volatile uint64_t*)addr = val;
-}
-
 int module_start(kproc_args* args)
 {
     uint64_t kdata_base = args->kdata_base;
+    uint32_t test_offset = args->fw_ver;
     volatile uint64_t* out = (volatile uint64_t*)args;
     volatile uint32_t* out32 = (volatile uint32_t*)args;
 
@@ -71,6 +67,15 @@ int module_start(kproc_args* args)
     out[1] = kdata_base;
     out[2] = ktext_base;
 
+    /* Validate offset range */
+    if (test_offset < 0x100 || test_offset > 0x148 || (test_offset & 7) != 0) {
+        /* Bad offset — refuse to run */
+        out[5] = test_offset;
+        out32[1] = 0xFD;  /* bad offset */
+        out[11] = 0xdeadbeefcafe0019ULL;
+        return 0;
+    }
+
     /* Get curthread and PCB */
     uint64_t curthread;
     __asm__ volatile("movq %%gs:0, %0" : "=r"(curthread));
@@ -78,7 +83,7 @@ int module_start(kproc_args* args)
 
     uint64_t td_pcb = read8(curthread + TD_PCB);
     out[4] = td_pcb;
-    out[5] = PCB_ONFAULT_OFF;
+    out[5] = test_offset;
 
     if (!td_pcb) {
         out32[1] = 0xFF;  /* error */
@@ -86,78 +91,69 @@ int module_start(kproc_args* args)
         return 0;
     }
 
-    /*
-     * The test:
-     * 1. Set pcb+0x108 to address of our recovery code
-     * 2. Try to read from unmapped address 0xDEAD000000000000
-     * 3. If fault recovery works, we land at recovery and set marker
-     * 4. If it panics, offset is wrong
-     *
-     * FreeBSD's trap handler checks pcb_onfault: if non-NULL on a
-     * page fault, it sets tf_rip = pcb_onfault and returns.
-     * The faulting instruction's result register gets 0 or -1 depending
-     * on the specific copyin/copyout wrapper.
-     *
-     * We use inline asm to set up a recovery label and do the
-     * faulting load, so we can detect if we reached recovery.
-     */
+    /* Read current value at the test offset (for diagnostics) */
+    out[9] = read8(td_pcb + test_offset);
 
     volatile uint64_t fault_result = 0;
     volatile uint64_t read_val = 0;
 
     /*
-     * Use asm to:
-     * 1. Write recovery address to pcb_onfault
-     * 2. Attempt faulting read
-     * 3. Recovery label clears pcb_onfault and sets marker
+     * The asm block:
+     * - r15 = td_pcb base address
+     * - r14 = test_offset
+     * - Write recovery address to pcb+offset
+     * - Attempt faulting read from 0xDEAD000000000000
+     * - Recovery label sets 0xCAFE0001 marker
      */
     __asm__ volatile(
-        /* Save pcb address in r15 (callee-saved, we restore later) */
         "movq %[pcb], %%r15\n\t"
+        "movq %[offset], %%r14\n\t"
+        "addq %%r15, %%r14\n\t"        /* r14 = pcb + offset */
 
-        /* Calculate address of .Lrecovery and write to pcb+0x108 */
-        "leaq .Lrecovery(%%rip), %%rax\n\t"
-        "movq %%rax, %[recovery_addr]\n\t"       /* save for output */
-        "movq %%rax, 0x108(%%r15)\n\t"            /* set pcb_onfault */
+        /* Write recovery address */
+        "leaq .Lrecovery2(%%rip), %%rax\n\t"
+        "movq %%rax, %[recovery_addr]\n\t"
+        "movq %%rax, (%%r14)\n\t"       /* pcb[offset] = recovery */
 
-        /* Attempt the faulting read */
+        /* Attempt faulting read */
         "movabsq $0xDEAD000000000000, %%rax\n\t"
-        "movq (%%rax), %%rbx\n\t"                 /* THIS SHOULD FAULT */
+        "movq (%%rax), %%rbx\n\t"       /* SHOULD FAULT */
 
-        /* If we get here, no fault occurred (unexpected) */
+        /* No fault path */
         "movq %%rbx, %[read_val]\n\t"
-        "jmp .Ldone\n\t"
+        "movq $0, (%%r14)\n\t"          /* clean up */
+        "jmp .Ldone2\n\t"
 
-        ".Lrecovery:\n\t"
-        /* Fault handler jumped here! pcb_onfault worked! */
-        /* Clear pcb_onfault so we don't interfere with anything */
-        "movq $0, 0x108(%%r15)\n\t"
+        ".Lrecovery2:\n\t"
+        /* Fault recovered! Clear onfault and set marker */
+        "movq $0, (%%r14)\n\t"
         "movl $0xCAFE, %%eax\n\t"
         "shlq $16, %%rax\n\t"
         "orq $0x0001, %%rax\n\t"
         "movq %%rax, %[fault_result]\n\t"
 
-        ".Ldone:\n\t"
+        ".Ldone2:\n\t"
         : [fault_result] "=m"(fault_result),
           [read_val] "=m"(read_val),
           [recovery_addr] "=m"(out[6])
-        : [pcb] "r"(td_pcb)
-        : "rax", "rbx", "r15", "memory"
+        : [pcb] "r"(td_pcb),
+          [offset] "r"((uint64_t)test_offset)
+        : "rax", "rbx", "r14", "r15", "memory"
     );
 
     out[7] = fault_result;
     out[8] = read_val;
 
-    /* Read back pcb_onfault after test (should be 0) */
-    out[10] = read8(td_pcb + PCB_ONFAULT_OFF);
+    /* Read back the offset after test */
+    out[10] = read8(td_pcb + test_offset);
 
     out[11] = 0xdeadbeefcafe0019ULL;
 
     /* Set final status */
     if (fault_result == 0xCAFE0001)
-        out32[1] = 0x0001;  /* PASS - onfault works! */
+        out32[1] = 0x0001;  /* PASS */
     else
-        out32[1] = 0x0002;  /* no fault occurred (weird) */
+        out32[1] = 0x0002;  /* no fault */
 
     return 0;
 }
