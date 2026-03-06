@@ -135,11 +135,18 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
     } 
     else if (nr == 7)
     {
-        // kproc_create(func, arg, newpp, flags, pages, fmt, ...)
-        // args[RDI]=func, args[RSI]=arg, args[RDX]=kproc_name
-        // fmt is the 6th parameter (R9), NOT a variadic arg
-        printf("Calling kproc_create on address %lx\n", args[RDI]);
-        kpoke64(regs[RDI]+td_retval, 0);
+        // kproc_create(func, arg, newpp, flags, pages, fmt)
+        // Must set up a return frame so kproc_create can ret properly
+        LOG("Handling kproc_create kekcall\n");
+        uint64_t td = regs[RDI];
+        uint64_t stack_frame[14] = {
+            (uint64_t)doreti_iret,
+            MKTRAP(TRAP_KEKCALL, 6),
+            [12] = td,
+        };
+        push_stack(regs, stack_frame, sizeof(stack_frame));
+
+        kpoke64(td+td_retval, 0);
         regs[RDI] = args[RDI];      // func = exec_code
         regs[RSI] = args[RSI];      // arg = kthread_args
         regs[RDX] = 0;              // newpp = NULL
@@ -148,7 +155,6 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
         regs[R9] = args[RDX];       // fmt = kproc_name
 
         regs[RIP] = (uint64_t) kproc_create;
-
     }
     
     else if(nr == 0xffffffff)
@@ -232,15 +238,22 @@ void handle_kekcall_trap(uint64_t* regs, uint32_t trap)
     else if(trap == 5)
     {
         // Return from kekcall nr=6 (malloc with RWX)
-        // RAX has the malloc result, store it in td_retval and set RAX=0
-        // Stack layout after pop (shifted by 1 due to doreti_iret consumed by ret):
-        //   [0]=MKTRAP, [1..4]=0, [5..10]=saved_dr, [11]=td, [12]=0, [13]=syscall_after
         uint64_t stack_frame[14];
         pop_stack(regs, stack_frame, sizeof(stack_frame));
         uint64_t td = stack_frame[11];
-        kpoke64(td+td_retval, regs[RAX]); // store malloc result in td_retval
-        regs[RAX] = 0; // success error code
-        write_dbgregs(stack_frame+5); // restore original debug regs
-        regs[RIP] = stack_frame[13]; // return to syscall_after
+        kpoke64(td+td_retval, regs[RAX]);
+        regs[RAX] = 0;
+        write_dbgregs(stack_frame+5);
+        regs[RIP] = stack_frame[13];
+    }
+    else if(trap == 6)
+    {
+        // Return from kekcall nr=7 (kproc_create)
+        uint64_t stack_frame[14];
+        pop_stack(regs, stack_frame, sizeof(stack_frame));
+        uint64_t td = stack_frame[11];
+        kpoke64(td+td_retval, regs[RAX]);
+        regs[RAX] = 0;
+        regs[RIP] = stack_frame[13];
     }
 }
