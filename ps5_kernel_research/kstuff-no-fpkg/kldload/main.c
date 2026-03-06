@@ -408,6 +408,67 @@ static void _kldload(void* data, size_t data_size)
         }
 
         printf("\n=== END GADGET PROBE ===\n");
+    } else if (magic == 0x41504344) { /* "APCD" - apic_ops dump */
+        uint64_t ktext_base = readback[2];
+        uint64_t apic_addr = readback[3];
+        int num_apic = (int)readback[4];
+        int num_sysent = (int)readback[33];
+
+        printf("\n=== APIC_OPS + KTEXT FUNCTION MAP ===\n");
+        printf("  kdata_base:  %#lx\n", readback[1]);
+        printf("  ktext_base:  %#lx\n", ktext_base);
+        printf("  apic_ops @:  %#lx (kdata+0x1656b0)\n", apic_addr);
+
+        printf("\n  --- apic_ops[0..%d] function pointers ---\n", num_apic - 1);
+        for (int i = 0; i < num_apic && i < 28; i++) {
+            uint64_t ptr = readback[5 + i];
+            if (ptr >= ktext_base && ptr < ktext_base + 0xC00000)
+                printf("  apic_ops[%2d]: %#lx (ktext+%#lx)\n", i, ptr, ptr - ktext_base);
+            else if (ptr == 0)
+                printf("  apic_ops[%2d]: (null)\n", i);
+            else
+                printf("  apic_ops[%2d]: %#lx (NOT in ktext!)\n", i, ptr);
+        }
+
+        printf("\n  --- sysent ktext function pointers (%d unique, sorted) ---\n", num_sysent);
+        for (int i = 0; i < num_sysent && i < 200; i++) {
+            uint64_t ptr = readback[34 + i];
+            printf("  sysent_func[%3d]: %#lx (ktext+%#lx)\n", i, ptr, ptr - ktext_base);
+        }
+
+        /* Print gaps between consecutive apic_ops functions for epilogue probing */
+        printf("\n  --- apic_ops function gaps (epilogue probe targets) ---\n");
+        printf("  (probe bytes just BEFORE each entry point for pop;ret gadgets)\n");
+        /* Collect and sort non-null apic_ops ptrs */
+        uint64_t sorted_apic[28];
+        int sa_count = 0;
+        for (int i = 0; i < num_apic && i < 28; i++) {
+            uint64_t p = readback[5 + i];
+            if (p >= ktext_base && p < ktext_base + 0xC00000)
+                sorted_apic[sa_count++] = p;
+        }
+        /* Sort */
+        for (int i = 1; i < sa_count; i++) {
+            uint64_t key = sorted_apic[i];
+            int j = i - 1;
+            while (j >= 0 && sorted_apic[j] > key) {
+                sorted_apic[j + 1] = sorted_apic[j];
+                j--;
+            }
+            sorted_apic[j + 1] = key;
+        }
+        for (int i = 0; i < sa_count; i++) {
+            uint64_t addr = sorted_apic[i];
+            int gap = (i + 1 < sa_count) ? (int)(sorted_apic[i + 1] - addr) : -1;
+            printf("  %#lx (ktext+%#06lx)", addr, addr - ktext_base);
+            if (gap >= 0)
+                printf("  gap=%d bytes → probe %#lx to %#lx\n",
+                       gap, addr + 1, sorted_apic[i + 1] - 1);
+            else
+                printf("  (last)\n");
+        }
+
+        printf("\n=== END APIC DUMP ===\n");
     } else {
         /* Generic readback - check for test markers */
         uint64_t val0 = readback[0];
