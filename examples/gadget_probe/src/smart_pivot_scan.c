@@ -230,6 +230,13 @@ int module_start(kproc_args* args)
     pcb_onfault_ptr = find_pcb_onfault(out);
     out[9] = pcb_onfault_ptr;  /* 0 = not found (diagnostic mode) */
 
+    /* v5.2c: early return to isolate panic source.
+     * If we get readback, the panic is in func-list building or probing.
+     * If we still panic, it's in the init code above. */
+    out[0] = ((uint64_t)0xDDDD << 32) | MAGIC_SPVT;
+    out[8] = 0xC0DE52C0;  /* marker: early return taken */
+    return 0;
+
     /* Build sorted function list */
     int n_funcs = 0;
 
