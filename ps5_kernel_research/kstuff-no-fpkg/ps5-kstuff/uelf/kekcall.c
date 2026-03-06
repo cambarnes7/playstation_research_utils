@@ -147,14 +147,40 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
     else if (nr == 8)
     {
         //
-        // Direct copyin: copyin(user_addr, kernel_addr, size)
-        // Uses kernel's own copyin function
+        // DMEM-based copyin: copy from user VA to kernel VA via physical memory
+        // Bypasses kernel copyin() which crashes for malloc'd addresses
         //
-        kpoke64(regs[RDI]+td_retval, 0);
-        regs[RDI] = args[RDI];  // user address (source)
-        regs[RSI] = args[RSI];  // kernel address (dest)
-        regs[RDX] = args[RDX];  // size
-        regs[RIP] = (uint64_t) copyin;
+        uint64_t user_addr = args[RDI];
+        uint64_t kernel_addr = args[RSI];
+        uint64_t size = args[RDX];
+        uint64_t phys_src, phys_src_end;
+        uint64_t phys_dst, phys_dst_end;
+
+        while(size > 0) {
+            // Resolve user VA to physical
+            if(!virt2phys(user_addr, &phys_src, &phys_src_end)) {
+                args[RAX] = EFAULT;
+                return EFAULT;
+            }
+            // Resolve kernel VA to physical
+            if(!virt2phys(kernel_addr, &phys_dst, &phys_dst_end)) {
+                args[RAX] = EFAULT;
+                return EFAULT;
+            }
+            // Chunk size = min of remaining bytes, src page remainder, dst page remainder
+            size_t chunk = phys_src_end - phys_src;
+            if(phys_dst_end - phys_dst < chunk)
+                chunk = phys_dst_end - phys_dst;
+            if(size < chunk)
+                chunk = size;
+            // Copy via DMEM: physical src -> physical dst
+            memcpy(DMEM + phys_dst, DMEM + phys_src, chunk);
+            user_addr += chunk;
+            kernel_addr += chunk;
+            size -= chunk;
+        }
+        args[RAX] = 0;
+        return 0;
     }
     else if(nr == 0xffffffff)
     {
