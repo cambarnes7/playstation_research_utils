@@ -5,9 +5,9 @@
 #include "structs.h"
 #include "traps.h"
 
-int virt2phys(uint64_t addr, uint64_t* phys, uint64_t* phys_limit)
+int virt2phys_cr3(uint64_t addr, uint64_t* phys, uint64_t* phys_limit, uint64_t cr3)
 {
-    uint64_t pml = cr3_phys;
+    uint64_t pml = cr3;
     for(int i = 39; i >= 12; i -= 9)
     {
         if(pml >= ((1ull << 39) - (1ull << 12))) //dmem mapping size
@@ -32,6 +32,11 @@ int virt2phys(uint64_t addr, uint64_t* phys, uint64_t* phys_limit)
         }
         pml = next_pml & ((1ull << 52) - (1ull << 12));
     }
+}
+
+int virt2phys(uint64_t addr, uint64_t* phys, uint64_t* phys_limit)
+{
+    return virt2phys_cr3(addr, phys, phys_limit, cr3_phys);
 }
 
 int copy_from_kernel(void* dst, uint64_t src, uint64_t sz)

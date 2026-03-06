@@ -14,6 +14,7 @@ extern char dmem[];
 #define  CRASH() uint8_t(*p)() = NULL; p() // crash with page fault
 
 int virt2phys(uint64_t addr, uint64_t* phys, uint64_t* phys_limit);
+int virt2phys_cr3(uint64_t addr, uint64_t* phys, uint64_t* phys_limit, uint64_t cr3);
 int copy_from_kernel(void* dst, uint64_t src, uint64_t sz);
 int copy_to_kernel(uint64_t dst, const void* src, uint64_t sz);
 void run_gadget(uint64_t* regs);

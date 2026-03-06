@@ -150,6 +150,14 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
         // DMEM-based copyin: copy from user VA to kernel VA via physical memory
         // Bypasses kernel copyin() which crashes for malloc'd addresses
         //
+        // Get user process CR3 from td -> proc -> vmspace -> pmap -> pm_cr3
+        // cr3_phys (kernel CR3) doesn't map user addresses (KPTI)
+        //
+        uint64_t td = regs[RDI];
+        uint64_t proc = kpeek64(td + td_proc);
+        uint64_t vmspace = kpeek64(proc + 0x200);    // p_vmspace
+        uint64_t user_cr3 = kpeek64(vmspace + 0x2E0 + 0x28); // pmap.pm_cr3
+
         uint64_t user_addr = args[RDI];
         uint64_t kernel_addr = args[RSI];
         uint64_t size = args[RDX];
@@ -157,12 +165,12 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
         uint64_t phys_dst, phys_dst_end;
 
         while(size > 0) {
-            // Resolve user VA to physical
-            if(!virt2phys(user_addr, &phys_src, &phys_src_end)) {
+            // Resolve user VA via user process CR3
+            if(!virt2phys_cr3(user_addr, &phys_src, &phys_src_end, user_cr3)) {
                 args[RAX] = EFAULT;
                 return EFAULT;
             }
-            // Resolve kernel VA to physical
+            // Resolve kernel VA via kernel CR3
             if(!virt2phys(kernel_addr, &phys_dst, &phys_dst_end)) {
                 args[RAX] = EFAULT;
                 return EFAULT;
