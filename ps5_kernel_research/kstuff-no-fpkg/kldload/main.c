@@ -1012,14 +1012,16 @@ static void _kldload(void* data, size_t data_size)
             "slot26", "slot27"
         };
 
-        /* Detect v4 persistence test: slot 2 unchanged (readback[122] == readback[123])
-         * and marker_base at [34] is a ktext addr */
-        int is_v4 = (readback[122] == readback[123]) &&
+        /* Detect v5: version_tag at [35] == 0x0005 */
+        int is_v5 = (readback[35] == 0x0005);
+        /* Detect v4: slot 2 unchanged and marker_base is ktext addr */
+        int is_v4 = !is_v5 && (readback[122] == readback[123]) &&
                      (readback[34] >= ktext && readback[34] < kdata) &&
-                     (readback[36] != 0); /* has test slot data */
+                     (readback[36] != 0);
 
-        printf("\n=== SUSPEND %s ===\n",
-               is_v4 ? "PERSISTENCE TEST (v4)" : "REGISTER CAPTURE");
+        const char* ver_str = is_v5 ? "PERSISTENCE TEST (v5)" :
+                              is_v4 ? "PERSISTENCE TEST (v4)" : "REGISTER CAPTURE";
+        printf("\n=== SUSPEND %s ===\n", ver_str);
         printf("  status:        %s\n",
                status == 1 ? "ARMED FOR SUSPEND" :
                status == 0xAAAA ? "IN PROGRESS..." :
@@ -1038,47 +1040,30 @@ static void _kldload(void* data, size_t data_size)
                    i, slot_names[i], ptr, ptr - ktext);
         }
 
-        if (is_v4) {
-            /* v4: kdata persistence test */
-            printf("\n  --- Persistence Test Markers ---\n");
-            printf("  marker_base:   %#lx (ktext+%#lx)\n",
-                   readback[34], readback[34] - ktext);
-            printf("  apic_ops[2]:   %#lx (UNCHANGED) %s\n",
+        if (is_v5) {
+            /* v5: pure kdata persistence test — NO apic_ops modifications */
+            uint64_t marker_region = readback[5];
+            int marker_count = (int)readback[34];
+            if (marker_count > 16) marker_count = 16;
+
+            printf("\n  --- v5 Pure kdata Persistence Test ---\n");
+            printf("  marker_region: %#lx (kdata+%#lx)\n",
+                   marker_region, marker_region - kdata);
+            printf("  marker_count:  %d\n", marker_count);
+            printf("  apic_ops[2]:   %#lx (UNTOUCHED) %s\n",
                    readback[122],
                    readback[122] == readback[4] ? "[OK - original]" : "[MODIFIED!]");
 
-            /* Test slot results */
-            struct { int slot; const char* name; int base_idx; } tests[] = {
-                {0, "create",  36},
-                {1, "init",    39},
-                {7, "set_id",  42},
-            };
-            printf("\n  --- Marker Slots (safe, not called during resume) ---\n");
+            printf("\n  --- Marker Write Verification ---\n");
             int all_ok = 1;
-            for (int t = 0; t < 3; t++) {
-                uint64_t orig = readback[tests[t].base_idx];
-                uint64_t marker = readback[tests[t].base_idx + 1];
-                uint64_t rb = readback[tests[t].base_idx + 2];
-                int write_ok = (rb == marker);
-                if (!write_ok) all_ok = 0;
-                printf("  slot[%d] %-8s: orig=%#lx marker=%#lx readback=%#lx %s\n",
-                       tests[t].slot, tests[t].name,
-                       orig, marker, rb,
-                       write_ok ? "[WRITE OK]" : "[WRITE FAILED]");
-            }
-
-            /* kdata marker results */
-            printf("\n  --- kdata Markers (near apic_ops) ---\n");
-            printf("  past_table @%#lx: wrote=%#lx readback=%#lx %s\n",
-                   readback[45], readback[46], readback[47],
-                   readback[46] == readback[47] ? "[OK]" : "[FAILED]");
-            if (readback[49] != 0) {
-                printf("  before_table @%#lx: wrote=%#lx readback=%#lx %s\n",
-                       readback[48], readback[49], readback[50],
-                       readback[49] == readback[50] ? "[OK]" : "[FAILED]");
-            } else {
-                printf("  before_table @%#lx: SKIPPED (held important data)\n",
-                       readback[48]);
+            for (int i = 0; i < marker_count; i++) {
+                uint64_t orig = readback[36 + i];
+                uint64_t wrote = readback[52 + i];
+                uint64_t rb = readback[68 + i];
+                int ok = (rb == wrote);
+                if (!ok) all_ok = 0;
+                printf("  [%2d] orig=%#018lx wrote=%#018lx rb=%#018lx %s\n",
+                       i, orig, wrote, rb, ok ? "[OK]" : "[FAILED]");
             }
 
             printf("\n  sentinel: %#lx %s\n", readback[104],
@@ -1086,14 +1071,19 @@ static void _kldload(void* data, size_t data_size)
             printf("  second sentinel: %#lx %s\n", readback[121],
                    readback[121] == 0xfeedface00000005ULL ? "[OK]" : "[MISSING]");
 
-            if (status == 1) {
-                printf("\n  >>> SAFE PERSISTENCE TEST ARMED <<<\n");
-                printf("  >>> apic_ops[2] is UNTOUCHED — resume will work normally <<<\n");
-                printf("  >>> Enter rest mode, then after resume: <<<\n");
+            if (status == 1 && all_ok) {
+                printf("\n  >>> PERSISTENCE TEST ARMED — apic_ops UNTOUCHED <<<\n");
+                printf("  >>> %d markers written to kdata @ %#lx <<<\n",
+                       marker_count, marker_region);
+                printf("  >>> Enter rest mode. After resume: <<<\n");
                 printf("  >>>   1. Re-run etaHEN exploit <<<\n");
-                printf("  >>>   2. Send kldload.elf <<<\n");
-                printf("  >>>   3. Read back apic_ops slots 0,1,7 to check persistence <<<\n");
+                printf("  >>>   2. Send kldload.elf + readback payload <<<\n");
+                printf("  >>>   3. Check if markers survived at kdata+%#lx <<<\n",
+                       marker_region - kdata);
             }
+        } else if (is_v4) {
+            /* v4: DEPRECATED — slots 0,1,7 cause panic on resume */
+            printf("\n  [v4 format — known to cause panic, use v5 instead]\n");
         } else {
             /* Legacy v1-v3 format */
             uint32_t call_count = ((uint32_t*)&readback[5])[0];
@@ -1116,8 +1106,7 @@ static void _kldload(void* data, size_t data_size)
                    readback[104] == 0xdeadbeefcafe0005ULL ? "[OK]" : "[MISSING]");
         }
 
-        printf("\n=== END SUSPEND %s ===\n",
-               is_v4 ? "PERSISTENCE TEST" : "REGISTER CAPTURE");
+        printf("\n=== END SUSPEND %s ===\n", ver_str);
     } else if (magic == 0x4B545354) { /* "KTST" - ktext redirect test */
         uint32_t mode = (uint32_t)(readback[0] >> 32);
         uint64_t ktext = readback[2];
