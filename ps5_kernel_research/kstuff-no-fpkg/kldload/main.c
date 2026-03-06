@@ -1227,17 +1227,23 @@ static void _kldload(void* data, size_t data_size)
         printf("  pc_curpmap:      %#lx\n", readback[78]);
         printf("  pc_scratch_rsp:  %#lx\n", readback[79]);
 
-        /* Idle thread stack dump */
-        printf("\n  --- Idle thread stack top (32 qwords) ---\n");
-        uint64_t idle_kstack = readback[16];
-        uint64_t idle_pages = readback[17];
-        if (idle_kstack && idle_pages) {
-            uint64_t stack_top = idle_kstack + idle_pages * 4096;
+        /* Stack dump around idle pcb_rsp */
+        uint64_t idle_pcb_rsp_ref = readback[113];
+        uint64_t idle_pcb_rbp_ref = readback[114];
+        printf("\n  --- Stack dump around idle pcb_rsp ---\n");
+        printf("  idle pcb_rsp:    %#lx\n", idle_pcb_rsp_ref);
+        printf("  idle pcb_rbp:    %#lx\n", idle_pcb_rbp_ref);
+        if (idle_pcb_rsp_ref >= 0xFFFF800000000000ULL) {
+            uint64_t dump_start = idle_pcb_rsp_ref - 128;
             for (int i = 0; i < 32; i++) {
-                uint64_t addr = stack_top - 256 + (i * 8);
+                uint64_t addr = dump_start + (i * 8);
                 uint64_t val = readback[43 + i];
                 const char* note = "";
-                if (val >= ktext && val < kdata)
+                if (addr == idle_pcb_rsp_ref)
+                    note = " <-- pcb_rsp";
+                else if (addr == idle_pcb_rbp_ref)
+                    note = " <-- pcb_rbp";
+                else if (val >= ktext && val < kdata)
                     note = " [ktext]";
                 else if (val >= kdata && val < kdata + 0x10000000)
                     note = " [kdata]";
@@ -1245,10 +1251,30 @@ static void _kldload(void* data, size_t data_size)
                     note = " [kern_heap]";
                 printf("  [%#lx] %#018lx%s\n", addr, val, note);
             }
+        } else {
+            printf("  (no valid pcb_rsp, stack dump skipped)\n");
         }
 
-        printf("\n  sentinel: %#lx [%s]\n", readback[75],
+        /* Thread struct offset scanner results */
+        printf("\n  --- Thread struct offset scan (idle thread) ---\n");
+        uint64_t hit_count = readback[80];
+        printf("  hits found:      %lu (kernel-addr values at offsets 0x200..0x3F0)\n", hit_count);
+        for (uint64_t h = 0; h < hit_count && h < 16; h++) {
+            uint64_t off = readback[81 + h * 2];
+            uint64_t val = readback[81 + h * 2 + 1];
+            const char* note = "";
+            /* Check if page-aligned (potential kstack base) */
+            if ((val & 0xFFF) == 0)
+                note = " [page-aligned, possible td_kstack]";
+            else if (val >= idle_pcb_rsp_ref - 0x10000 && val <= idle_pcb_rsp_ref + 0x10000)
+                note = " [near pcb_rsp]";
+            printf("  thread+%#lx:  %#lx%s\n", off, val, note);
+        }
+
+        printf("\n  sentinel[75]:  %#lx [%s]\n", readback[75],
                readback[75] == 0xdeadbeefcafe0022ULL ? "OK" : "MISSING");
+        printf("  sentinel[120]: %#lx [%s]\n", readback[120],
+               readback[120] == 0xdeadbeefcafe0033ULL ? "OK" : "MISSING");
 
         printf("\n=== END PCPU RECON ===\n");
     } else if (magic == 0x534B5052) { /* "SKPR" - suspend stack probe */
@@ -1259,18 +1285,24 @@ static void _kldload(void* data, size_t data_size)
         printf("\n=== SUSPEND STACK PROBE ===\n");
         printf("  status:          %s\n",
                status == 1 ? "PASS" : status == 0xAAAA ? "IN PROGRESS" :
-               status == 0xFF ? "ERROR (bad mode)" : "UNKNOWN");
+               status == 0xFF ? "ERROR (bad mode)" :
+               status == 0xFE ? "ERROR (invalid pcb_rsp)" : "UNKNOWN");
         printf("  kdata_base:      %#lx\n", kdata);
         printf("  ktext_base:      %#lx\n", ktext);
 
         if (status == 0xFF) {
             printf("\n  *** MODE ERROR: fw_ver was not 0x403 or 0x2 ***\n");
             printf("  *** Likely bug: fw_ver read after buffer zeroed ***\n");
+        } else if (status == 0xFE) {
+            printf("\n  *** SAFETY CHECK FAILED: invalid pcb_rsp ***\n");
+            printf("  idle_pcb:        %#lx\n", readback[2]);
+            printf("  pcb_rsp:         %#lx\n", readback[3]);
+            printf("  *** No markers written, no crash risk ***\n");
         } else if (readback[100] == 0xdeadbeefcafe0023ULL) {
             /* Mode 0 (ARM) output */
             printf("\n  --- Mode 0: ARM ---\n");
-            printf("  idle_kstack:     %#lx\n", readback[3]);
-            printf("  idle_pages:      %lu\n", readback[4]);
+            printf("  idle_pcb:        %#lx\n", readback[3]);
+            printf("  pcb_rsp (center):%#lx\n", readback[4]);
             printf("  idle_pcb_rsp:    %#lx\n", readback[5]);
             printf("  idle_pcb_rip:    %#lx\n", readback[6]);
             printf("  marker_grid:     %#lx .. %#lx\n", readback[7], readback[8]);

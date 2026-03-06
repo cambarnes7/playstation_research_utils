@@ -1,49 +1,15 @@
 #include <stdint.h>
 
 /*
- * pcpu_recon — Per-CPU / thread / stack reconnaissance
+ * pcpu_recon v2 — Per-CPU / thread / stack reconnaissance + offset scanner
  *
- * Dumps critical kernel structures needed for the suspend ROP chain:
- *   1. pcpu[0] fields: curthread, idlethread, curpcb
- *   2. Thread fields: td_kstack, td_pcb, td_name
- *   3. Stack address ranges for both curthread and idlethread
- *   4. PCB fields: pcb_rsp, pcb_rbp, pcb_flags (includes PCB_DBREGS)
- *   5. Debug register current values (DR0-DR3, DR6, DR7)
- *
- * This tells us:
- *   - Where the idle thread's kernel stack is (used during suspend/resume)
- *   - What the PCB saved RSP is (approximate resume stack pointer)
- *   - Whether debug registers are currently set
- *
- * All reads are from kdata — completely safe, no ktext access.
- *
- * FreeBSD 11 amd64 structure offsets (PS5 FW 4.03):
- *   pcpu size: ~0x480 (per-cpu struct)
- *   Key pcpu fields:
- *     pc_curthread:   +0x0   (struct thread *)
- *     pc_idlethread:  +0x10  (struct thread *)
- *     pc_curpcb:      +0x18  (struct pcb *)
- *     pc_cpuid:       +0x34  (u_int)
- *     pc_curpmap:     +0x258 (struct pmap *)
- *
- *   Key thread fields (from kek.asm structs.inc):
- *     td_proc:        +0x008 (struct proc *)
- *     td_name:        +0x290 (char[MAXCOMLEN+1])
- *     td_pcb:         +0x3f8 (struct pcb *)
- *     td_kstack:      +0x2a8 (vm_offset_t) — kernel stack base
- *     td_kstack_pages:+0x2b0 (int) — stack size in pages
- *     td_retval:      +0x408 (register_t[2])
- *
- *   Key PCB fields:
- *     pcb_r15-r12:    +0x00..+0x18
- *     pcb_rbp:        +0x20
- *     pcb_rsp:        +0x28
- *     pcb_rbx:        +0x30
- *     pcb_rip:        +0x38
- *     pcb_fsbase:     +0x40
- *     pcb_gsbase:     +0x48
- *     pcb_flags:      +0x100
- *     pcb_dr0..dr7:   +0x110..+0x140
+ * v2 CHANGES:
+ *   - Added thread struct offset scanner: scans idle thread struct from
+ *     offset 0x200 to 0x400 looking for values that look like kernel
+ *     stack addresses (in 0xFFFFFF80xxxxxxxx range, near pcb_rsp).
+ *     This helps find the correct td_kstack offset on PS5.
+ *   - Uses PCB-based stack dump as fallback when td_kstack is 0
+ *   - Dumps 32 qwords around idle thread's pcb_rsp for stack context
  *
  * Output layout (uint64_t indices):
  *   [0]   magic "PCPU" (0x50435055) | status(32)
@@ -54,29 +20,29 @@
  *   --- pcpu[0] fields ---
  *   [4]   pc_curthread
  *   [5]   pc_idlethread
- *   [6]   pc_curpcb
- *   [7]   pc_cpuid (32-bit, zero-extended)
+ *   [6]   pc_fpcurthread
+ *   [7]   pc_curpcb
  *
  *   --- curthread info ---
- *   [8]   curthread->td_kstack (kernel stack base)
+ *   [8]   curthread->td_kstack (may be 0 if offset wrong)
  *   [9]   curthread->td_kstack_pages
  *   [10]  curthread->td_pcb
  *   [11]  curthread->td_proc
  *   [12..15] curthread->td_name (first 32 bytes)
  *
  *   --- idlethread info ---
- *   [16]  idlethread->td_kstack
+ *   [16]  idlethread->td_kstack (may be 0 if offset wrong)
  *   [17]  idlethread->td_kstack_pages
  *   [18]  idlethread->td_pcb
  *   [19]  idlethread->td_proc
  *   [20..23] idlethread->td_name (first 32 bytes)
  *
  *   --- curthread PCB (saved context) ---
- *   [24]  pcb_rsp (saved RSP during last context switch)
+ *   [24]  pcb_rsp
  *   [25]  pcb_rbp
  *   [26]  pcb_rip
  *   [27]  pcb_rbx
- *   [28]  pcb_r12..r15 packed or individual
+ *   [28]  pcb_r12
  *   [29]  pcb_flags
  *
  *   --- idlethread PCB ---
@@ -87,7 +53,7 @@
  *   [34]  pcb_flags
  *
  *   --- Current debug register values ---
- *   [35]  DR0 (read via mov rax, dr0)
+ *   [35]  DR0
  *   [36]  DR1
  *   [37]  DR2
  *   [38]  DR3
@@ -95,22 +61,38 @@
  *   [40]  DR7
  *
  *   --- Current live RSP, RBP ---
- *   [41]  current RSP (for stack location reference)
+ *   [41]  current RSP
  *   [42]  current RBP
  *
- *   --- Stack dump: 32 qwords from idle thread's stack top ---
- *   [43..74] idle_kstack + (pages*4096) - 256 .. - 0
+ *   --- Stack dump: 32 qwords around idle pcb_rsp ---
+ *   [43..74] 128 bytes below pcb_rsp .. 128 bytes above pcb_rsp
  *
  *   [75]  sentinel 0xdeadbeefcafe0022
+ *
+ *   --- Extra pcpu fields ---
+ *   [76]  pc_rsp0
+ *   [77]  pc_cpuid
+ *   [78]  pc_curpmap
+ *   [79]  pc_scratch_rsp
+ *
+ *   --- Thread struct offset scan (idle thread) ---
+ *   Scans offsets 0x200..0x3F0 (step 8) for kernel stack-like addresses.
+ *   Reports up to 16 "hits" (values in 0xFFFFFF80xxxxxxxx range).
+ *   [80]  number of hits found
+ *   [81..112] pairs: (offset, value) for each hit (16 max = 32 slots)
+ *
+ *   [113] idle pcb_rsp (for reference during analysis)
+ *   [114] idle pcb_rbp
+ *
+ *   [120] sentinel 0xdeadbeefcafe0033
  */
 
 #define MAGIC_PCPU       0x50435055  /* "PCPU" */
 
 /* FW 4.03 pcpu_array offset from kdata_base */
 #define PCPU_ARRAY_OFF   0x64d2280
-#define PCPU_SIZE        0x480
 
-/* pcpu field offsets (FreeBSD 11 amd64) */
+/* pcpu field offsets */
 #define PC_CURTHREAD     0x00
 #define PC_IDLETHREAD    0x08
 #define PC_FPCURTHREAD   0x10
@@ -139,12 +121,6 @@
 #define PCB_RBX          0x30
 #define PCB_RIP          0x38
 #define PCB_FLAGS        0x100
-#define PCB_DR0          0x110
-#define PCB_DR1          0x118
-#define PCB_DR2          0x120
-#define PCB_DR3          0x128
-#define PCB_DR6          0x130
-#define PCB_DR7          0x138
 
 typedef struct {
     uint64_t kdata_base;
@@ -204,7 +180,7 @@ int module_start(kproc_args* args)
     out[6] = fpcurthread;
     out[7] = curpcb;
 
-    /* Extra pcpu fields at indices 76-79 (after sentinel) */
+    /* Extra pcpu fields */
     out[76] = rsp0;
     out[77] = cpuid;
     out[78] = read8(pcpu0 + PC_CURPMAP);
@@ -216,7 +192,6 @@ int module_start(kproc_args* args)
         out[9]  = read8(curthread + TD_KSTACK_PAGES);
         out[10] = read8(curthread + TD_PCB);
         out[11] = read8(curthread + TD_PROC);
-        /* thread name (first 32 bytes) */
         out[12] = read8(curthread + TD_NAME);
         out[13] = read8(curthread + TD_NAME + 8);
         out[14] = read8(curthread + TD_NAME + 16);
@@ -229,7 +204,6 @@ int module_start(kproc_args* args)
         out[17] = read8(idlethread + TD_KSTACK_PAGES);
         out[18] = read8(idlethread + TD_PCB);
         out[19] = read8(idlethread + TD_PROC);
-        /* thread name */
         out[20] = read8(idlethread + TD_NAME);
         out[21] = read8(idlethread + TD_NAME + 8);
         out[22] = read8(idlethread + TD_NAME + 16);
@@ -243,7 +217,7 @@ int module_start(kproc_args* args)
         out[25] = read8(cur_pcb_addr + PCB_RBP);
         out[26] = read8(cur_pcb_addr + PCB_RIP);
         out[27] = read8(cur_pcb_addr + PCB_RBX);
-        out[28] = read8(cur_pcb_addr + PCB_R12);  /* r12 */
+        out[28] = read8(cur_pcb_addr + PCB_R12);
         out[29] = read8(cur_pcb_addr + PCB_FLAGS);
     }
 
@@ -272,29 +246,51 @@ int module_start(kproc_args* args)
     __asm__ volatile("mov %%dr7, %0" : "=r"(dr_val));
     out[40] = dr_val;
 
-    /* ── Current live RSP, RBP (for reference) ── */
+    /* ── Current live RSP, RBP ── */
     uint64_t rsp_val, rbp_val;
     __asm__ volatile("mov %%rsp, %0" : "=r"(rsp_val));
     __asm__ volatile("mov %%rbp, %0" : "=r"(rbp_val));
     out[41] = rsp_val;
     out[42] = rbp_val;
 
-    /* ── Dump top of idle thread's kernel stack ── */
-    if (idlethread) {
-        uint64_t idle_kstack = read8(idlethread + TD_KSTACK);
-        uint64_t idle_pages  = read8(idlethread + TD_KSTACK_PAGES);
-        if (idle_kstack && idle_pages) {
-            /* Stack top = kstack + pages * PAGE_SIZE */
-            uint64_t stack_top = idle_kstack + idle_pages * 4096;
-            /* Dump 32 qwords (256 bytes) from top of stack */
-            for (int i = 0; i < 32; i++) {
-                uint64_t addr = stack_top - 256 + (i * 8);
-                out[43 + i] = read8(addr);
-            }
+    /* ── Stack dump around idle thread's pcb_rsp ── */
+    uint64_t idle_pcb_rsp = idle_pcb_addr ? read8(idle_pcb_addr + PCB_RSP) : 0;
+    uint64_t idle_pcb_rbp = idle_pcb_addr ? read8(idle_pcb_addr + PCB_RBP) : 0;
+
+    if (idle_pcb_rsp >= 0xFFFF800000000000ULL) {
+        /* Dump 32 qwords: 16 below pcb_rsp and 16 above (256 bytes total) */
+        uint64_t dump_start = idle_pcb_rsp - 128;
+        for (int i = 0; i < 32; i++) {
+            out[43 + i] = read8(dump_start + (i * 8));
         }
     }
 
     out[75] = 0xdeadbeefcafe0022ULL;
+
+    /* ── Thread struct offset scanner ──
+     * Scan idle thread struct for values that look like kernel stack addresses.
+     * We look for values in 0xFFFFFF80xxxxxxxx range (direct map kernel addrs)
+     * that are page-aligned or near pcb_rsp, to find the real td_kstack offset. */
+    out[113] = idle_pcb_rsp;
+    out[114] = idle_pcb_rbp;
+
+    if (idlethread) {
+        int hit_count = 0;
+        /* Scan from offset 0x200 to 0x3F0 in steps of 8 */
+        for (uint64_t off = 0x200; off < 0x3F8 && hit_count < 16; off += 8) {
+            uint64_t val = read8(idlethread + off);
+            /* Check if this looks like a kernel direct-map address
+             * (0xFFFFFF80xxxxxxxx) and is page-aligned (potential kstack) */
+            if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                out[81 + hit_count * 2] = off;       /* offset in thread struct */
+                out[81 + hit_count * 2 + 1] = val;   /* value at that offset */
+                hit_count++;
+            }
+        }
+        out[80] = hit_count;
+    }
+
+    out[120] = 0xdeadbeefcafe0033ULL;
 
     /* Success */
     out32[1] = 0x0001;
