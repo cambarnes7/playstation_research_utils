@@ -196,18 +196,8 @@ static uint64_t find_pcb_onfault(volatile uint64_t* out)
         out[4 + i] = val;
     }
 
-    /* Also dump wider range %gs:0x00..0xf8 into out[40..71] */
-    for (int i = 0; i < 32; i++) {
-        uint64_t val;
-        uint64_t off = i * 8;
-        __asm__ volatile(
-            "movq %%gs:(%1), %0"
-            : "=r"(val)
-            : "r"(off)
-        );
-        out[40 + i] = val;
-    }
-
+    /* Wide dump removed — %gs at large offsets causes faults on PS5.
+     * The 4 visible qwords (%gs:0x00..0x18) above are sufficient. */
     return 0;
 }
 
