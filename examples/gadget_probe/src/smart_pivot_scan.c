@@ -220,6 +220,13 @@ int module_start(kproc_args* args)
     /* Find pcb_onfault for fault-safe probing */
     pcb_onfault_ptr = find_pcb_onfault(out);
 
+    /* v5.3c diagnostic: verify pcb_onfault discovery on this boot */
+    out[0] = ((uint64_t)0xEE03 << 32) | MAGIC_SPVT;
+    out[4] = pcb_onfault_ptr;  /* should be non-zero */
+    out[5] = pcb_onfault_ptr ? *(volatile uint64_t*)pcb_onfault_ptr : 0xBAD;
+    out[6] = saved_onfault;
+    return 0;
+
     /* Build sorted function list */
     int n_funcs = 0;
 
