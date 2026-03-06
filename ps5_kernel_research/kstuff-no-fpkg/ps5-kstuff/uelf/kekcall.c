@@ -111,15 +111,14 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
     {
         LOG("Handling kmalloc kekcall\n");
         //
-        // malloc with rwx
+        // malloc WITHOUT rwx fix (debug test)
+        // Just call kernel malloc directly, no debug breakpoints
         //
         kpoke64(regs[RDI]+td_retval, 0);
         regs[RDI] = args[RDI];
         regs[RSI] = (uint64_t) M_something;
         regs[RDX] = 0x1;
         regs[RIP] = (uint64_t) malloc;
-
-        start_syscall_with_dbgregs(regs, dbgregs_for_kfunction_fixes);
     } 
     else if (nr == 7)
     {
