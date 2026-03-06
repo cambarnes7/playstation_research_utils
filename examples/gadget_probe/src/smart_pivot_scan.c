@@ -12,10 +12,14 @@
  * which overflowed the page → instant kernel panic on any batch > 0.
  *
  * v2 fixes:
- *   - func_list[512] moved to stack (safe with -mno-red-zone, 16KB kernel stack)
  *   - safe_buf[2048] eliminated — replaced with pointer to unused kthread_args
- *     tail (bytes 288..4095), filled with nop_ret addresses at runtime
- *   - .bss now ~364 bytes: entry_stk[32]=256, pivot_chain[8]=64, scan vars=44
+ *     tail (bytes 2304..4095), filled with nop_ret addresses at runtime
+ *   - func_list reduced to static [96] (768 bytes) — sysent dropped (bad probes)
+ *   - .bss now ~1132 bytes: func_list[96]=768, entry_stk[32]=256, rest=108
+ *   - Total VMA (code+rodata+bss) ≈ 3856, fits in single 4096-byte page
+ *
+ * v2.1 fix: func_list CANNOT go on stack — kernel thread stack may be small
+ *   (4-8KB), and 4KB array + frame + asm clobber saves = instant overflow.
  *
  * Configure via -D flags:
  *   SCAN_BATCH:    which batch of the sorted pointer list to scan (0-based)
@@ -232,28 +236,32 @@ int module_start(kproc_args* args)
 
     /*
      * Build sorted list of function entry points to probe.
-     * ON THE STACK — safe with -mno-red-zone on 16KB kernel stack.
-     * 512 * 8 = 4096 bytes — well within limits.
+     * STATIC — must fit in .bss within the single malloc page.
+     * 96 entries * 8 bytes = 768 bytes. Total .bss ≈ 3856, fits in 4096.
+     *
+     * Sources: known kstuff offsets (~32) + IDT unique (~20) + apic_ops (~15).
+     * Sysent excluded: syscall handlers are complex functions with locks,
+     * hardware access, etc. — bad probe candidates that kill threads.
      */
-    uint64_t func_list[512];
+    static uint64_t func_list[96];
     int n_funcs = 0;
 
     /* Add known kstuff ktext functions */
     for (int i = 0; known_ktext_funcs[i] != 0; i++) {
         uint64_t addr = kdata_base + known_ktext_funcs[i];
-        if (addr >= ktext_base && addr < ktext_end && n_funcs < 512)
+        if (addr >= ktext_base && addr < ktext_end && n_funcs < 96)
             func_list[n_funcs++] = addr;
     }
 
     /* Add IDT handlers */
     volatile uint8_t* idt = (volatile uint8_t*)(kdata_base + 0x64cdc80);
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 256 && n_funcs < 96; i++) {
         uint16_t off_lo  = *(volatile uint16_t*)(idt + i*16 + 0);
         uint16_t off_mid = *(volatile uint16_t*)(idt + i*16 + 6);
         uint32_t off_hi  = *(volatile uint32_t*)(idt + i*16 + 8);
         uint64_t handler = (uint64_t)off_lo | ((uint64_t)off_mid << 16) |
                            ((uint64_t)off_hi << 32);
-        if (handler >= ktext_base && handler < ktext_end && n_funcs < 512) {
+        if (handler >= ktext_base && handler < ktext_end) {
             int dup = 0;
             for (int j = 0; j < n_funcs; j++)
                 if (func_list[j] == handler) { dup = 1; break; }
@@ -262,22 +270,9 @@ int module_start(kproc_args* args)
         }
     }
 
-    /* Add sysent sy_call entries (724 entries, stride 0x30, sy_call at +8) */
-    volatile uint8_t* sysent = (volatile uint8_t*)(kdata_base + 0x1709c0);
-    for (int i = 0; i < 724 && n_funcs < 512; i++) {
-        uint64_t sy_call = *(volatile uint64_t*)(sysent + i * 0x30 + 8);
-        if (sy_call >= ktext_base && sy_call < ktext_end) {
-            int dup = 0;
-            for (int j = 0; j < n_funcs; j++)
-                if (func_list[j] == sy_call) { dup = 1; break; }
-            if (!dup)
-                func_list[n_funcs++] = sy_call;
-        }
-    }
-
     /* Add apic_ops entries (28 entries at kdata+0x1656b0) */
     volatile uint64_t* apic_ops = (volatile uint64_t*)(kdata_base + 0x1656b0);
-    for (int i = 0; i < 28 && n_funcs < 512; i++) {
+    for (int i = 0; i < 28 && n_funcs < 96; i++) {
         uint64_t fn = apic_ops[i];
         if (fn >= ktext_base && fn < ktext_end) {
             int dup = 0;
