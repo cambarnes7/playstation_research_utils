@@ -1121,7 +1121,11 @@ static void _kldload(void* data, size_t data_size)
                readback[121] == 0xfeedface00000005ULL ? "[OK]" : "[MISSING]");
 
         if (status == 1) {
-            printf("\n  >>> apic_ops[2] ARMED with nop_ret (ktext) <<<\n");
+            if ((readback[34] >> 40) == 0xffffff)
+                printf("\n  >>> apic_ops[2] ARMED with capture_stub trampoline (heap) <<<\n");
+            else
+                printf("\n  >>> apic_ops[2] ARMED with ktext target <<<\n");
+            printf("  >>> capture_stub → saves regs → calls original xapic_mode <<<\n");
             printf("  >>> Enter rest mode now to test suspend! <<<\n");
             printf("  >>> After resume: run KTST restore (fw_ver=3) to clean up <<<\n");
         }
