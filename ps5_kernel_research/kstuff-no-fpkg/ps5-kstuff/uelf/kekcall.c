@@ -109,24 +109,37 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
     }
     else if (nr == 6)
     {
-        LOG("Handling malloc kekcall\n");
+        LOG("Handling kmem_alloc kekcall\n");
         //
-        // Use malloc with push_stack/trap to capture full 64-bit return
-        // malloc(size, M_something, M_NOWAIT)
+        // kmem_alloc(kernel_vmmap, size) with RWX fix
+        //
+        // Two-frame stack setup:
+        //   1. kekcall frame (deep) - captures return value via trap 6
+        //   2. utils frame (top) - saves/restores debug registers
+        //
+        // When kmem_alloc returns:
+        //   ret → utils trap → restores dbgregs (RAX preserved)
+        //   → kekcall trap → captures RAX in td_retval
         //
         uint64_t td = regs[RDI];
+
+        // Push kekcall return frame FIRST (processed SECOND after utils)
         uint64_t stack_frame[14] = {
             (uint64_t)doreti_iret,
             MKTRAP(TRAP_KEKCALL, 6),
             [12] = td,
         };
         push_stack(regs, stack_frame, sizeof(stack_frame));
-
         kpoke64(td + td_retval, 0);
-        regs[RDI] = args[RDI];                 // size
-        regs[RSI] = (uint64_t) M_something;    // malloc type
-        regs[RDX] = 0x1;                       // M_NOWAIT
-        regs[RIP] = (uint64_t) malloc;
+
+        // Push dbgreg frame ON TOP (processed FIRST)
+        // Loads kmem_alloc_rwx_fix breakpoint, restores original after
+        start_syscall_with_dbgregs(regs, dbgregs_for_kfunction_fixes);
+
+        // Set up kmem_alloc(kernel_vmmap, size)
+        regs[RSI] = args[RDI];                          // size
+        regs[RDI] = kpeek64((uint64_t)kernel_vmmap);    // kernel vm_map pointer
+        regs[RIP] = (uint64_t) kmem_alloc;
     } 
     else if (nr == 7)
     {
