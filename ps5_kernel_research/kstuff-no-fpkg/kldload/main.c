@@ -180,6 +180,37 @@ static void _kldload(void* data, size_t data_size)
         printf("  With KRW: overwrite -> suspend/resume -> code runs before HV\n");
 
         printf("\n=== END APIC OPS ===\n");
+    } else if (magic == 0x52454750) { /* "REGP" - register probe results */
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+
+        printf("\n=== REGISTER PROBE RESULTS ===\n");
+        printf("  status:     %s\n", status == 1 ? "SUCCESS" : "FAILED/CRASHED");
+        printf("  kdata_base: %#lx\n", readback[1]);
+        printf("  ktext_base: %#lx\n", readback[2]);
+        printf("  apic_ops @: %#lx\n", readback[3]);
+        printf("  xapic_mode returned: %lu\n", readback[4]);
+
+        if (status == 1) {
+            static const char* rnames[] = {
+                "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "R8 ",
+                "R9 ", "R10", "R11", "R12", "R13", "R14", "R15", "RSP"
+            };
+            uint64_t apic_addr = readback[3];
+            printf("\n  Registers at xapic_mode entry:\n");
+            for (int i = 0; i < 16; i++) {
+                uint64_t val = readback[5 + i];
+                const char* note = "";
+                if (val == apic_addr)
+                    note = " <-- apic_ops table! PIVOT REGISTER";
+                else if (val >= readback[2] && val < readback[1])
+                    note = " (ktext)";
+                else if (val >= readback[1] && val < readback[1] + 0x10000000)
+                    note = " (kdata)";
+                printf("    %s: %#018lx%s\n", rnames[i], val, note);
+            }
+        }
+
+        printf("\n=== END REGISTER PROBE ===\n");
     } else if (magic == 0x50495654) { /* "PIVT" - pivot test results */
         /*
          * Layout (packed):
