@@ -469,6 +469,46 @@ static void _kldload(void* data, size_t data_size)
         }
 
         printf("\n=== END APIC DUMP ===\n");
+    } else if (magic == 0x4B4D4150) { /* "KMAP" - ktext function map */
+        uint64_t ktext_base = readback[2];
+        uint64_t ktext_end = readback[3];
+        int total = (int)readback[5];
+
+        printf("\n=== KTEXT FUNCTION MAP (IDT + KDATA SCAN) ===\n");
+        printf("  kdata_base:  %#lx\n", readback[1]);
+        printf("  ktext_base:  %#lx\n", ktext_base);
+        printf("  ktext_end:   %#lx\n", ktext_end);
+        printf("  IDT @:       %#lx\n", readback[4]);
+        printf("  total unique ktext pointers: %d\n", total);
+
+        printf("\n  --- All ktext function pointers (sorted) ---\n");
+        for (int i = 0; i < total && i < 270; i++) {
+            uint64_t ptr = readback[6 + i];
+            uint64_t off = ptr - ktext_base;
+            /* Show gap from previous */
+            int gap = 0;
+            if (i > 0) gap = (int)(ptr - readback[6 + i - 1]);
+            if (i == 0)
+                printf("  [%3d]: %#lx (ktext+%#08lx)\n", i, ptr, off);
+            else
+                printf("  [%3d]: %#lx (ktext+%#08lx)  gap=%d\n", i, ptr, off, gap);
+        }
+
+        /* Show distribution across ktext */
+        printf("\n  --- Coverage distribution (256KB buckets) ---\n");
+        int buckets[48] = {0};
+        for (int i = 0; i < total && i < 270; i++) {
+            uint64_t off = readback[6 + i] - ktext_base;
+            int b = (int)(off >> 18); /* /256KB */
+            if (b >= 0 && b < 48) buckets[b]++;
+        }
+        for (int b = 0; b < 48; b++) {
+            if (buckets[b] > 0)
+                printf("  ktext+%#08x..%#08x: %d ptrs\n",
+                       b << 18, ((b + 1) << 18) - 1, buckets[b]);
+        }
+
+        printf("\n=== END KTEXT MAP ===\n");
     } else {
         /* Generic readback - check for test markers */
         uint64_t val0 = readback[0];
