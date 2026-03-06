@@ -237,6 +237,8 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
             args[RAX] = cr3_phys;
         else if(what == 4)
             args[RAX] = td;
+        else if(what == 5)
+            args[RAX] = kpeek64(args[RSI]); // read kernel u64 at args[RSI]
         else
             args[RAX] = 0xdeadbeef;
         return 0;
