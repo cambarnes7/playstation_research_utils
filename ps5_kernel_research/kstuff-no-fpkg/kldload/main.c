@@ -1152,6 +1152,188 @@ static void _kldload(void* data, size_t data_size)
         }
 
         printf("\n=== END KTEXT REDIRECT TEST ===\n");
+    } else if (magic == 0x50435055) { /* "PCPU" - pcpu recon results */
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+        uint64_t kdata = readback[1];
+        uint64_t ktext = readback[2];
+        uint64_t pcpu0_addr = readback[3];
+
+        printf("\n=== PCPU RECON RESULTS ===\n");
+        printf("  status:          %s\n", status == 1 ? "PASS" : "FAIL");
+        printf("  kdata_base:      %#lx\n", kdata);
+        printf("  ktext_base:      %#lx\n", ktext);
+        printf("  pcpu_array[0]:   %#lx (kdata+%#lx)\n", pcpu0_addr, pcpu0_addr - kdata);
+
+        printf("\n  --- pcpu[0] fields ---\n");
+        printf("  pc_curthread:    %#lx\n", readback[4]);
+        printf("  pc_idlethread:   %#lx\n", readback[5]);
+        printf("  pc_fpcurthread:  %#lx\n", readback[6]);
+        printf("  pc_curpcb:       %#lx\n", readback[7]);
+
+        printf("\n  --- curthread info ---\n");
+        printf("  td_kstack:       %#lx\n", readback[8]);
+        printf("  td_kstack_pages: %lu\n", readback[9]);
+        printf("  td_pcb:          %#lx\n", readback[10]);
+        printf("  td_proc:         %#lx\n", readback[11]);
+        /* thread name: readback[12..15] = 32 bytes of td_name */
+        {
+            char name[33] = {0};
+            __builtin_memcpy(name, &readback[12], 32);
+            printf("  td_name:         \"%s\"\n", name);
+        }
+
+        printf("\n  --- idlethread info ---\n");
+        printf("  td_kstack:       %#lx\n", readback[16]);
+        printf("  td_kstack_pages: %lu\n", readback[17]);
+        printf("  td_pcb:          %#lx\n", readback[18]);
+        printf("  td_proc:         %#lx\n", readback[19]);
+        {
+            char name[33] = {0};
+            __builtin_memcpy(name, &readback[20], 32);
+            printf("  td_name:         \"%s\"\n", name);
+        }
+
+        printf("\n  --- curthread PCB (saved context) ---\n");
+        printf("  pcb_rsp:         %#lx\n", readback[24]);
+        printf("  pcb_rbp:         %#lx\n", readback[25]);
+        printf("  pcb_rip:         %#lx\n", readback[26]);
+        printf("  pcb_rbx:         %#lx\n", readback[27]);
+        printf("  pcb_r12:         %#lx\n", readback[28]);
+        printf("  pcb_flags:       %#lx\n", readback[29]);
+
+        printf("\n  --- idlethread PCB ---\n");
+        printf("  pcb_rsp:         %#lx\n", readback[30]);
+        printf("  pcb_rbp:         %#lx\n", readback[31]);
+        printf("  pcb_rip:         %#lx\n", readback[32]);
+        printf("  pcb_rbx:         %#lx\n", readback[33]);
+        printf("  pcb_flags:       %#lx\n", readback[34]);
+
+        printf("\n  --- Debug registers ---\n");
+        printf("  DR0:             %#lx\n", readback[35]);
+        printf("  DR1:             %#lx\n", readback[36]);
+        printf("  DR2:             %#lx\n", readback[37]);
+        printf("  DR3:             %#lx\n", readback[38]);
+        printf("  DR6:             %#lx\n", readback[39]);
+        printf("  DR7:             %#lx\n", readback[40]);
+
+        printf("\n  --- Live registers ---\n");
+        printf("  RSP (current):   %#lx\n", readback[41]);
+        printf("  RBP (current):   %#lx\n", readback[42]);
+
+        /* Extra pcpu fields */
+        printf("\n  --- Extra pcpu fields ---\n");
+        printf("  pc_rsp0:         %#lx\n", readback[76]);
+        printf("  pc_cpuid:        %lu\n", readback[77]);
+        printf("  pc_curpmap:      %#lx\n", readback[78]);
+        printf("  pc_scratch_rsp:  %#lx\n", readback[79]);
+
+        /* Idle thread stack dump */
+        printf("\n  --- Idle thread stack top (32 qwords) ---\n");
+        uint64_t idle_kstack = readback[16];
+        uint64_t idle_pages = readback[17];
+        if (idle_kstack && idle_pages) {
+            uint64_t stack_top = idle_kstack + idle_pages * 4096;
+            for (int i = 0; i < 32; i++) {
+                uint64_t addr = stack_top - 256 + (i * 8);
+                uint64_t val = readback[43 + i];
+                const char* note = "";
+                if (val >= ktext && val < kdata)
+                    note = " [ktext]";
+                else if (val >= kdata && val < kdata + 0x10000000)
+                    note = " [kdata]";
+                else if ((val >> 40) == 0xffffff)
+                    note = " [kern_heap]";
+                printf("  [%#lx] %#018lx%s\n", addr, val, note);
+            }
+        }
+
+        printf("\n  sentinel: %#lx [%s]\n", readback[75],
+               readback[75] == 0xdeadbeefcafe0022ULL ? "OK" : "MISSING");
+
+        printf("\n=== END PCPU RECON ===\n");
+    } else if (magic == 0x534B5052) { /* "SKPR" - suspend stack probe */
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+        uint64_t kdata = readback[1];
+        uint64_t ktext = readback[2];
+
+        printf("\n=== SUSPEND STACK PROBE ===\n");
+        printf("  status:          %s\n",
+               status == 1 ? "PASS" : status == 0xAAAA ? "IN PROGRESS" :
+               status == 0xFF ? "ERROR (bad mode)" : "UNKNOWN");
+        printf("  kdata_base:      %#lx\n", kdata);
+        printf("  ktext_base:      %#lx\n", ktext);
+
+        if (status == 0xFF) {
+            printf("\n  *** MODE ERROR: fw_ver was not 0x403 or 0x2 ***\n");
+            printf("  *** Likely bug: fw_ver read after buffer zeroed ***\n");
+        } else if (readback[100] == 0xdeadbeefcafe0023ULL) {
+            /* Mode 0 (ARM) output */
+            printf("\n  --- Mode 0: ARM ---\n");
+            printf("  idle_kstack:     %#lx\n", readback[3]);
+            printf("  idle_pages:      %lu\n", readback[4]);
+            printf("  idle_pcb_rsp:    %#lx\n", readback[5]);
+            printf("  idle_pcb_rip:    %#lx\n", readback[6]);
+            printf("  marker_grid:     %#lx .. %#lx\n", readback[7], readback[8]);
+            printf("  marker_count:    %lu\n", readback[9]);
+            printf("  marker_spacing:  %lu bytes\n", readback[10]);
+            printf("  apic_ops @:      %#lx\n", readback[11]);
+            printf("  orig xapic:      %#lx\n", readback[12]);
+            printf("  new xapic:       %#lx (get_timer_freq)\n", readback[13]);
+
+            printf("\n  DR sentinels written:\n");
+            printf("  DR0: %#lx\n", readback[78]);
+            printf("  DR1: %#lx\n", readback[79]);
+            printf("  DR2: %#lx\n", readback[80]);
+            printf("  DR3: %#lx\n", readback[81]);
+
+            printf("  kdata ctrl @:    %#lx = %#lx\n", readback[82], readback[83]);
+
+            printf("\n  >>> ARMED FOR SUSPEND <<<\n");
+            printf("  >>> apic_ops[2] -> get_timer_freq <<<\n");
+            printf("  >>> %d markers on idle stack, DRs set <<<\n", 32);
+            printf("  >>> Enter rest mode, then send readback (fw_ver=2) <<<\n");
+        } else if (readback[100] == 0xdeadbeefcafe0024ULL) {
+            /* Mode 2 (READBACK) output */
+            printf("\n  --- Mode 2: READBACK ---\n");
+
+            int marker_count = (int)readback[35];
+            int64_t first_clob = (int64_t)readback[36];
+            int64_t last_clob = (int64_t)readback[37];
+            uint64_t est_rsp = readback[38];
+
+            printf("  markers:         %d\n", marker_count);
+            printf("  first clobbered: %ld\n", first_clob);
+            printf("  last clobbered:  %ld\n", last_clob);
+            printf("  estimated RSP:   %#lx\n", est_rsp);
+
+            /* Show marker readback */
+            printf("\n  --- Marker grid readback ---\n");
+            for (int i = 0; i < 32; i++) {
+                uint64_t val = readback[3 + i];
+                uint64_t expected = 0x4D41524B00000000ULL | (uint64_t)i;
+                const char* state = (val == expected) ? "intact" : "CLOBBERED";
+                printf("  [%2d] %#018lx  %s\n", i, val, state);
+            }
+
+            printf("\n  --- Debug register readback ---\n");
+            printf("  DR0: %#lx  %s\n", readback[39],
+                   readback[39] == 0x5354414B50524F42ULL ? "[survived]" : "[clobbered]");
+            printf("  DR1: %#lx  %s\n", readback[40],
+                   readback[40] == 0x4452314452314452ULL ? "[survived]" : "[clobbered]");
+            printf("  DR2: %#lx  %s\n", readback[41],
+                   readback[41] == 0x4452324452324452ULL ? "[survived]" : "[clobbered]");
+            printf("  DR3: %#lx  %s\n", readback[42],
+                   readback[42] == 0x4452334452334452ULL ? "[survived]" : "[clobbered]");
+
+            printf("\n  kdata ctrl:      %#lx  %s\n", readback[44],
+                   readback[44] == 0x4B44415441435452ULL ? "[survived]" : "[clobbered]");
+
+            printf("  apic_ops[2]:     %#lx (current)\n", readback[46]);
+            printf("  apic_ops[2]:     %#lx (restored)\n", readback[47]);
+        }
+
+        printf("\n  sentinel: %#lx\n", readback[100]);
+        printf("\n=== END SUSPEND STACK PROBE ===\n");
     } else {
         /* Generic readback - check for test markers */
         uint64_t val0 = readback[0];

@@ -92,7 +92,7 @@
 #define APIC_OPS_OFF_FROM_KTEXT  0x1934AC8
 
 /* pcpu / thread / PCB offsets */
-#define PC_IDLETHREAD    0x10
+#define PC_IDLETHREAD    0x08
 #define TD_KSTACK        0x2a8
 #define TD_KSTACK_PAGES  0x2b0
 #define TD_PCB           0x3f8
@@ -301,14 +301,13 @@ static void mode2_readback(uint64_t kdata_base, volatile uint64_t* out, volatile
 int module_start(kproc_args* args)
 {
     uint64_t kdata_base = args->kdata_base;
+    uint32_t mode = args->fw_ver;  /* MUST read before zeroing — out IS args! */
     volatile uint64_t* out = (volatile uint64_t*)args;
     volatile uint32_t* out32 = (volatile uint32_t*)args;
 
     /* Zero output */
     for (int i = 0; i < 280; i++)
         out[i] = 0;
-
-    uint32_t mode = args->fw_ver;
 
     if (mode == 0x403) {
         mode0_arm(kdata_base, out, out32);

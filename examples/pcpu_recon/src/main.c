@@ -110,11 +110,17 @@
 #define PCPU_ARRAY_OFF   0x64d2280
 #define PCPU_SIZE        0x480
 
-/* pcpu field offsets */
+/* pcpu field offsets (FreeBSD 11 amd64) */
 #define PC_CURTHREAD     0x00
-#define PC_IDLETHREAD    0x10
+#define PC_IDLETHREAD    0x08
+#define PC_FPCURTHREAD   0x10
 #define PC_CURPCB        0x18
-#define PC_CPUID         0x34
+#define PC_CURPMAP       0x20
+#define PC_TSSP          0x28
+#define PC_COMMONTSSP    0x30
+#define PC_RSP0          0x38
+#define PC_SCRATCH_RSP   0x40
+#define PC_CPUID         0x48
 
 /* thread field offsets */
 #define TD_PROC          0x008
@@ -188,13 +194,21 @@ int module_start(kproc_args* args)
     /* Read pcpu[0] fields */
     uint64_t curthread  = read8(pcpu0 + PC_CURTHREAD);
     uint64_t idlethread = read8(pcpu0 + PC_IDLETHREAD);
+    uint64_t fpcurthread = read8(pcpu0 + PC_FPCURTHREAD);
     uint64_t curpcb     = read8(pcpu0 + PC_CURPCB);
+    uint64_t rsp0       = read8(pcpu0 + PC_RSP0);
     uint32_t cpuid      = read4(pcpu0 + PC_CPUID);
 
     out[4] = curthread;
     out[5] = idlethread;
-    out[6] = curpcb;
-    out[7] = cpuid;
+    out[6] = fpcurthread;
+    out[7] = curpcb;
+
+    /* Extra pcpu fields at indices 76-79 (after sentinel) */
+    out[76] = rsp0;
+    out[77] = cpuid;
+    out[78] = read8(pcpu0 + PC_CURPMAP);
+    out[79] = read8(pcpu0 + PC_SCRATCH_RSP);
 
     /* ── curthread info ── */
     if (curthread) {
