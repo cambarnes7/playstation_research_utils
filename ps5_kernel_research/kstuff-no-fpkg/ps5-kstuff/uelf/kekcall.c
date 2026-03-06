@@ -109,14 +109,10 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
     }
     else if (nr == 6)
     {
-        LOG("Handling kmem_alloc kekcall\n");
+        LOG("Handling malloc kekcall\n");
         //
-        // Use kmem_alloc(kernel_vmmap, size) instead of malloc
-        // kmem_alloc maps pages with kernel pmap, making them accessible
-        // to copyin (malloc'd addresses are not accessible to copyin)
-        //
-        // Uses push_stack/trap pattern to capture full 64-bit return value
-        // (simple redirect truncates to 32 bits via syscall error path)
+        // Use malloc with push_stack/trap to capture full 64-bit return
+        // malloc(size, M_something, M_NOWAIT)
         //
         uint64_t td = regs[RDI];
         uint64_t stack_frame[14] = {
@@ -127,9 +123,10 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
         push_stack(regs, stack_frame, sizeof(stack_frame));
 
         kpoke64(td + td_retval, 0);
-        regs[RSI] = args[RDI];                          // size
-        regs[RDI] = kpeek64((uint64_t)kernel_vmmap);    // kernel vm_map pointer
-        regs[RIP] = (uint64_t) kmem_alloc;
+        regs[RDI] = args[RDI];                 // size
+        regs[RSI] = (uint64_t) M_something;    // malloc type
+        regs[RDX] = 0x1;                       // M_NOWAIT
+        regs[RIP] = (uint64_t) malloc;
     } 
     else if (nr == 7)
     {
