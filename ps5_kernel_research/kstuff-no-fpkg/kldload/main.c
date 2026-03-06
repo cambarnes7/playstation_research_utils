@@ -551,11 +551,23 @@ static void _kldload(void* data, size_t data_size)
         uint32_t status = (uint32_t)(readback[0] >> 32);
         uint64_t ktext_base = readback[2];
 
+        /* Detect v20 gadget scanner: check for sentinel after gadget entries */
+        int is_gadget_scan = 0;
+        {
+            int nfound = (int)readback[4];
+            if (nfound >= 0 && nfound <= 128) {
+                int sentinel_slot = 5 + nfound * 2;
+                if (sentinel_slot < 278 && readback[sentinel_slot] == 0xdeadbeefcafe0020ULL)
+                    is_gadget_scan = 1;
+            }
+        }
+
         /* Detect v19 multi-offset onfault: sentinel 0xdeadbeefcafe0019 at slot 9 */
-        int is_onfault_v19 = (readback[9] == 0xdeadbeefcafe0019ULL);
+        int is_onfault_v19 = !is_gadget_scan &&
+                             (readback[9] == 0xdeadbeefcafe0019ULL);
 
         /* Detect v18 onfault test: sentinel 0xdeadbeefcafe0018 at slot 8 */
-        int is_onfault_test = !is_onfault_v19 &&
+        int is_onfault_test = !is_onfault_v19 && !is_gadget_scan &&
                               (readback[8] == 0xdeadbeefcafe0018ULL);
 
         /* Detect v17 pcb dump: sentinel 0xdeadbeefcafe0017 at slot 37 */
@@ -563,7 +575,7 @@ static void _kldload(void* data, size_t data_size)
                           (readback[5 + 32] == 0xdeadbeefcafe0017ULL);
 
         /* Detect v16 thread dump: readback[3] is LSTAR (0xffffffff8xxx) */
-        int is_thread_dump = !is_pcb_dump && !is_onfault_test && !is_onfault_v19 &&
+        int is_thread_dump = !is_pcb_dump && !is_onfault_test && !is_onfault_v19 && !is_gadget_scan &&
                              (readback[3] >> 32) == 0xffffffff &&
                              (readback[4] >> 32) != 0 && readback[4] != 0;
 
