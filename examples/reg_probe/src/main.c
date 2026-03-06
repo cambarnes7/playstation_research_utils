@@ -1,82 +1,83 @@
 #include <stdint.h>
 
 /*
- * PS5 Register Probe v2 (kstuff payload)
+ * PS5 APIC Table Dump + Multi-Slot Register Probe v3 (kstuff payload)
  *
- * Hooks apic_ops[2] (xapic_mode) with a transparent shim that captures
- * all register values at the KERNEL'S natural call entry point, then
- * calls the original.
+ * Part 1: Dumps all 28 apic_ops entries.
+ * Part 2: Tries hooking multiple slots in sequence to find one that fires
+ *         during normal kernel operation. Uses RDTSC for proper timing.
+ *         Tests each slot for ~1 second before moving to the next.
  *
- * v2 change: Instead of calling xapic_mode ourselves (which captures
- * OUR register context), we install the hook and WAIT for the kernel
- * to naturally call xapic_mode (via timer interrupt, scheduler, etc.).
- * This captures the actual register state during LAPIC operations,
- * which is what we need for stack pivot gadget selection.
- *
- * The probe captures up to 4 calls to see if registers are stable.
+ * Slots to try (most likely to fire):
+ *   slot  9: ipi_vectored - called for inter-processor interrupts (TLB flush, etc.)
+ *   slot  8: ipi_raw - raw IPI sending
+ *   slot 25: self_ipi - self-interrupts
+ *   slot 23: timer_initial_count - timer setup (scheduler tick)
+ *   slot 24: timer_current_count - timer read
+ *   slot 18: set_tpr - task priority changes
  *
  * Output layout:
  *   [0x000] uint32_t magic = 0x52454750 ("REGP")
- *   [0x004] uint32_t status (1=success, 0=timeout)
+ *   [0x004] uint32_t status (1=captures, 2=table-only)
  *   [0x008] uint64_t kdata_base
  *   [0x010] uint64_t ktext_base
  *   [0x018] uint64_t apic_ops_table_addr
- *   [0x020] uint64_t original_xapic_mode
- *   [0x028] uint32_t call_count (how many captures)
- *   [0x02C] uint32_t pad
+ *   [0x020] uint64_t original_slot2 (xapic_mode)
+ *   [0x028] uint32_t call_count
+ *   [0x02C] uint32_t hooked_slot_index
  *
- *   Per-call captures (4 captures × 17 uint64 = 544 bytes):
- *   [0x030] capture[0]: rax rbx rcx rdx rsi rdi rbp r8 r9 r10 r11 r12 r13 r14 r15 rsp rflags
- *   [0x0B8] capture[1]: ...
- *   [0x140] capture[2]: ...
- *   [0x1C8] capture[3]: ...
+ *   [0x030] apic_ops[0..27] = 28 x uint64 = 224 bytes
+ *   [0x110] end of table dump
  *
- *   [0x250] uint64_t sentinel = 0xdeadbeefcafe0002
+ *   [0x110] uint64_t slots_tried_mask (bitmask of which slots were attempted)
+ *   [0x118] uint64_t slots_hit_mask (bitmask of which slots got calls)
+ *
+ *   Per-call captures (4 captures x 17 uint64 = 544 bytes):
+ *   [0x120] capture[0]: rax rbx rcx rdx rsi rdi rbp r8 r9 r10 r11 r12 r13 r14 r15 rsp rflags
+ *   [0x1A8] capture[1]: ...
+ *   [0x230] capture[2]: ...
+ *   [0x2B8] capture[3]: ...
+ *
+ *   [0x340] uint64_t sentinel = 0xdeadbeefcafe0003
  */
 
-#define MAGIC_REGP       0x52454750  /* "REGP" */
-#define APIC_OPS_OFFSET  0x1934AC8   /* from ktext_base on FW 4.03 */
+#define MAGIC_REGP       0x52454750
+#define APIC_OPS_OFFSET  0x1934AC8
+#define APIC_OPS_COUNT   28
 #define MAX_CAPTURES     4
-#define REGS_PER_CAPTURE 17          /* 16 GPRs + RFLAGS */
+#define REGS_PER_CAPTURE 17
 
 typedef struct {
     uint64_t kdata_base;
     uint32_t fw_ver;
 } kproc_args;
 
-/* ── Shared state between probe_stub and module_start ── */
 static volatile uint64_t capture_buf[MAX_CAPTURES * REGS_PER_CAPTURE];
 static volatile int capture_count;
 static volatile uint64_t orig_func;
 
-/*
- * Probe stub — installed as apic_ops[2].
- *
- * Naked function: no prologue/epilogue.
- * Saves all registers to capture_buf[capture_count * 17], increments count,
- * then tail-calls original xapic_mode.
- *
- * After MAX_CAPTURES, stops capturing (just calls original).
- */
+static inline uint64_t rdtsc(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 __attribute__((naked, used))
 static void probe_stub(void)
 {
     __asm__ volatile(
-        /* Save two temporaries */
         "pushq %%rax\n\t"
         "pushq %%rbx\n\t"
 
-        /* Check if we've captured enough */
         "movl capture_count(%%rip), %%eax\n\t"
         "cmpl %[max], %%eax\n\t"
-        "jge 1f\n\t"  /* skip capture if full */
+        "jge 1f\n\t"
 
-        /* RBX = &capture_buf[count * 17] */
         "leaq capture_buf(%%rip), %%rbx\n\t"
-        "imulq $136, %%rax, %%rax\n\t"  /* 17 * 8 = 136 */
+        "imulq $136, %%rax, %%rax\n\t"
         "addq %%rax, %%rbx\n\t"
 
-        /* Save registers that aren't clobbered */
         "movq %%rcx, 2*8(%%rbx)\n\t"
         "movq %%rdx, 3*8(%%rbx)\n\t"
         "movq %%rsi, 4*8(%%rbx)\n\t"
@@ -91,34 +92,26 @@ static void probe_stub(void)
         "movq %%r14, 13*8(%%rbx)\n\t"
         "movq %%r15, 14*8(%%rbx)\n\t"
 
-        /* Save entry RSP (before our two pushes) = rsp + 16 */
         "leaq 16(%%rsp), %%rax\n\t"
         "movq %%rax, 15*8(%%rbx)\n\t"
 
-        /* Save RFLAGS */
         "pushfq\n\t"
         "popq %%rax\n\t"
         "movq %%rax, 16*8(%%rbx)\n\t"
 
-        /* Recover original RAX from stack and save */
-        "movq 8(%%rsp), %%rax\n\t"    /* original RAX (pushed second) */
+        "movq 8(%%rsp), %%rax\n\t"
         "movq %%rax, 0*8(%%rbx)\n\t"
 
-        /* Recover original RBX from stack and save */
-        "movq (%%rsp), %%rax\n\t"     /* original RBX (pushed first, now at top) */
+        "movq (%%rsp), %%rax\n\t"
         "movq %%rax, 1*8(%%rbx)\n\t"
 
-        /* Increment capture count */
         "movl capture_count(%%rip), %%eax\n\t"
         "incl %%eax\n\t"
         "movl %%eax, capture_count(%%rip)\n\t"
 
         "1:\n\t"
-        /* Restore temporaries */
         "popq %%rbx\n\t"
         "popq %%rax\n\t"
-
-        /* Tail-call original xapic_mode */
         "jmpq *orig_func(%%rip)\n\t"
         :
         : [max] "i"(MAX_CAPTURES)
@@ -126,13 +119,26 @@ static void probe_stub(void)
     );
 }
 
+/* Slots to try, in order of expected frequency */
+#define NUM_TRY_SLOTS 8
+static const int try_slots[NUM_TRY_SLOTS] = {
+    9,   /* ipi_vectored - TLB shootdowns, scheduler */
+    8,   /* ipi_raw - raw IPI */
+    25,  /* self_ipi - self-interrupt */
+    23,  /* timer_initial_count - scheduler tick */
+    24,  /* timer_current_count - timer read */
+    18,  /* set_tpr - interrupt priority */
+    20,  /* timer_enable_intr */
+    10,  /* ipi_wait */
+};
+
 int module_start(kproc_args* args)
 {
     uint64_t kdata_base = args->kdata_base;
     volatile uint64_t* out = (volatile uint64_t*)args;
 
-    /* Zero output area */
-    for (int i = 0; i < 80; i++)
+    /* Output needs: 6 header + 28 table + 2 masks + 4*17 captures + 1 sentinel = 105 slots */
+    for (int i = 0; i < 105; i++)
         out[i] = 0;
 
     /* rdmsr LSTAR */
@@ -142,61 +148,90 @@ int module_start(kproc_args* args)
     uint64_t ktext_base = lstar - 0x294218;
     uint64_t apic_ops_addr = ktext_base + APIC_OPS_OFFSET;
 
-    /* Write header */
     volatile uint32_t* out32 = (volatile uint32_t*)args;
     out32[0] = MAGIC_REGP;
-    out32[1] = 0;  /* status: not yet done */
+    out32[1] = 0;
     out[1] = kdata_base;
     out[2] = ktext_base;
     out[3] = apic_ops_addr;
 
-    /* Read original apic_ops[2] */
-    volatile uint64_t* apic_slot2 = (volatile uint64_t*)(apic_ops_addr + 0x10);
-    uint64_t original = *apic_slot2;
-    orig_func = original;
-    out[4] = original;
+    volatile uint64_t* apic_table = (volatile uint64_t*)apic_ops_addr;
+    out[4] = apic_table[2];  /* original xapic_mode */
 
-    /* Initialize capture state */
-    capture_count = 0;
-    for (int i = 0; i < MAX_CAPTURES * REGS_PER_CAPTURE; i++)
-        capture_buf[i] = 0;
+    /* Part 1: Dump all apic_ops entries (slots 6..33) */
+    for (int i = 0; i < APIC_OPS_COUNT; i++)
+        out[6 + i] = apic_table[i];
 
-    /* Install probe stub */
-    *apic_slot2 = (uint64_t)probe_stub;
+    /* Part 2: Try hooking slots */
+    uint64_t slots_tried = 0;
+    uint64_t slots_hit = 0;
+    int hooked_slot = -1;
 
-    /*
-     * Wait for the kernel to naturally call xapic_mode.
-     * LAPIC operations happen frequently during timer interrupts,
-     * IPIs, and scheduler activity. Spin for up to ~2 seconds
-     * (roughly ~200M iterations at kernel speed).
-     */
-    for (volatile int i = 0; i < 200000000 && capture_count < MAX_CAPTURES; i++) {
-        /* spin */
-    }
+    /* Get TSC frequency estimate: ~3.5 GHz on PS5 Zen 2 */
+    /* 1 second ≈ 3,500,000,000 cycles */
+    uint64_t one_second_tsc = 3500000000ULL;
 
-    /* Restore original immediately */
-    *apic_slot2 = original;
+    for (int t = 0; t < NUM_TRY_SLOTS; t++) {
+        int slot = try_slots[t];
+        if (slot >= APIC_OPS_COUNT) continue;
 
-    /* Copy results to output */
-    out32[10] = (uint32_t)capture_count;  /* at offset 0x28 */
-    out32[11] = 0;  /* pad */
+        uint64_t original = apic_table[slot];
+        if (original == 0) continue;
 
-    /* Copy capture data starting at offset 0x30 (slot 6) */
-    int n = capture_count;
-    if (n > MAX_CAPTURES) n = MAX_CAPTURES;
+        slots_tried |= (1ULL << slot);
 
-    for (int c = 0; c < n; c++) {
-        for (int r = 0; r < REGS_PER_CAPTURE; r++) {
-            out[6 + c * REGS_PER_CAPTURE + r] = capture_buf[c * REGS_PER_CAPTURE + r];
+        capture_count = 0;
+        for (int i = 0; i < MAX_CAPTURES * REGS_PER_CAPTURE; i++)
+            capture_buf[i] = 0;
+        orig_func = original;
+
+        /* Install probe */
+        apic_table[slot] = (uint64_t)probe_stub;
+
+        /* Wait up to 1 second using RDTSC */
+        uint64_t start = rdtsc();
+        while (capture_count < MAX_CAPTURES) {
+            uint64_t now = rdtsc();
+            if (now - start > one_second_tsc)
+                break;
+            /* Yield hint to allow other threads/cores to run */
+            __asm__ volatile("pause");
+        }
+
+        /* Restore immediately */
+        apic_table[slot] = original;
+
+        if (capture_count > 0) {
+            slots_hit |= (1ULL << slot);
+            hooked_slot = slot;
+            break;  /* Got captures! */
         }
     }
 
-    /* Sentinel */
-    int sentinel_slot = 6 + MAX_CAPTURES * REGS_PER_CAPTURE;
-    out[sentinel_slot] = 0xdeadbeefcafe0002ULL;
+    /* Store masks (slots 34-35, offsets 0x110-0x11F) */
+    out[34] = slots_tried;
+    out[35] = slots_hit;
 
-    /* Done */
-    out32[1] = (n > 0) ? 1 : 0;
+    out32[10] = (uint32_t)(capture_count > 0 ? capture_count : 0);
+    out32[11] = (uint32_t)(hooked_slot >= 0 ? hooked_slot : 0xFF);
+
+    if (capture_count > 0) {
+        int n = capture_count;
+        if (n > MAX_CAPTURES) n = MAX_CAPTURES;
+
+        /* Captures at slots 36+ (offset 0x120) */
+        for (int c = 0; c < n; c++) {
+            for (int r = 0; r < REGS_PER_CAPTURE; r++) {
+                out[36 + c * REGS_PER_CAPTURE + r] = capture_buf[c * REGS_PER_CAPTURE + r];
+            }
+        }
+        out32[1] = 1;
+    } else {
+        out32[1] = 2;  /* table-only */
+    }
+
+    /* Sentinel at slot 104 (offset 0x340) */
+    out[104] = 0xdeadbeefcafe0003ULL;
 
     return 0;
 }

