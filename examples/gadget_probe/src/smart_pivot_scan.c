@@ -161,97 +161,33 @@ static void sort_u64(uint64_t* arr, int n)
  *   4. If all checks pass, return &pcb->pcb_onfault
  */
 /*
- * Diagnostic version: dump %gs:0x00..0x40 to output for pcpu layout analysis.
- * Does NOT dereference any pointers (safe against faults).
- * Returns 0 always — pcb_onfault discovery deferred until we know offsets.
- */
-/*
- * Diagnostic: dump pcpu layout into VISIBLE header slots (out[4..8]).
- * kldload only prints through [0x38] so we use slots the user can see.
- * We also tag out[3] high bits to mark this as a diagnostic dump.
+ * Find pcb_onfault using discovered PS5 offsets:
+ *   td_pcb     = curthread + 0x3f8   (FreeBSD standard)
+ *   pcb_onfault = pcb + 0xb0          (FreeBSD standard)
  *
- * Layout:
- *   out[4] = %gs:0x00  (pc_prvspace / self-pointer)
- *   out[5] = %gs:0x08  (pc_curthread)
- *   out[6] = %gs:0x10  (candidate: curpcb or idlethread)
- *   out[7] = %gs:0x18  (candidate: curpcb or fpcurthread)
- *
- * Also dumps %gs:0x00..0xf8 (32 qwords) into out[40..71] in case
- * we can hex-dump the full readback later.
+ * Returns address of pcb->pcb_onfault, or 0 on failure.
  */
-/*
- * v5.2e: Find td_pcb by dumping curthread fields.
- * %gs:0x08 = curthread. We read curthread+offset for a range of offsets
- * looking for td_pcb (kernel stack pointer, 0xffffff80...).
- * Dumps values to out[4..8] for analysis.
- */
-/*
- * v5.2f: Find td_pcb from curthread, then probe pcb_onfault candidates.
- *
- * Output layout (all in visible [0x20..0x38] = out[4..7]):
- *   out[4] = curthread
- *   out[5] = td_pcb candidate (first 0xffffff80... hit)
- *   out[6] = offset where td_pcb was found | (pcb_onfault_off << 16)
- *   out[7] = pcb_onfault address (if found), else 0xDEAD
- */
+#define TD_PCB_OFF     0x3f8
+#define PCB_ONFAULT_OFF 0xb0
+
 static uint64_t find_pcb_onfault(volatile uint64_t* out)
 {
-    out[3] |= ((uint64_t)0xDDDD << 48);
-
     uint64_t curthread;
     __asm__ volatile("movq %%gs:0x08, %0" : "=r"(curthread));
-    out[4] = curthread;
 
-    /* Find td_pcb: scan curthread for 0xffffff80... pointer */
-    uint64_t pcb = 0;
-    int td_pcb_off = 0;
-    for (int off = 0x380; off <= 0x420; off += 8) {
-        uint64_t val = *(volatile uint64_t*)(curthread + off);
-        if ((val >> 40) == 0xFFFFFF) {
-            pcb = val;
-            td_pcb_off = off;
-            break;
-        }
-    }
-    if (!pcb) {
-        for (int off = 0x300; off <= 0x500; off += 8) {
-            uint64_t val = *(volatile uint64_t*)(curthread + off);
-            if ((val >> 40) == 0xFFFFFF) {
-                pcb = val;
-                td_pcb_off = off;
-                break;
-            }
-        }
-    }
-
-    out[5] = pcb;
-    out[6] = (uint64_t)td_pcb_off;
-
-    if (!pcb) {
-        out[7] = 0xDEAD0001;
+    uint64_t pcb = *(volatile uint64_t*)(curthread + TD_PCB_OFF);
+    if ((pcb >> 40) != 0xFFFFFF)
         return 0;
-    }
 
-    /* Probe pcb_onfault: try offsets 0xb0..0xd0.
-     * For a fresh thread, pcb_onfault should be NULL (0).
-     * We also verify by writing a test value and reading back. */
-    for (int poff = 0xb0; poff <= 0xd0; poff += 8) {
-        uint64_t val = *(volatile uint64_t*)(pcb + poff);
-        if (val == 0) {
-            /* Candidate: write test value, read back, restore */
-            *(volatile uint64_t*)(pcb + poff) = 0x4141414141414141ULL;
-            uint64_t readback = *(volatile uint64_t*)(pcb + poff);
-            *(volatile uint64_t*)(pcb + poff) = 0;  /* restore */
-            if (readback == 0x4141414141414141ULL) {
-                out[6] |= ((uint64_t)poff << 16);
-                out[7] = pcb + poff;  /* pcb_onfault address */
-                return pcb + poff;
-            }
-        }
-    }
+    uint64_t onfault_addr = pcb + PCB_ONFAULT_OFF;
 
-    out[7] = 0xDEAD0002;  /* pcb found but no onfault candidate */
-    return 0;
+    /* Validate: current value should be 0 (no active handler) */
+    uint64_t cur = *(volatile uint64_t*)onfault_addr;
+    if (cur != 0)
+        return 0;
+
+    out[9] = onfault_addr;  /* log for diagnostics */
+    return onfault_addr;
 }
 
 int module_start(kproc_args* args)
@@ -279,13 +215,8 @@ int module_start(kproc_args* args)
         safe_region[i] = nop_ret;
     safe_addr = (uint64_t)((uint8_t*)args + 2304 + 896);
 
-    /* Dump curthread fields to find td_pcb */
+    /* Find pcb_onfault for fault-safe probing */
     pcb_onfault_ptr = find_pcb_onfault(out);
-    out[9] = pcb_onfault_ptr;
-
-    /* v5.2e: early return — dump curthread fields only */
-    out[0] = ((uint64_t)0xEE02 << 32) | MAGIC_SPVT;
-    return 0;
 
     /* Build sorted function list */
     int n_funcs = 0;
@@ -323,15 +254,6 @@ int module_start(kproc_args* args)
     }
 
     sort_u64(func_list, n_funcs);
-
-    /* v5.2d: return after func-list build, before probing.
-     * Report how many functions found from each source. */
-    out[0] = ((uint64_t)0xEEEE << 32) | MAGIC_SPVT;
-    out[4] = n_funcs;  /* total functions found */
-    /* Show first 4 function addresses in slots 5-8 */
-    for (int i = 0; i < 4 && i < n_funcs; i++)
-        out[5 + i] = func_list[i];
-    return 0;
 
     int batch_start = SCAN_BATCH * BATCH_SIZE;
     int batch_end = batch_start + BATCH_SIZE;
