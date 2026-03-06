@@ -551,19 +551,47 @@ static void _kldload(void* data, size_t data_size)
         uint32_t status = (uint32_t)(readback[0] >> 32);
         uint64_t ktext_base = readback[2];
 
+        /* Detect v19 multi-offset onfault: sentinel 0xdeadbeefcafe0019 at slot 9 */
+        int is_onfault_v19 = (readback[9] == 0xdeadbeefcafe0019ULL);
+
         /* Detect v18 onfault test: sentinel 0xdeadbeefcafe0018 at slot 8 */
-        int is_onfault_test = (readback[8] == 0xdeadbeefcafe0018ULL);
+        int is_onfault_test = !is_onfault_v19 &&
+                              (readback[8] == 0xdeadbeefcafe0018ULL);
 
         /* Detect v17 pcb dump: sentinel 0xdeadbeefcafe0017 at slot 37 */
-        int is_pcb_dump = !is_onfault_test &&
+        int is_pcb_dump = !is_onfault_test && !is_onfault_v19 &&
                           (readback[5 + 32] == 0xdeadbeefcafe0017ULL);
 
         /* Detect v16 thread dump: readback[3] is LSTAR (0xffffffff8xxx) */
-        int is_thread_dump = !is_pcb_dump && !is_onfault_test &&
+        int is_thread_dump = !is_pcb_dump && !is_onfault_test && !is_onfault_v19 &&
                              (readback[3] >> 32) == 0xffffffff &&
                              (readback[4] >> 32) != 0 && readback[4] != 0;
 
-        if (is_onfault_test) {
+        if (is_onfault_v19) {
+            printf("\n=== PCB_ONFAULT MULTI-OFFSET TEST (v19) ===\n");
+            printf("  kdata_base:       %#lx\n", readback[1]);
+            printf("  ktext_base:       %#lx\n", ktext_base);
+            printf("  curthread:        %#lx\n", readback[3]);
+            printf("  td_pcb:           %#lx\n", readback[4]);
+            printf("  recovery_label:   %#lx\n", readback[6]);
+            printf("  fault_address:    %#lx\n", readback[8]);
+
+            if (status == 0x0002) {
+                printf("\n  >>> pcb_onfault WORKS! <<<\n");
+                if (readback[7] == 0xFFFF)
+                    printf("  Multi-offset hit (need single-offset test to determine exact offset)\n");
+                else
+                    printf("  Winning offset: pcb+0x%lx\n", readback[7]);
+                printf("  Fault recovery confirmed with non-NULL address!\n");
+            } else if (status == 0x0001) {
+                printf("\n  pcb_onfault did NOT trigger\n");
+                printf("  None of the tested offsets worked\n");
+            } else if (status == 0xAAAA) {
+                printf("\n  Module crashed or still running\n");
+            }
+
+            printf("\n=== END ONFAULT v19 TEST ===\n");
+        } else if (is_onfault_test) {
             printf("\n=== PCB_ONFAULT VALIDATION TEST ===\n");
             printf("  kdata_base:       %#lx\n", readback[1]);
             printf("  ktext_base:       %#lx\n", ktext_base);
