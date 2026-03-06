@@ -962,6 +962,51 @@ static void _kldload(void* data, size_t data_size)
         }
 
         printf("\n=== END DMAP PIVOT SCAN ===\n");
+    } else if (magic == 0x4B545354) { /* "KTST" - ktext redirect test */
+        uint32_t mode = (uint32_t)(readback[0] >> 32);
+        uint64_t ktext = readback[2];
+        uint64_t original = readback[4];
+        uint64_t new_target = readback[5];
+        uint64_t rb = readback[6];
+        uint64_t nop_ret = readback[7];
+        uint64_t is_x2apic = readback[8];
+        uint32_t status = ((uint32_t*)&readback[9])[0];
+
+        static const char* mode_names[] = {
+            "nop_ret (ktext 'ret')",
+            "is_x2apic (returns 0)",
+            "original xapic_mode (control)",
+            "RESTORE original"
+        };
+
+        printf("\n=== KTEXT REDIRECT TEST ===\n");
+        printf("  mode:          %u (%s)\n", mode,
+               mode < 4 ? mode_names[mode] : "unknown");
+        printf("  kdata_base:    %#lx\n", readback[1]);
+        printf("  ktext_base:    %#lx\n", ktext);
+        printf("  apic_ops @:    %#lx\n", readback[3]);
+        printf("  original:      %#lx (ktext+%#lx)\n", original, original - ktext);
+        printf("  new_target:    %#lx (ktext+%#lx)\n", new_target, new_target - ktext);
+        printf("  readback:      %#lx %s\n", rb,
+               rb == new_target ? "[WRITE OK]" : "[WRITE FAILED!]");
+        printf("  nop_ret:       %#lx (ktext+%#lx)\n", nop_ret, nop_ret - ktext);
+        printf("  is_x2apic:     %#lx (ktext+%#lx)\n", is_x2apic, is_x2apic - ktext);
+        printf("  status:        %s\n",
+               status == 1 ? "ARMED (apic_ops[2] overwritten!)" :
+               status == 2 ? "RESTORED (original value)" :
+               status == 0xFF ? "ERROR" : "unknown");
+
+        if (status == 1) {
+            printf("\n  >>> apic_ops[2] is now pointing to ktext+%#lx <<<\n",
+                   new_target - ktext);
+            printf("  >>> Enter rest mode to test if ktext survives suspend! <<<\n");
+            printf("  >>> If no panic on resume: ktext ROP approach CONFIRMED <<<\n");
+            printf("\n  To restore: send payload with fw_ver=3\n");
+        } else if (status == 2) {
+            printf("\n  apic_ops[2] restored to original xapic_mode\n");
+        }
+
+        printf("\n=== END KTEXT REDIRECT TEST ===\n");
     } else {
         /* Generic readback - check for test markers */
         uint64_t val0 = readback[0];

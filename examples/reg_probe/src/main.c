@@ -1,237 +1,134 @@
 #include <stdint.h>
 
 /*
- * PS5 APIC Table Dump + Multi-Slot Register Probe v3 (kstuff payload)
+ * PS5 apic_ops ktext redirect test (kstuff payload)
  *
- * Part 1: Dumps all 28 apic_ops entries.
- * Part 2: Tries hooking multiple slots in sequence to find one that fires
- *         during normal kernel operation. Uses RDTSC for proper timing.
- *         Tests each slot for ~1 second before moving to the next.
+ * THE critical test: overwrite apic_ops[2] with a KTEXT address
+ * and leave it armed for suspend/resume.
  *
- * Slots to try (most likely to fire):
- *   slot  9: ipi_vectored - called for inter-processor interrupts (TLB flush, etc.)
- *   slot  8: ipi_raw - raw IPI sending
- *   slot 25: self_ipi - self-interrupts
- *   slot 23: timer_initial_count - timer setup (scheduler tick)
- *   slot 24: timer_current_count - timer read
- *   slot 18: set_tpr - task priority changes
+ * Previous tests (Sessions 4, 8) only tried kdata/kmod targets,
+ * which panic because HV enforces NX on non-ktext during suspend.
+ * ktext is ALWAYS executable. This has never been tested.
+ *
+ * Strategy: Point apic_ops[2] to the SAME xapic_mode function
+ * (proving the write path works) OR to nop_ret/another ktext func.
+ *
+ * Test modes (selected via fw_ver field hack):
+ *   fw_ver=0x403:  Mode 0 - point to get_timer_freq (real ktext func, returns large int)
+ *   fw_ver=0x1:    Mode 1 - point to is_x2apic (returns 0, valid ktext func)
+ *   fw_ver=0x2:    Mode 2 - point to original xapic_mode (no-op, control test)
+ *   fw_ver=0x3:    Mode 3 - RESTORE original and exit (cleanup)
  *
  * Output layout:
- *   [0x000] uint32_t magic = 0x52454750 ("REGP")
- *   [0x004] uint32_t status (1=captures, 2=table-only)
+ *   [0x000] uint32_t magic = 0x4B545354 ("KTST")
+ *   [0x004] uint32_t mode
  *   [0x008] uint64_t kdata_base
  *   [0x010] uint64_t ktext_base
- *   [0x018] uint64_t apic_ops_table_addr
- *   [0x020] uint64_t original_slot2 (xapic_mode)
- *   [0x028] uint32_t call_count
- *   [0x02C] uint32_t hooked_slot_index
- *
- *   [0x030] apic_ops[0..27] = 28 x uint64 = 224 bytes
- *   [0x110] end of table dump
- *
- *   [0x110] uint64_t slots_tried_mask (bitmask of which slots were attempted)
- *   [0x118] uint64_t slots_hit_mask (bitmask of which slots got calls)
- *
- *   Per-call captures (4 captures x 17 uint64 = 544 bytes):
- *   [0x120] capture[0]: rax rbx rcx rdx rsi rdi rbp r8 r9 r10 r11 r12 r13 r14 r15 rsp rflags
- *   [0x1A8] capture[1]: ...
- *   [0x230] capture[2]: ...
- *   [0x2B8] capture[3]: ...
- *
- *   [0x340] uint64_t sentinel = 0xdeadbeefcafe0003
+ *   [0x018] uint64_t apic_ops_addr
+ *   [0x020] uint64_t original_xapic_mode
+ *   [0x028] uint64_t new_target
+ *   [0x030] uint64_t readback (verify write)
+ *   [0x038] uint64_t nop_ret_addr
+ *   [0x040] uint64_t is_x2apic_addr
+ *   [0x048] uint32_t status (1=armed, 2=restored, 0xFF=error)
+ *   [0x04C] uint32_t pad
+ *   [0x050] uint64_t sentinel = 0xdeadbeefcafe0004
  */
 
-#define MAGIC_REGP       0x52454750
-#define APIC_OPS_OFFSET  0x1934AC8
-#define APIC_OPS_COUNT   28
-#define MAX_CAPTURES     4
-#define REGS_PER_CAPTURE 17
+#define MAGIC_KTST       0x4B545354  /* "KTST" */
+
+/* FW 4.03 offsets (relative to kdata_base, negative = ktext) */
+#define NOP_RET_OFF      (-0x9d20ca)    /* wrmsr_ret + 2 = just 'ret' */
+#define APIC_OPS_OFF_FROM_KTEXT  0x1934AC8
 
 typedef struct {
     uint64_t kdata_base;
     uint32_t fw_ver;
 } kproc_args;
 
-static volatile uint64_t capture_buf[MAX_CAPTURES * REGS_PER_CAPTURE];
-static volatile int capture_count;
-static volatile uint64_t orig_func;
-
-static inline uint64_t rdtsc(void)
-{
-    uint32_t lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((uint64_t)hi << 32) | lo;
-}
-
-__attribute__((naked, used))
-static void probe_stub(void)
-{
-    __asm__ volatile(
-        "pushq %%rax\n\t"
-        "pushq %%rbx\n\t"
-
-        "movl capture_count(%%rip), %%eax\n\t"
-        "cmpl %[max], %%eax\n\t"
-        "jge 1f\n\t"
-
-        "leaq capture_buf(%%rip), %%rbx\n\t"
-        "imulq $136, %%rax, %%rax\n\t"
-        "addq %%rax, %%rbx\n\t"
-
-        "movq %%rcx, 2*8(%%rbx)\n\t"
-        "movq %%rdx, 3*8(%%rbx)\n\t"
-        "movq %%rsi, 4*8(%%rbx)\n\t"
-        "movq %%rdi, 5*8(%%rbx)\n\t"
-        "movq %%rbp, 6*8(%%rbx)\n\t"
-        "movq %%r8,  7*8(%%rbx)\n\t"
-        "movq %%r9,  8*8(%%rbx)\n\t"
-        "movq %%r10, 9*8(%%rbx)\n\t"
-        "movq %%r11, 10*8(%%rbx)\n\t"
-        "movq %%r12, 11*8(%%rbx)\n\t"
-        "movq %%r13, 12*8(%%rbx)\n\t"
-        "movq %%r14, 13*8(%%rbx)\n\t"
-        "movq %%r15, 14*8(%%rbx)\n\t"
-
-        "leaq 16(%%rsp), %%rax\n\t"
-        "movq %%rax, 15*8(%%rbx)\n\t"
-
-        "pushfq\n\t"
-        "popq %%rax\n\t"
-        "movq %%rax, 16*8(%%rbx)\n\t"
-
-        "movq 8(%%rsp), %%rax\n\t"
-        "movq %%rax, 0*8(%%rbx)\n\t"
-
-        "movq (%%rsp), %%rax\n\t"
-        "movq %%rax, 1*8(%%rbx)\n\t"
-
-        "movl capture_count(%%rip), %%eax\n\t"
-        "incl %%eax\n\t"
-        "movl %%eax, capture_count(%%rip)\n\t"
-
-        "1:\n\t"
-        "popq %%rbx\n\t"
-        "popq %%rax\n\t"
-        "jmpq *orig_func(%%rip)\n\t"
-        :
-        : [max] "i"(MAX_CAPTURES)
-        : "memory"
-    );
-}
-
-/* Slots to try, in order of expected frequency */
-#define NUM_TRY_SLOTS 8
-static const int try_slots[NUM_TRY_SLOTS] = {
-    9,   /* ipi_vectored - TLB shootdowns, scheduler */
-    8,   /* ipi_raw - raw IPI */
-    25,  /* self_ipi - self-interrupt */
-    23,  /* timer_initial_count - scheduler tick */
-    24,  /* timer_current_count - timer read */
-    18,  /* set_tpr - interrupt priority */
-    20,  /* timer_enable_intr */
-    10,  /* ipi_wait */
-};
-
 int module_start(kproc_args* args)
 {
     uint64_t kdata_base = args->kdata_base;
+    uint32_t mode = args->fw_ver;  /* repurpose fw_ver as test mode */
     volatile uint64_t* out = (volatile uint64_t*)args;
+    volatile uint32_t* out32 = (volatile uint32_t*)args;
 
-    /* Output needs: 6 header + 28 table + 2 masks + 4*17 captures + 1 sentinel = 105 slots */
-    for (int i = 0; i < 105; i++)
+    /* Zero output */
+    for (int i = 0; i < 12; i++)
         out[i] = 0;
 
-    /* rdmsr LSTAR */
+    /* Compute addresses */
     uint32_t lo, hi;
     __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"((uint32_t)0xC0000082));
     uint64_t lstar = ((uint64_t)hi << 32) | lo;
     uint64_t ktext_base = lstar - 0x294218;
-    uint64_t apic_ops_addr = ktext_base + APIC_OPS_OFFSET;
+    uint64_t apic_ops_addr = ktext_base + APIC_OPS_OFF_FROM_KTEXT;
+    uint64_t nop_ret = kdata_base + NOP_RET_OFF;  /* ktext address */
 
-    volatile uint32_t* out32 = (volatile uint32_t*)args;
-    out32[0] = MAGIC_REGP;
-    out32[1] = 0;
+    volatile uint64_t* apic_table = (volatile uint64_t*)apic_ops_addr;
+    uint64_t original = apic_table[2];       /* original xapic_mode */
+    uint64_t is_x2apic = apic_table[3];     /* is_x2apic function */
+    uint64_t get_timer_freq = apic_table[19]; /* get_timer_freq */
+
+    /* Determine actual mode from fw_ver field */
+    uint32_t actual_mode;
+    if (mode == 0x403)
+        actual_mode = 0;  /* get_timer_freq test (safest: real ktext func) */
+    else if (mode <= 3)
+        actual_mode = mode;
+    else
+        actual_mode = 0;
+
+    /* Write header */
+    out32[0] = MAGIC_KTST;
+    out32[1] = actual_mode;
     out[1] = kdata_base;
     out[2] = ktext_base;
     out[3] = apic_ops_addr;
+    out[4] = original;
 
-    volatile uint64_t* apic_table = (volatile uint64_t*)apic_ops_addr;
-    out[4] = apic_table[2];  /* original xapic_mode */
-
-    /* Part 1: Dump all apic_ops entries (slots 6..33) */
-    for (int i = 0; i < APIC_OPS_COUNT; i++)
-        out[6 + i] = apic_table[i];
-
-    /* Part 2: Try hooking slots */
-    uint64_t slots_tried = 0;
-    uint64_t slots_hit = 0;
-    int hooked_slot = -1;
-
-    /* Get TSC frequency estimate: ~3.5 GHz on PS5 Zen 2 */
-    /* 1 second ≈ 3,500,000,000 cycles */
-    uint64_t one_second_tsc = 3500000000ULL;
-
-    for (int t = 0; t < NUM_TRY_SLOTS; t++) {
-        int slot = try_slots[t];
-        if (slot >= APIC_OPS_COUNT) continue;
-
-        uint64_t original = apic_table[slot];
-        if (original == 0) continue;
-
-        slots_tried |= (1ULL << slot);
-
-        capture_count = 0;
-        for (int i = 0; i < MAX_CAPTURES * REGS_PER_CAPTURE; i++)
-            capture_buf[i] = 0;
-        orig_func = original;
-
-        /* Install probe */
-        apic_table[slot] = (uint64_t)probe_stub;
-
-        /* Wait up to 1 second using RDTSC */
-        uint64_t start = rdtsc();
-        while (capture_count < MAX_CAPTURES) {
-            uint64_t now = rdtsc();
-            if (now - start > one_second_tsc)
-                break;
-            /* Yield hint to allow other threads/cores to run */
-            __asm__ volatile("pause");
-        }
-
-        /* Restore immediately */
-        apic_table[slot] = original;
-
-        if (capture_count > 0) {
-            slots_hit |= (1ULL << slot);
-            hooked_slot = slot;
-            break;  /* Got captures! */
-        }
+    uint64_t new_target;
+    switch (actual_mode) {
+        case 0:  new_target = get_timer_freq; break;  /* real ktext func */
+        case 1:  new_target = is_x2apic;   break;  /* returns 0 */
+        case 2:  new_target = original;    break;  /* same as original */
+        case 3:  /* restore mode */
+            apic_table[2] = original;  /* ensure original is restored */
+            out[5] = original;
+            out[6] = apic_table[2];  /* readback */
+            out[7] = nop_ret;
+            out[8] = is_x2apic;
+            out32[18] = 2;  /* status: restored */
+            out[10] = 0xdeadbeefcafe0004ULL;
+            return 0;
+        default: new_target = original; break;
     }
 
-    /* Store masks (slots 34-35, offsets 0x110-0x11F) */
-    out[34] = slots_tried;
-    out[35] = slots_hit;
+    out[5] = new_target;
 
-    out32[10] = (uint32_t)(capture_count > 0 ? capture_count : 0);
-    out32[11] = (uint32_t)(hooked_slot >= 0 ? hooked_slot : 0xFF);
+    /* Verify new_target is in ktext range */
+    if (new_target < ktext_base || new_target >= kdata_base) {
+        out32[18] = 0xFF;  /* error: target not in ktext */
+        out[10] = 0xdeadbeefcafe0004ULL;
+        return 0;
+    }
 
-    if (capture_count > 0) {
-        int n = capture_count;
-        if (n > MAX_CAPTURES) n = MAX_CAPTURES;
+    /* OVERWRITE apic_ops[2] with ktext target */
+    apic_table[2] = new_target;
 
-        /* Captures at slots 36+ (offset 0x120) */
-        for (int c = 0; c < n; c++) {
-            for (int r = 0; r < REGS_PER_CAPTURE; r++) {
-                out[36 + c * REGS_PER_CAPTURE + r] = capture_buf[c * REGS_PER_CAPTURE + r];
-            }
-        }
-        out32[1] = 1;
+    /* Readback to verify */
+    uint64_t readback = apic_table[2];
+    out[6] = readback;
+    out[7] = nop_ret;
+    out[8] = is_x2apic;
+
+    if (readback == new_target) {
+        out32[18] = 1;  /* status: armed */
     } else {
-        out32[1] = 2;  /* table-only */
+        out32[18] = 0xFF;  /* error: write failed */
     }
 
-    /* Sentinel at slot 104 (offset 0x340) */
-    out[104] = 0xdeadbeefcafe0003ULL;
+    out[10] = 0xdeadbeefcafe0004ULL;  /* sentinel */
 
     return 0;
 }
