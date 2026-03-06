@@ -160,36 +160,33 @@ static void sort_u64(uint64_t* arr, int n)
  *   3. Read pcb+onfault_offset — should be 0 (no active fault handler)
  *   4. If all checks pass, return &pcb->pcb_onfault
  */
-static uint64_t find_pcb_onfault(void)
+/*
+ * Diagnostic version: dump %gs:0x00..0x40 to output for pcpu layout analysis.
+ * Does NOT dereference any pointers (safe against faults).
+ * Returns 0 always — pcb_onfault discovery deferred until we know offsets.
+ */
+static void dump_pcpu_layout(volatile uint64_t* out)
 {
-    for (int i = 0; i < PC_CURPCB_CANDIDATES; i++) {
-        uint64_t pcb;
-        int off = pc_curpcb_offsets[i];
-
-        /* Read %gs:off */
+    /* Dump %gs:0x00 through %gs:0x40 (9 qwords) to out[40..48] */
+    for (int i = 0; i <= 8; i++) {
+        uint64_t val;
+        uint64_t off = i * 8;
         __asm__ volatile(
             "movq %%gs:(%1), %0"
-            : "=r"(pcb)
-            : "r"((uint64_t)off)
+            : "=r"(val)
+            : "r"(off)
         );
-
-        /* Validate: pcb should look like a kernel address */
-        if ((pcb >> 40) != 0xffffff)
-            continue;
-        /* Check alignment */
-        if (pcb & 0x7)
-            continue;
-
-        /* Try each pcb_onfault offset */
-        for (int j = 0; j < PCB_ONFAULT_CANDIDATES; j++) {
-            int foff = pcb_onfault_offsets[j];
-            uint64_t val = *(volatile uint64_t*)(pcb + foff);
-
-            /* Should be NULL for a fresh kernel thread */
-            if (val == 0)
-                return pcb + foff;
-        }
+        out[40 + i] = val;
     }
+}
+
+static uint64_t find_pcb_onfault(volatile uint64_t* out)
+{
+    /* Dump pcpu layout for diagnostics first */
+    dump_pcpu_layout(out);
+
+    /* For now, return 0 — don't dereference unknown pointers.
+     * Once we know the correct offsets from the dump, we'll hardcode them. */
     return 0;
 }
 
@@ -218,9 +215,9 @@ int module_start(kproc_args* args)
         safe_region[i] = nop_ret;
     safe_addr = (uint64_t)((uint8_t*)args + 2304 + 896);
 
-    /* Find pcb_onfault for fault recovery */
-    pcb_onfault_ptr = find_pcb_onfault();
-    out[9] = pcb_onfault_ptr;  /* report: 0 = not found */
+    /* Dump pcpu layout + attempt onfault discovery */
+    pcb_onfault_ptr = find_pcb_onfault(out);
+    out[9] = pcb_onfault_ptr;  /* 0 = not found (diagnostic mode) */
 
     /* Build sorted function list */
     int n_funcs = 0;
