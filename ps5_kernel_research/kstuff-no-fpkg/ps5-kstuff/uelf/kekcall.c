@@ -112,26 +112,14 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
         LOG("Handling kmalloc kekcall\n");
         //
         // malloc with rwx
-        // Build custom frame: doreti_iret -> TRAP_KEKCALL,5 handler
-        // which stores malloc result in td_retval and restores debug regs
         //
-        uint64_t td = regs[RDI]; // save thread pointer before overwriting
-        uint64_t stack_frame[14] = {
-            (uint64_t)doreti_iret,
-            MKTRAP(TRAP_KEKCALL, 5),
-            [12] = td, // save td for return value storage
-        };
-        read_dbgregs(stack_frame+6);
-        push_stack(regs, stack_frame, sizeof(stack_frame));
-
-        kpoke64(td+td_retval, 0);
+        kpoke64(regs[RDI]+td_retval, 0);
         regs[RDI] = args[RDI];
         regs[RSI] = (uint64_t) M_something;
         regs[RDX] = 0x1;
         regs[RIP] = (uint64_t) malloc;
 
-        set_pcb_dbregs();
-        write_dbgregs(dbgregs_for_kfunction_fixes);
+        start_syscall_with_dbgregs(regs, dbgregs_for_kfunction_fixes);
     } 
     else if (nr == 7)
     {
@@ -233,17 +221,6 @@ void handle_kekcall_trap(uint64_t* regs, uint32_t trap)
         pop_stack(regs, stack_frame, sizeof(stack_frame));
         if(trap == 3 && !(uint32_t)regs[RAX])
             kpoke64(stack_frame[5]+td_retval, kpeek64(stack_frame[6]+td_retval));
-        regs[RIP] = stack_frame[13];
-    }
-    else if(trap == 5)
-    {
-        // Return from kekcall nr=6 (malloc with RWX)
-        uint64_t stack_frame[14];
-        pop_stack(regs, stack_frame, sizeof(stack_frame));
-        uint64_t td = stack_frame[11];
-        kpoke64(td+td_retval, regs[RAX]);
-        regs[RAX] = 0;
-        write_dbgregs(stack_frame+5);
         regs[RIP] = stack_frame[13];
     }
     else if(trap == 6)
