@@ -998,7 +998,12 @@ static void _kldload(void* data, size_t data_size)
         printf("  ktext_base:    %#lx\n", ktext);
         printf("  apic_ops @:    %#lx\n", apic_addr);
         printf("  orig xapic:    %#lx (ktext+%#lx)\n", readback[4], readback[4] - ktext);
-        printf("  nop_ret:       %#lx (ktext+%#lx)\n", readback[34], readback[34] - ktext);
+        printf("  armed_target:  %#lx", readback[34]);
+        if (readback[34] >= ktext && readback[34] < kdata)
+            printf(" (ktext+%#lx)", readback[34] - ktext);
+        else if ((readback[34] >> 40) == 0xffffff)
+            printf(" (heap - capture_stub trampoline)");
+        printf("\n");
         printf("  capture_stub:  %#lx\n", readback[35]);
         printf("  captures:      %u (hooked slot %u = %s)\n", call_count,
                hooked_slot, hooked_slot < 28 ? slot_names[hooked_slot] : "?");
@@ -1067,15 +1072,21 @@ static void _kldload(void* data, size_t data_size)
         printf("  sentinel: %#lx %s\n", readback[104],
                readback[104] == 0xdeadbeefcafe0005ULL ? "[OK]" : "[MISSING]");
 
-        /* Kdata markers for post-resume check */
-        printf("\n  kdata markers (check after resume):\n");
-        int markers_ok = 1;
-        for (int i = 0; i < 16; i++) {
-            uint64_t expected = 0xDEAD000000000000ULL | (uint64_t)(i + 1);
-            uint64_t actual = readback[105 + i];
-            if (actual != expected) markers_ok = 0;
+        /* Phase 1 probe metadata */
+        printf("\n  Phase 1 probe info:\n");
+        uint64_t slots_tried = readback[105];
+        uint64_t slots_hit = readback[106];
+        uint64_t first_hit = readback[107];
+        printf("    slots_tried: %#lx", slots_tried);
+        if (slots_tried) {
+            printf(" (");
+            for (int i = 0; i < 28; i++)
+                if ((slots_tried >> i) & 1)
+                    printf("%s(%d) ", i < 28 ? slot_names[i] : "?", i);
+            printf(")");
         }
-        printf("    marker integrity: %s\n", markers_ok ? "ALL OK" : "MISMATCH");
+        printf("\n    slots_hit:   %#lx\n", slots_hit);
+        printf("    first_hit:   %#lx\n", first_hit);
         printf("    second sentinel: %#lx %s\n", readback[121],
                readback[121] == 0xfeedface00000005ULL ? "[OK]" : "[MISSING]");
 

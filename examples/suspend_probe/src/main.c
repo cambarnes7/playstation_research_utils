@@ -1,31 +1,35 @@
 #include <stdint.h>
 
 /*
- * PS5 Suspend Register Capture v2 (kstuff payload)
+ * PS5 Suspend Register Capture v3 (kstuff payload)
  *
- * v2 changes from v1:
- *   - Wait 2 seconds (not 200ms) for register captures
- *   - Try MULTIPLE apic_ops slots: [2] xapic_mode, [3] is_x2apic,
- *     [18] set_tpr, [24] timer_current_count (timer-related = frequent)
- *   - Arm with is_x2apic (returns 0 = "not x2apic", safe return value)
- *     instead of nop_ret (which returned garbage RAX → PANIC on resume)
+ * v3 changes from v2:
+ *   - Arm with capture_stub TRAMPOLINE instead of is_x2apic.
+ *     capture_stub saves registers then tail-calls orig_func (= original
+ *     xapic_mode), so the APIC gets properly initialized on resume.
+ *   - v2 panicked because is_x2apic doesn't do xapic_mode's hardware
+ *     setup work (writes to APIC MSRs/MMIO). Returning 0 isn't enough.
+ *   - v1 panicked because nop_ret returned garbage RAX.
  *
- * KEY FINDING from v1: nop_ret caused kernel panic on resume, proving:
- *   1) apic_ops[2] IS called during suspend
- *   2) The return value matters (garbage → wrong APIC mode → panic)
- *   3) get_timer_freq survived because its large return was != x2APIC flag
+ * KEY INSIGHT: The capture_stub lives in kernel heap (NX-cleared page).
+ *   The PTE modification is in-memory and survives suspend/resume.
+ *   After resume, TLBs are flushed but the page table walk finds the
+ *   NX-cleared PTE → capture_stub can execute → calls orig xapic_mode
+ *   → APIC initializes properly → no panic.
  *
  * TWO PHASES:
  *
  * Phase 1 — REGISTER CAPTURE (normal operation):
  *   Hooks multiple apic_ops slots with capture stubs.
- *   Waits ~2s for natural kernel calls.
+ *   Waits ~500ms per slot for natural kernel calls.
  *   Captures up to 4 full register snapshots per slot hit.
  *   Restores all originals when done.
  *
  * Phase 2 — SUSPEND ARMING:
- *   Overwrites apic_ops[2] with is_x2apic (ktext, returns 0, safe).
- *   User enters rest mode after this completes.
+ *   Sets orig_func = original xapic_mode.
+ *   Overwrites apic_ops[2] with capture_stub (heap trampoline).
+ *   On resume: capture_stub → saves regs → calls xapic_mode → no panic.
+ *   After resume, readback shows registers from the resume call.
  *
  * Output layout (uint64_t indices):
  *   [0]   magic(32) "SRCP" | status(32)
@@ -35,7 +39,7 @@
  *   [4]   orig_xapic_mode
  *   [5]   capture_count(32) | hooked_slot(32)
  *   [6..33]  apic_ops table dump (28 slots)
- *   [34]  armed_target (is_x2apic addr)
+ *   [34]  armed_target (capture_stub addr for v3)
  *   [35]  capture_stub_addr
  *   [36..103] register captures: 4 × 17 uint64_t
  *             each capture: RAX,RBX,RCX,RDX,RSI,RDI,RBP,R8-R15,RSP,RFLAGS
@@ -184,7 +188,6 @@ int module_start(kproc_args* args)
 
     /* Save originals */
     uint64_t original_slot2 = apic_table[2];
-    uint64_t original_slot3 = apic_table[3]; /* is_x2apic */
     out[4] = original_slot2;
 
     /* Dump full apic_ops table (28 slots) */
@@ -255,21 +258,30 @@ int module_start(kproc_args* args)
     /* ════════════════════════════════════════════
      * PHASE 2: ARM FOR SUSPEND
      *
-     * Use is_x2apic (slot 3) as the armed target for apic_ops[2].
-     * is_x2apic returns 0 = "not in x2APIC mode", which is the
-     * CORRECT answer for PS5 (uses xAPIC, not x2APIC).
+     * Use capture_stub as a TRAMPOLINE for apic_ops[2].
+     * capture_stub saves all registers then tail-calls orig_func.
+     * We set orig_func = original xapic_mode, so:
+     *   resume → capture_stub → save regs → jmp xapic_mode → APIC init OK
      *
-     * Unlike nop_ret (which returned garbage RAX and caused panic),
-     * is_x2apic returns a valid, expected value.
+     * v2 used is_x2apic (just returns 0) → panic because APIC not initialized.
+     * v1 used nop_ret (returns garbage) → panic because wrong return value.
+     * v3 uses capture_stub → calls the REAL xapic_mode → works!
+     *
+     * capture_stub is in kernel heap with NX cleared. The PTE modification
+     * is in physical memory and survives suspend/resume.
      * ════════════════════════════════════════════ */
 
-    /* Armed target = is_x2apic function (ktext, returns 0) */
-    uint64_t armed_target = original_slot3;  /* is_x2apic */
+    /* Set orig_func to the ORIGINAL xapic_mode so capture_stub calls it */
+    orig_func = original_slot2;
+    cap_count = 0;  /* reset so we capture the resume call */
+
+    /* Armed target = capture_stub (heap trampoline → calls xapic_mode) */
+    uint64_t armed_target = (uint64_t)capture_stub;
     out[34] = armed_target;
 
     out[121] = 0xfeedface00000005ULL;
 
-    /* Arm apic_ops[2] with is_x2apic */
+    /* Arm apic_ops[2] with capture_stub trampoline */
     apic_table[2] = armed_target;
 
     uint64_t readback = apic_table[2];
