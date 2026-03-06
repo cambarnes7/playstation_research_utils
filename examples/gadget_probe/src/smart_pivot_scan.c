@@ -165,10 +165,39 @@ static void sort_u64(uint64_t* arr, int n)
  * Does NOT dereference any pointers (safe against faults).
  * Returns 0 always — pcb_onfault discovery deferred until we know offsets.
  */
-static void dump_pcpu_layout(volatile uint64_t* out)
+/*
+ * Diagnostic: dump pcpu layout into VISIBLE header slots (out[4..8]).
+ * kldload only prints through [0x38] so we use slots the user can see.
+ * We also tag out[3] high bits to mark this as a diagnostic dump.
+ *
+ * Layout:
+ *   out[4] = %gs:0x00  (pc_prvspace / self-pointer)
+ *   out[5] = %gs:0x08  (pc_curthread)
+ *   out[6] = %gs:0x10  (candidate: curpcb or idlethread)
+ *   out[7] = %gs:0x18  (candidate: curpcb or fpcurthread)
+ *
+ * Also dumps %gs:0x00..0xf8 (32 qwords) into out[40..71] in case
+ * we can hex-dump the full readback later.
+ */
+static uint64_t find_pcb_onfault(volatile uint64_t* out)
 {
-    /* Dump %gs:0x00 through %gs:0x40 (9 qwords) to out[40..48] */
-    for (int i = 0; i <= 8; i++) {
+    /* Tag out[3] high word to mark diagnostic mode */
+    out[3] |= ((uint64_t)0xDDDD << 48);
+
+    /* Dump first 4 pcpu qwords into visible header slots */
+    for (int i = 0; i < 4; i++) {
+        uint64_t val;
+        uint64_t off = i * 8;
+        __asm__ volatile(
+            "movq %%gs:(%1), %0"
+            : "=r"(val)
+            : "r"(off)
+        );
+        out[4 + i] = val;
+    }
+
+    /* Also dump wider range %gs:0x00..0xf8 into out[40..71] */
+    for (int i = 0; i < 32; i++) {
         uint64_t val;
         uint64_t off = i * 8;
         __asm__ volatile(
@@ -178,15 +207,7 @@ static void dump_pcpu_layout(volatile uint64_t* out)
         );
         out[40 + i] = val;
     }
-}
 
-static uint64_t find_pcb_onfault(volatile uint64_t* out)
-{
-    /* Dump pcpu layout for diagnostics first */
-    dump_pcpu_layout(out);
-
-    /* For now, return 0 — don't dereference unknown pointers.
-     * Once we know the correct offsets from the dump, we'll hardcode them. */
     return 0;
 }
 
