@@ -230,13 +230,6 @@ int module_start(kproc_args* args)
     pcb_onfault_ptr = find_pcb_onfault(out);
     out[9] = pcb_onfault_ptr;  /* 0 = not found (diagnostic mode) */
 
-    /* v5.2c: early return to isolate panic source.
-     * If we get readback, the panic is in func-list building or probing.
-     * If we still panic, it's in the init code above. */
-    out[0] = ((uint64_t)0xDDDD << 32) | MAGIC_SPVT;
-    out[8] = 0xC0DE52C0;  /* marker: early return taken */
-    return 0;
-
     /* Build sorted function list */
     int n_funcs = 0;
 
@@ -273,6 +266,15 @@ int module_start(kproc_args* args)
     }
 
     sort_u64(func_list, n_funcs);
+
+    /* v5.2d: return after func-list build, before probing.
+     * Report how many functions found from each source. */
+    out[0] = ((uint64_t)0xEEEE << 32) | MAGIC_SPVT;
+    out[4] = n_funcs;  /* total functions found */
+    /* Show first 4 function addresses in slots 5-8 */
+    for (int i = 0; i < 4 && i < n_funcs; i++)
+        out[5 + i] = func_list[i];
+    return 0;
 
     int batch_start = SCAN_BATCH * BATCH_SIZE;
     int batch_end = batch_start + BATCH_SIZE;
