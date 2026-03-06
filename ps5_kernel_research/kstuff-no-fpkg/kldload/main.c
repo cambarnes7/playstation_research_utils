@@ -118,8 +118,11 @@ static void _kldload(void* data, size_t data_size)
     kekcall_kproc_create(exec_code, kthread_args, kproc_name);
     printf("[debug] kproc_create returned\n");
 
-    /* Wait for thread to complete */
-    usleep(100000); /* 100ms */
+    /* Wait for thread to complete.
+     * suspend_probe v2 probes up to 6 slots × 500ms = 3s,
+     * so we need at least 4s here. */
+    printf("[debug] waiting 5s for payload to complete...\n");
+    usleep(5000000); /* 5s */
 
     /* Read back results from kthread_args */
     printf("[debug] reading back kthread_args (%d bytes)...\n", READBACK_SIZE);
