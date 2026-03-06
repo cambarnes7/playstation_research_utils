@@ -158,6 +158,11 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
         uint64_t vmspace = kpeek64(proc + 0x200);    // p_vmspace
         uint64_t user_cr3 = kpeek64(vmspace + 0x2E0 + 0x28); // pmap.pm_cr3
 
+        // Stash diagnostic values in td_retval so user can read them
+        // td_retval[0] = user_cr3, td_retval[1] = proc
+        kpoke64(td + td_retval, user_cr3);
+        kpoke64(td + td_retval + 8, vmspace);
+
         uint64_t user_addr = args[RDI];
         uint64_t kernel_addr = args[RSI];
         uint64_t size = args[RDX];
@@ -167,13 +172,13 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
         while(size > 0) {
             // Resolve user VA via user process CR3
             if(!virt2phys_cr3(user_addr, &phys_src, &phys_src_end, user_cr3)) {
-                args[RAX] = EFAULT;
-                return EFAULT;
+                args[RAX] = 100; // user VA resolution failed
+                return 100;
             }
             // Resolve kernel VA via kernel CR3
             if(!virt2phys(kernel_addr, &phys_dst, &phys_dst_end)) {
-                args[RAX] = EFAULT;
-                return EFAULT;
+                args[RAX] = 200; // kernel VA resolution failed
+                return 200;
             }
             // Chunk size = min of remaining bytes, src page remainder, dst page remainder
             size_t chunk = phys_src_end - phys_src;
@@ -188,6 +193,32 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
             size -= chunk;
         }
         args[RAX] = 0;
+        return 0;
+    }
+    else if (nr == 9)
+    {
+        // Diagnostic kekcall: return process info for debugging
+        // args[RDI] = what to return:
+        //   0 = user_cr3
+        //   1 = proc ptr
+        //   2 = vmspace ptr
+        //   3 = cr3_phys (kernel CR3)
+        uint64_t td = regs[RDI];
+        uint64_t proc = kpeek64(td + td_proc);
+        uint64_t vmspace = kpeek64(proc + 0x200);
+        uint64_t what = args[RDI];
+        if(what == 0)
+            args[RAX] = kpeek64(vmspace + 0x2E0 + 0x28); // pmap.pm_cr3
+        else if(what == 1)
+            args[RAX] = proc;
+        else if(what == 2)
+            args[RAX] = vmspace;
+        else if(what == 3)
+            args[RAX] = cr3_phys;
+        else if(what == 4)
+            args[RAX] = td;
+        else
+            args[RAX] = 0xdeadbeef;
         return 0;
     }
     else if(nr == 0xffffffff)
