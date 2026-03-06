@@ -142,6 +142,160 @@ The kernel module loader (`kldload.elf`) is **fully functional**:
 - Copies code into kernel memory via kernel `copyin` (kekcall nr=8)
 - Clears NX bit on code pages via page table walk (kekcall nr=10)
 - Launches kernel thread via `kproc_create` (kekcall nr=7)
+- Reads back kthread_args buffer (2304 bytes) for structured output
 - Verified with `test_kmod.bin` writing `0xCAFEBABE`/`0xDEAD` markers
 
-The `apic_ops.bin` research payload (2816 bytes) loads and launches without panic. Its output goes to `kprintf` (kernel log buffer) rather than back over the network, so results must be read from the kernel log.
+---
+
+## Phase 2: Kernel Reconnaissance
+
+**Status: COMPLETE**
+
+With kldload working, deployed multiple research payloads:
+
+### apic_dump
+Dumped all 28 `apic_ops` function pointers and sorted unique sysent ktext function addresses. Gave us ~200+ known ktext entry points as anchor addresses for gadget scanning.
+
+### gadget_reader (v1-v2)
+Attempted to read bytes around known ktext addresses via DMAP (Direct Memory Access Mapping). Idea: if physical pages backing ktext can be read through DMAP, we can scan for gadget byte patterns without executing anything.
+
+**Result**: Limited success. The hypervisor appears to intercept or block DMAP accesses to ktext-backing physical pages.
+
+### register_probe
+Captured full register state at the apic_ops[2] call site. Confirmed which registers contain useful values (function pointers, kernel addresses) when entering apic_ops handlers.
+
+### chain_prep
+Read system registers (LSTAR, CR3, etc.) and confirmed pop_all_iret layout matches standard FreeBSD. Established that LSTAR = ktext_base + 0x294218.
+
+### ktext_mapper
+Built expanded ktext pointer map by scanning IDT entries + kdata for ktext function pointers. Discovered many function entry points across the ktext region.
+
+---
+
+## Phase 3: Pivot Gadget Scanning
+
+**Status: IN PROGRESS — the core challenge**
+
+### Goal
+Find a **stack pivot gadget** in ktext (e.g., `xchg rsp, rax; ret` = bytes `48 94 c3`) that allows redirecting kernel execution to a controlled stack, enabling ROP despite CFI/hypervisor.
+
+### Strategy 1: Blind Execution Probing (v1-v3)
+Systematically executed offsets near known ktext function boundaries, checking if they returned cleanly or crashed.
+
+- Built batch scanner that probed offsets within ktext functions
+- Scanned epilogues (bytes before function entry points) for `pop; ret` sequences
+- **Result**: Many crashes, no pivots found. Without fault recovery, each crash killed the thread.
+
+### Strategy 2: pcb_onfault Fault Recovery (v5-v5.3)
+FreeBSD's `pcb_onfault` mechanism: set a recovery address in the PCB, and faults jump there instead of panicking. Critical for surviving bad probes.
+
+- **v5-v5.1**: Attempted to set pcb_onfault, but wrong td_pcb offset caused crashes
+- **v5.2-v5.2f**: Series of diagnostics to discover pcpu layout and td_pcb offset
+- **v5.3-v5.3c**: Attempted full probing with fault recovery — unreliable across reboots
+
+**Key problem**: td_pcb offset varies between struct layout assumptions. Needed empirical discovery.
+
+### Strategy 3: DMAP Byte Scanning (v6-v6b)
+Read ktext bytes through DMAP to find gadget byte patterns without executing.
+
+- **v6**: Static byte scanner searching for `48 94 c3` (xchg rsp,rax; ret) in DMAP
+- **v6b**: Added pcb_onfault protection for XO page faults during DMAP reads
+- **Result**: Hypervisor blocks DMAP reads of ktext physical pages. XOM enforced even through DMAP alias.
+
+### Strategy 4: kdata Function Pointer Harvesting (v7-v10)
+Scanned all of kdata for pointers into ktext, building a map of callable functions.
+
+- **v7**: Wide scan of kdata for ktext pointers
+- **v8**: Added kernel pointer diagnostics
+- **v9**: Packed 8 ktext offsets per output slot for efficiency
+- **v10**: Deduplicated page bitmap with summary mode
+
+**Result**: Found many function entry points but couldn't read their bytes due to XOM.
+
+### Strategy 5: Execute-Test (v11-v13)
+Execute candidate ktext offsets and check if RSP changed (indicating a pivot).
+
+- Set RAX to a known address, execute the candidate, check if RSP == RAX afterward
+- **v11**: Initial implementation
+- **v12**: One-offset-at-a-time for safety
+- **v13**: Fixed stack layout for recovery label
+- **Problem**: Still needed reliable pcb_onfault for surviving bad candidates
+
+### Strategy 6: Thread Structure Research (v14-v17) — CURRENT
+
+Pivoted to empirically mapping the kernel thread structure to get correct pcb_onfault offset.
+
+| Version | What | Result |
+|---------|------|--------|
+| v14 | Dereference pcb pointer at td+0x3f8 | **CRASHED** — bad pcb sub-offsets |
+| v15 | Minimal smoke test (no dereferences) | **WORKED** — confirmed infrastructure solid |
+| v16 | Dump 1024 bytes of struct thread | **WORKED** — found td_pcb at +0x3f8, td_name at +0x290 |
+| v17 | Dump 256 bytes of struct pcb | **PENDING** — will reveal pcb_onfault, pcb_cr3, pcb_rsp |
+
+---
+
+## Key Discoveries
+
+| Item | Value | How Found |
+|------|-------|-----------|
+| kdata_base | KASLR'd per boot | From payload_args |
+| ktext_base | kdata_base - 0xC00000 | LSTAR - 0x294218 |
+| LSTAR | ktext_base + 0x294218 | rdmsr 0xC0000082 |
+| curthread | gs:0 | movq %%gs:0 |
+| curthread region | DMAP (0xffffXXXX...) | v16 dump |
+| td_pcb offset | **+0x3f8** | v16: only kern_heap ptr in thread struct |
+| td_name offset | +0x290 | v16: contains "my_kthread" |
+| td_proc (likely) | +0x008 | v16: DMAP pointer |
+| pcb_onfault | TBD | v17 will reveal |
+| pcb_cr3 | TBD | v17 will reveal |
+
+### Thread Structure Layout (v16, FW 4.03)
+
+```
++0x000: mutex/lock ptr (kdata range 0xffffffffdb...)
++0x008: DMAP ptr (likely td_proc)
++0x010: null
++0x018: DMAP ptr (list linkage)
++0x028: kdata ptr
++0x030: DMAP ptr
++0x038: DMAP ptr
++0x050: DMAP ptr
++0x058-0x070: DMAP ptrs (various subsystems)
++0x078: DMAP ptr
++0x088: DMAP ptr
++0x098: 0x0001898bffffffff (flags/timestamp)
++0x0c8: DMAP self-reference (curthread + 0xc0)
++0x0d0: DMAP ptr (same as +0x008, proc?)
++0x0d8: 1 (flag)
++0x0e0: 0x00000004000003ff (capabilities)
++0x0e8: 0x2020000000000000
++0x140: DMAP ptr
++0x148: DMAP ptr
++0x290: td_name "my_kthread\0" (MAXCOMLEN=19)
++0x3b8: 0x0044004400000000 (scheduling params)
++0x3c0: 0x02bc02bc000a0044 (scheduling params)
++0x3f8: td_pcb → 0xffffff80XXXXXXXX (kernel heap)
+```
+
+---
+
+## Failures & Lessons
+
+1. **XOM is enforced through DMAP**: The hypervisor doesn't just block ktext virtual address reads — it also blocks reading the same physical pages through the DMAP alias. This eliminates the most obvious bypass.
+
+2. **Blind execution is dangerous**: Without fault recovery, any probe that doesn't return cleanly kills the kernel thread. Some bad probes crash the entire kernel.
+
+3. **Struct offsets must be discovered empirically**: FreeBSD struct layouts on PS5 (FW 4.03) don't match public FreeBSD source exactly. td_pcb at +0x3f8 had to be found by dumping the struct.
+
+4. **Linux gcc ≠ PS5 SDK**: Building kldload with Linux gcc produces an incompatible binary. Must use ps5-payload-dev/sdk with `prospero-clang` (target x86_64-sie-ps5).
+
+5. **KASLR means addresses change every boot**: All ktext/kdata addresses are randomized. Only offsets from kdata_base or ktext_base are stable.
+
+---
+
+## Next Steps
+
+1. **Run v17** to dump struct pcb and find pcb_onfault offset
+2. **Build v18**: execute-test scanner with correct pcb_onfault fault recovery
+3. Systematically probe ktext offsets near known functions for stack pivot gadgets
+4. If execute-test fails: consider alternative approaches (hypervisor interaction, different gadget types)

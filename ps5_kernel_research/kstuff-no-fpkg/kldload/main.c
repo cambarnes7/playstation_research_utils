@@ -550,15 +550,74 @@ static void _kldload(void* data, size_t data_size)
     } else if (magic == 0x53505654) { /* "SPVT" - smart pivot scan */
         uint32_t status = (uint32_t)(readback[0] >> 32);
         uint64_t ktext_base = readback[2];
-        uint64_t curthread = readback[4];
 
-        /* Detect v16 thread dump mode: sentinel at readback[5+127+1] won't exist,
-         * but we can check if readback[4] looks like a DMAP/kernel thread pointer
-         * and readback[3] looks like LSTAR (0xffffffff8xxxxxxx) */
-        int is_thread_dump = (readback[3] >> 32) == 0xffffffff &&
-                             (curthread >> 32) != 0 && curthread != 0;
+        /* Detect v17 pcb dump: sentinel 0xdeadbeefcafe0017 at slot 37 */
+        int is_pcb_dump = (readback[5 + 32] == 0xdeadbeefcafe0017ULL);
 
-        if (is_thread_dump) {
+        /* Detect v16 thread dump: readback[3] is LSTAR (0xffffffff8xxx) */
+        int is_thread_dump = !is_pcb_dump &&
+                             (readback[3] >> 32) == 0xffffffff &&
+                             (readback[4] >> 32) != 0 && readback[4] != 0;
+
+        if (is_pcb_dump) {
+            uint64_t curthread = readback[3];
+            uint64_t pcb_ptr = readback[4];
+
+            printf("\n=== PCB STRUCTURE DUMP ===\n");
+            printf("  kdata_base:  %#lx\n", readback[1]);
+            printf("  ktext_base:  %#lx\n", ktext_base);
+            printf("  curthread:   %#lx\n", curthread);
+            printf("  td_pcb:      %#lx (curthread+0x3f8)\n", pcb_ptr);
+
+            if (pcb_ptr == 0) {
+                printf("\n  td_pcb is NULL!\n");
+            } else {
+                printf("\n  --- struct pcb @ %#lx (256 bytes) ---\n", pcb_ptr);
+                for (int i = 0; i < 32; i++) {
+                    uint64_t val = readback[5 + i];
+                    int off = i * 8;
+                    const char* note = "";
+                    /* Annotate value types */
+                    if (val == 0)
+                        note = " [null]";
+                    else if (val < 0x1000)
+                        note = " [small]";
+                    else if ((val >> 40) == 0xffffff)
+                        note = " [kern_heap]";
+                    else if ((val >> 32) == 0xffffffff)
+                        note = " [kdata/ktext]";
+                    else if ((val & 0xFFF) == 0 && val < 0x800000000ULL)
+                        note = " [phys_addr? page-aligned]";
+                    else if (val > 0xffff000000000000ULL)
+                        note = " [kernel_ptr]";
+                    else if (val < 0x100)
+                        note = " [byte]";
+                    printf("  pcb+0x%03x: %#018lx%s\n", off, val, note);
+                }
+
+                /* Highlight cr3 candidates: page-aligned physical addresses */
+                printf("\n  --- cr3 candidates (page-aligned, < 4GB phys) ---\n");
+                for (int i = 0; i < 32; i++) {
+                    uint64_t val = readback[5 + i];
+                    if (val != 0 && (val & 0xFFF) == 0 && val < 0x800000000ULL) {
+                        printf("  pcb+0x%03x: %#018lx\n", i * 8, val);
+                    }
+                }
+
+                /* Highlight kernel stack pointers */
+                printf("\n  --- rsp/rbp candidates (kernel ptrs) ---\n");
+                for (int i = 0; i < 32; i++) {
+                    uint64_t val = readback[5 + i];
+                    if (val > 0xffff000000000000ULL && val != 0xffffffffffffffffULL) {
+                        printf("  pcb+0x%03x: %#018lx\n", i * 8, val);
+                    }
+                }
+            }
+
+            printf("\n=== END PCB DUMP ===\n");
+        } else if (is_thread_dump) {
+            uint64_t curthread = readback[4];
+
             printf("\n=== THREAD STRUCTURE DUMP ===\n");
             printf("  kdata_base:  %#lx\n", readback[1]);
             printf("  ktext_base:  %#lx\n", ktext_base);
@@ -571,7 +630,6 @@ static void _kldload(void* data, size_t data_size)
                 uint64_t val = readback[5 + i];
                 int off = i * 8;
                 const char* note = "";
-                /* Annotate likely pointer types */
                 if ((val >> 40) == 0xffffff)
                     note = " [kern_heap]";
                 else if ((val >> 32) == 0xffffffff)
@@ -586,7 +644,6 @@ static void _kldload(void* data, size_t data_size)
                 printf("  +0x%03x: %#018lx%s\n", off, val, note);
             }
 
-            /* Highlight candidates for td_pcb (kernel heap pointers) */
             printf("\n  --- td_pcb candidates (kernel heap ptrs) ---\n");
             for (int i = 0; i < 128 && (5 + i) < READBACK_SIZE / 8; i++) {
                 uint64_t val = readback[5 + i];
