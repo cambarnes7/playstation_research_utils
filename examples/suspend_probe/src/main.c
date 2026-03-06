@@ -1,57 +1,38 @@
 #include <stdint.h>
 
 /*
- * PS5 Suspend Persistence Test v5 (kstuff payload)
+ * PS5 ktext Gadget Scanner (kstuff payload)
  *
- * KEY LEARNINGS from v1-v4:
- *   v1: nop_ret in apic_ops[2] → panic (garbage return value)
- *   v2: is_x2apic in apic_ops[2] → panic (APIC not initialized)
- *   v3: capture_stub (heap) in apic_ops[2] → panic (heap not mapped)
- *   v4: markers in apic_ops slots 0,1,7 → panic (slots called on resume!)
+ * Scans all of ktext (12MB) byte-by-byte for stack pivot gadgets,
+ * including unintentional gadgets at misaligned instruction boundaries.
  *
- * CONCLUSION: ALL apic_ops slots may be called during resume.
- * The LAPIC must be fully reinitialized when waking from sleep, so
- * init, set_id, and possibly create are all invoked.
- *
- * v5 STRATEGY: Pure kdata persistence test — ZERO apic_ops modifications.
- *   - Read & dump apic_ops for reference (read-only)
- *   - Write marker values to a kdata region FAR from apic_ops
- *     (use kdata_base + small offset into BSS/padding area)
- *   - Write 16 distinct marker qwords so we can verify persistence
- *   - After resume, a readback payload checks if any survived
- *
- * Target kdata region: kdata_base + 0x100 (256 bytes into kdata)
- * This is deep in the BSS zero-fill area, far from any function
- * pointer tables. We write 16 qwords (128 bytes) starting there.
+ * Patterns searched:
+ *   - pop rsp; ret                    (5c c3)
+ *   - xchg rsp, <reg>; ret           (48 94 c3, 48 87 XX c3, etc.)
+ *   - mov rsp, <reg>; ret            (48 89 XX c3)
+ *   - push <reg>; pop rsp; ret       ({50-57} 5c c3, 41 {50-57} 5c c3)
+ *   - leave; ret                      (c9 c3) — limited to 5 results
  *
  * Output layout (uint64_t indices):
- *   [0]   magic(32) "SRCP" | status(32)
+ *   [0]   magic(32) "GSCA" | total_found(32)
  *   [1]   kdata_base
  *   [2]   ktext_base
- *   [3]   apic_ops_addr
- *   [4]   orig_xapic_mode (read-only, for reference)
- *   [5]   marker_region_addr (where we wrote markers)
- *   [6..33]  apic_ops table dump (read-only, 28 slots)
- *   [34]  marker_count (16)
- *   [35]  version_tag = 0x0005 (v5 identifier)
+ *   [3]   ktext_size
+ *   [4]   sentinel = 0xdeadbeefcafe0006
+ *   [5..122] results: 2 qwords each (up to 59 results)
+ *     [even] gadget_address
+ *     [odd]  type(8) | len(8) | reg_id(8) | pad(8) | 4_bytes_at_addr(32)
+ *   [123] end_sentinel = 0xfeedface00000006
  *
- *   --- Marker data (16 markers) ---
- *   [36..51]  original values at marker region (before write)
- *   [52..67]  marker values written
- *   [68..83]  readback values (verify writes took)
- *
- *   [104] sentinel = 0xdeadbeefcafe0005
- *   [121] second_sentinel = 0xfeedface00000005
- *   [122] apic_ops[2] current (should be unchanged = [4])
- *   [123] apic_ops[2] original (should be unchanged = [4])
+ * Types: 0=pop_rsp_ret, 1=xchg_rsp_reg_ret, 2=mov_rsp_reg_ret,
+ *        3=push_reg_pop_rsp_ret, 4=leave_ret
+ * reg_id: 0=rax,1=rcx,2=rdx,3=rbx,4=rsp,5=rbp,6=rsi,7=rdi,
+ *         8..15=r8..r15
  */
 
-#define MAGIC_SRCP       0x53524350  /* "SRCP" */
-#define MARKER_COUNT     16
-#define VERSION_TAG      0x0005
-
-/* FW 4.03 offsets */
-#define APIC_OPS_OFF_FROM_KTEXT  0x1934AC8
+#define MAGIC_GSCA   0x47534341  /* "GSCA" */
+#define MAX_RESULTS  59
+#define MAX_LEAVE    5
 
 typedef struct {
     uint64_t kdata_base;
@@ -71,82 +52,124 @@ int module_start(kproc_args* args)
     volatile uint64_t* out = (volatile uint64_t*)args;
     volatile uint32_t* out32 = (volatile uint32_t*)args;
 
-    /* Zero output */
     for (int i = 0; i < 124; i++)
         out[i] = 0;
 
-    /* Compute addresses */
     uint64_t lstar = rdmsr(0xC0000082);
     uint64_t ktext_base = lstar - 0x294218;
-    uint64_t apic_ops_addr = ktext_base + APIC_OPS_OFF_FROM_KTEXT;
+    uint64_t ktext_size = kdata_base - ktext_base;
 
-    volatile uint64_t* apic_table = (volatile uint64_t*)apic_ops_addr;
-
-    /*
-     * Choose a marker region in kdata, far from apic_ops.
-     * kdata_base + 0x100 should be in BSS/zero-fill territory.
-     * We'll scan a few candidate offsets and pick one that looks
-     * like unused memory (all zeros or padding).
-     */
-    uint64_t marker_region = kdata_base + 0x100;
-    volatile uint64_t* markers = (volatile uint64_t*)marker_region;
-
-    /* Write header */
-    out32[0] = MAGIC_SRCP;
-    out32[1] = 0xAAAA;  /* status: in progress */
+    out32[0] = MAGIC_GSCA;
     out[1] = kdata_base;
     out[2] = ktext_base;
-    out[3] = apic_ops_addr;
+    out[3] = ktext_size;
+    out[4] = 0xdeadbeefcafe0006ULL;
 
-    /* Read-only: save original xapic_mode for reference */
-    out[4] = apic_table[2];
+    volatile uint8_t* k = (volatile uint8_t*)ktext_base;
+    int found = 0;
+    int leave_count = 0;
 
-    /* Marker region address */
-    out[5] = marker_region;
+#define RECORD(addr, type, length, regid) do { \
+    if (found < MAX_RESULTS && !((type) == 4 && leave_count >= MAX_LEAVE)) { \
+        if ((type) == 4) leave_count++; \
+        int _idx = 5 + found * 2; \
+        uint64_t _a = (addr); \
+        uint64_t _off = _a - ktext_base; \
+        uint32_t _raw = (uint32_t)k[_off] | ((uint32_t)k[_off+1] << 8) | \
+                        ((uint32_t)k[_off+2] << 16) | ((uint32_t)k[_off+3] << 24); \
+        out[_idx] = _a; \
+        out[_idx+1] = (uint64_t)(type) | ((uint64_t)(length) << 8) | \
+                      ((uint64_t)(regid) << 16) | ((uint64_t)_raw << 32); \
+        found++; \
+    } \
+} while(0)
 
-    /* Dump full apic_ops table (READ-ONLY — no modifications!) */
-    for (int i = 0; i < 28; i++)
-        out[6 + i] = apic_table[i];
+    for (uint64_t i = 0; i + 4 <= ktext_size && found < MAX_RESULTS; i++) {
 
-    /* Marker metadata */
-    out[34] = MARKER_COUNT;
-    out[35] = VERSION_TAG;
+        /* ── 2-byte patterns: XX c3 ── */
+        if (k[i+1] == 0xc3) {
+            /* pop rsp; ret = 5c c3 */
+            if (k[i] == 0x5c) {
+                RECORD(ktext_base+i, 0, 2, 4);
+                continue;
+            }
+            /* leave; ret = c9 c3 */
+            if (k[i] == 0xc9) {
+                RECORD(ktext_base+i, 4, 2, 5);
+                continue;
+            }
+        }
 
-    /* ════════════════════════════════════════════
-     * Save original values at marker region
-     * ════════════════════════════════════════════ */
-    for (int i = 0; i < MARKER_COUNT; i++)
-        out[36 + i] = markers[i];
+        /* ── 3-byte patterns: XX XX c3 ── */
+        if (i + 2 < ktext_size && k[i+2] == 0xc3) {
+            /* xchg rsp, rax; ret = 48 94 c3 */
+            if (k[i] == 0x48 && k[i+1] == 0x94) {
+                RECORD(ktext_base+i, 1, 3, 0);
+                continue;
+            }
+            /* push gpr; pop rsp; ret = {50-57} 5c c3
+             * 50=push rax, 51=push rcx, 52=push rdx, 53=push rbx,
+             * 54=push rsp, 55=push rbp, 56=push rsi, 57=push rdi */
+            if (k[i+1] == 0x5c && k[i] >= 0x50 && k[i] <= 0x57) {
+                int reg = k[i] - 0x50;
+                if (reg != 4) /* skip push rsp; pop rsp (useless) */
+                    RECORD(ktext_base+i, 3, 3, reg);
+                continue;
+            }
+        }
 
-    /* ════════════════════════════════════════════
-     * Write distinguishable markers
-     * Pattern: 0xPERSIST00 | index
-     * Each marker is unique so we can verify individually.
-     * ════════════════════════════════════════════ */
-    for (int i = 0; i < MARKER_COUNT; i++) {
-        uint64_t val = 0x5045525349535400ULL | (uint64_t)i;  /* "PERSIST\x00" | i */
-        out[52 + i] = val;  /* record what we wrote */
-        markers[i] = val;   /* write to kdata */
+        /* ── 4-byte patterns: XX XX XX c3 ── */
+        if (i + 3 < ktext_size && k[i+3] == 0xc3) {
+
+            /* xchg rsp, gpr; ret = 48 87 ModRM c3
+             * Two encodings per pair:
+             *   reg=rsp(4), r/m=target: ModRM = 11_100_xxx (0xE0|rm)
+             *   reg=target, r/m=rsp(4): ModRM = 11_xxx_100 (0xC4|(r<<3)) */
+            if (k[i] == 0x48 && k[i+1] == 0x87) {
+                uint8_t m = k[i+2];
+                int reg = -1;
+                if ((m & 0xF8) == 0xE0) reg = m & 0x07;       /* 11_100_xxx */
+                else if ((m & 0xC7) == 0xC4) reg = (m >> 3) & 0x07; /* 11_xxx_100 */
+                if (reg >= 0 && reg != 4) {
+                    RECORD(ktext_base+i, 1, 4, reg);
+                    continue;
+                }
+            }
+
+            /* xchg rsp, r8-r15; ret
+             * REX.WB (49): reg=rsp, r/m=r8+x: 49 87 (0xE0|x) c3
+             * REX.WR (4c): reg=r8+x, r/m=rsp: 4c 87 (0xC4|(x<<3)) c3 */
+            if (k[i] == 0x49 && k[i+1] == 0x87 && (k[i+2] & 0xF8) == 0xE0) {
+                RECORD(ktext_base+i, 1, 4, 8 + (k[i+2] & 0x07));
+                continue;
+            }
+            if (k[i] == 0x4c && k[i+1] == 0x87 && (k[i+2] & 0xC7) == 0xC4) {
+                RECORD(ktext_base+i, 1, 4, 8 + ((k[i+2] >> 3) & 0x07));
+                continue;
+            }
+
+            /* mov rsp, gpr; ret = 48 89 ModRM c3
+             * opcode 89 = mov r/m, reg → "mov rsp, src" = mod=11, r/m=rsp(4)
+             * ModRM = 11_src_100 = 0xC4|(src<<3) */
+            if (k[i] == 0x48 && k[i+1] == 0x89 && (k[i+2] & 0xC7) == 0xC4) {
+                int reg = (k[i+2] >> 3) & 0x07;
+                if (reg != 4)
+                    RECORD(ktext_base+i, 2, 4, reg);
+                continue;
+            }
+
+            /* push r8-r15; pop rsp; ret = 41 {50-57} 5c c3
+             * REX.B(41) + push(50+x) = push r8+x, then 5c = pop rsp */
+            if (k[i] == 0x41 && k[i+1] >= 0x50 && k[i+1] <= 0x57 && k[i+2] == 0x5c) {
+                RECORD(ktext_base+i, 3, 4, 8 + (k[i+1] - 0x50));
+                continue;
+            }
+        }
     }
 
-    /* Readback to verify writes took */
-    for (int i = 0; i < MARKER_COUNT; i++)
-        out[68 + i] = markers[i];
+#undef RECORD
 
-    /* ════════════════════════════════════════════
-     * IMPORTANT: apic_ops is COMPLETELY UNTOUCHED
-     * No function pointers modified. Resume is safe.
-     * ════════════════════════════════════════════ */
-
-    out[104] = 0xdeadbeefcafe0005ULL;
-    out[121] = 0xfeedface00000005ULL;
-
-    /* Verify apic_ops[2] unchanged */
-    out[122] = apic_table[2];
-    out[123] = apic_table[2];
-
-    /* Status: armed for suspend persistence test */
-    out32[1] = 1;
-
+    out32[1] = (uint32_t)found;
+    out[123] = 0xfeedface00000006ULL;
     return 0;
 }

