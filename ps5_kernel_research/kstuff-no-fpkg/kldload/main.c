@@ -1417,6 +1417,34 @@ static void _kldload(void* data, size_t data_size)
                readback[175] == 0xdeadbeefcafe0018ULL ? "OK" : "MISSING");
 
         printf("\n=== END PCB DUMP ===\n");
+    } else if (magic == 0x4f4e4654) { /* "ONFT" - pcb_onfault test */
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+
+        printf("\n=== PCB_ONFAULT TEST ===\n");
+        printf("  status:          %s\n",
+               status == 1 ? "PASS (onfault works!)" :
+               status == 2 ? "NO FAULT (unexpected)" :
+               status == 0xFF ? "ERROR" : "UNKNOWN");
+        printf("  kdata_base:      %#lx\n", readback[1]);
+        printf("  ktext_base:      %#lx\n", readback[2]);
+        printf("  curthread:       %#lx\n", readback[3]);
+        printf("  td_pcb:          %#lx\n", readback[4]);
+        printf("  onfault offset:  %#lx\n", readback[5]);
+        printf("  recovery addr:   %#lx\n", readback[6]);
+        printf("  fault result:    %#lx %s\n", readback[7],
+               readback[7] == 0xCAFE0001 ? "(RECOVERED)" : "(no recovery)");
+        printf("  read value:      %#lx\n", readback[8]);
+        printf("  onfault after:   %#lx %s\n", readback[10],
+               readback[10] == 0 ? "(cleared, good)" : "(NOT cleared)");
+        printf("  sentinel:        %#lx [%s]\n", readback[11],
+               readback[11] == 0xdeadbeefcafe0019ULL ? "OK" : "MISSING");
+
+        if (status == 1) {
+            printf("\n  >>> pcb_onfault CONFIRMED at PCB+%#lx <<<\n", readback[5]);
+            printf("  >>> Ready for v18 execute-test scanner <<<\n");
+        }
+
+        printf("\n=== END PCB_ONFAULT TEST ===\n");
     } else if (magic == 0x534B5052) { /* "SKPR" - suspend stack probe */
         uint32_t status = (uint32_t)(readback[0] >> 32);
         uint64_t kdata = readback[1];
