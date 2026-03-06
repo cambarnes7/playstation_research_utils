@@ -170,23 +170,25 @@ static void sort_u64(uint64_t* arr, int n)
 #define TD_PCB_OFF     0x3f8
 #define PCB_ONFAULT_OFF 0xb0
 
+static volatile uint64_t saved_onfault;  /* save/restore existing handler */
+
 static uint64_t find_pcb_onfault(volatile uint64_t* out)
 {
     uint64_t curthread;
     __asm__ volatile("movq %%gs:0x08, %0" : "=r"(curthread));
 
     uint64_t pcb = *(volatile uint64_t*)(curthread + TD_PCB_OFF);
-    if ((pcb >> 40) != 0xFFFFFF)
+    if ((pcb >> 40) != 0xFFFFFF) {
+        out[7] = 0xDEAD0001;  /* bad pcb pointer */
         return 0;
+    }
 
     uint64_t onfault_addr = pcb + PCB_ONFAULT_OFF;
 
-    /* Validate: current value should be 0 (no active handler) */
-    uint64_t cur = *(volatile uint64_t*)onfault_addr;
-    if (cur != 0)
-        return 0;
+    /* Save existing value (might be non-NULL from kproc_create) */
+    saved_onfault = *(volatile uint64_t*)onfault_addr;
+    out[7] = saved_onfault;  /* show what was there */
 
-    out[9] = onfault_addr;  /* log for diagnostics */
     return onfault_addr;
 }
 
@@ -314,6 +316,29 @@ int module_start(kproc_args* args)
                 continue;
             }
 
+            /* Byte pre-filter: skip addresses starting with trap/illegal ops */
+            {
+                uint8_t b0 = *(volatile uint8_t*)candidate;
+                if (b0 == 0xCC ||  /* int3 */
+                    b0 == 0xCE ||  /* into */
+                    b0 == 0xF4 ||  /* hlt */
+                    b0 == 0xFA ||  /* cli */
+                    b0 == 0x00) {  /* likely padding */
+                    func_skipped++;
+                    total_skipped++;
+                    continue;
+                }
+                /* Check for ud2 (0F 0B) */
+                if (b0 == 0x0F) {
+                    uint8_t b1 = *(volatile uint8_t*)(candidate + 1);
+                    if (b1 == 0x0B) {
+                        func_skipped++;
+                        total_skipped++;
+                        continue;
+                    }
+                }
+            }
+
             func_probed++;
             total_probed++;
             out[4] = total_probed;
@@ -326,8 +351,7 @@ int module_start(kproc_args* args)
 
             /*
              * Set pcb_onfault to our fault recovery handler.
-             * If the probe faults, trap() will jump to fault_recovery
-             * instead of calling trap_fatal() → panic().
+             * Save existing value and restore after probe.
              */
             if (pcb_onfault_ptr) {
                 *(volatile uint64_t*)pcb_onfault_ptr = (uint64_t)fault_recovery;
@@ -390,9 +414,9 @@ int module_start(kproc_args* args)
                     "rbp", "memory", "cc"
             );
 
-            /* Clear pcb_onfault after probe */
+            /* Restore pcb_onfault after probe */
             if (pcb_onfault_ptr) {
-                *(volatile uint64_t*)pcb_onfault_ptr = 0;
+                *(volatile uint64_t*)pcb_onfault_ptr = saved_onfault;
             }
 
             if (scan_got_pivot) {
