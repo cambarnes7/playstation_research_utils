@@ -28,7 +28,7 @@
 #include <ps5/payload.h>
 
 #define PORT 9022
-#define READBACK_SIZE 512  /* bytes to read back from kthread_args */
+#define READBACK_SIZE 2304  /* bytes to read back from kthread_args (enough for gadget_reader) */
 
 /* kekcall wrappers (in kekcall.asm) */
 extern uint64_t kekcall_malloc(uint64_t size);
@@ -180,6 +180,57 @@ static void _kldload(void* data, size_t data_size)
         printf("  With KRW: overwrite -> suspend/resume -> code runs before HV\n");
 
         printf("\n=== END APIC OPS ===\n");
+    } else if (magic == 0x47414447) { /* "GADG" - gadget reader results */
+        uint32_t num_regions = (uint32_t)(readback[0] >> 32);
+        uint64_t rb_kdata = readback[1];
+        uint64_t rb_ktext = readback[2];
+
+        printf("\n=== GADGET READER RESULTS ===\n");
+        printf("  kdata_base: %#lx\n", rb_kdata);
+        printf("  ktext_base: %#lx\n", rb_ktext);
+        printf("  regions:    %u\n\n", num_regions);
+
+        /* Each region starts at byte offset 24 (3 uint64s header)
+         * Region layout: addr(8) + offset(8) + bytes(256) = 272 bytes */
+        uint8_t* raw = (uint8_t*)readback;
+        for (uint32_t r = 0; r < num_regions && r < 8; r++) {
+            uint8_t* rp = raw + 24 + r * 272;
+            uint64_t raddr = *(uint64_t*)rp;
+            int64_t  roff  = *(int64_t*)(rp + 8);
+            uint8_t* rbytes = rp + 16;
+
+            const char* label = "unknown";
+            if (roff == -0x9d6f80)       label = "cpu_switch";
+            else if (roff == (-0x9d20cc - 16)) label = "wrmsr_ret region";
+            else if (roff == (-0x9cf84c - 32)) label = "doreti_iret region";
+            else if (roff == (-0x99002a - 16)) label = "rep_movsb_pop region";
+            else if (roff == (-0x396f9e - 16)) label = "mov_cr3_rax region";
+            else if (roff == -0x9d0cfa)  label = "rdmsr region";
+            else if (roff == (-0x9cf8ab - 16)) label = "pop_all_iret region";
+            else if (roff == -0x9908e0)  label = "copyin";
+
+            printf("  --- Region %u: %s ---\n", r, label);
+            printf("  Address: %#lx (kdata_base %+ld / ktext+%#lx)\n",
+                   raddr, roff, (uint64_t)(raddr - rb_ktext));
+
+            /* Hex dump with inline ASCII */
+            for (int row = 0; row < 256; row += 16) {
+                printf("  %04x: ", row);
+                for (int col = 0; col < 16; col++) {
+                    printf("%02x ", rbytes[row + col]);
+                    if (col == 7) printf(" ");
+                }
+                printf(" |");
+                for (int col = 0; col < 16; col++) {
+                    uint8_t c = rbytes[row + col];
+                    printf("%c", (c >= 0x20 && c < 0x7f) ? c : '.');
+                }
+                printf("|\n");
+            }
+            printf("\n");
+        }
+
+        printf("=== END GADGET READER ===\n");
     } else {
         /* Generic readback - check for test markers */
         uint64_t val0 = readback[0];
