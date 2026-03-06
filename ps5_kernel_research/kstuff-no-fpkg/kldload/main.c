@@ -118,11 +118,41 @@ static void _kldload(void* data, size_t data_size)
     kekcall_kproc_create(exec_code, kthread_args, kproc_name);
     printf("[debug] kproc_create returned\n");
 
-    /* Wait for thread to complete.
-     * suspend_probe v2 probes up to 6 slots × 500ms = 3s,
-     * so we need at least 4s here. */
-    printf("[debug] waiting 5s for payload to complete...\n");
-    usleep(5000000); /* 5s */
+    /* Poll for payload completion instead of fixed delay.
+     * Check the status field (first uint32 at offset 4) every 500ms.
+     * SRCP payloads set status=0xAAAA while capturing and change to
+     * 1 (armed) or 0xFF (error) when done. Other payloads just get
+     * a generous timeout. */
+    {
+        int completed = 0;
+        for (int poll = 0; poll < 60; poll++) { /* up to 30s */
+            usleep(500000); /* 500ms */
+            uint64_t word0 = kekcall_read_kmem(5, kthread_args);
+            uint32_t magic_chk = (uint32_t)(word0 & 0xFFFFFFFF);
+            uint32_t status_chk = (uint32_t)(word0 >> 32);
+
+            if (magic_chk == 0x53524350) { /* SRCP */
+                if (status_chk != 0xAAAA) {
+                    printf("[debug] SRCP completed (status=%#x) after %d.%ds\n",
+                           status_chk, (poll + 1) / 2, ((poll + 1) % 2) * 5);
+                    completed = 1;
+                    break;
+                }
+                if (poll % 4 == 3)
+                    printf("[debug] SRCP still capturing... (%d.%ds elapsed)\n",
+                           (poll + 1) / 2, ((poll + 1) % 2) * 5);
+            } else if (magic_chk != 0) {
+                /* Non-SRCP payload wrote its magic — give it 1 more second */
+                usleep(1000000);
+                printf("[debug] payload completed (magic=%#x) after %d.%ds\n",
+                       magic_chk, (poll + 1) / 2 + 1, ((poll + 1) % 2) * 5);
+                completed = 1;
+                break;
+            }
+        }
+        if (!completed)
+            printf("[debug] timeout waiting for payload (30s)\n");
+    }
 
     /* Read back results from kthread_args */
     printf("[debug] reading back kthread_args (%d bytes)...\n", READBACK_SIZE);
