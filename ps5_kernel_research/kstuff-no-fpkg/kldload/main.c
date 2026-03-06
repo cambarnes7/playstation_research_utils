@@ -547,6 +547,63 @@ static void _kldload(void* data, size_t data_size)
         }
 
         printf("\n=== END BATCH PIVOT SCAN ===\n");
+    } else if (magic == 0x53505654) { /* "SPVT" - smart pivot scan results */
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+        uint64_t ktext_base = readback[2];
+        uint32_t batch_id = (uint32_t)(readback[3] & 0xFFFF);
+        uint32_t batch_size = (uint32_t)((readback[3] >> 16) & 0xFFFF);
+        uint32_t probe_depth = (uint32_t)(readback[3] >> 32);
+        int total_probed = (int)readback[4];
+        int total_survived = (int)readback[5];
+        int total_skipped = (int)readback[6];
+        uint64_t found_addr = readback[7];
+        uint64_t found_off = readback[8];
+
+        printf("\n=== SMART PIVOT SCAN RESULTS ===\n");
+        printf("  kdata_base:    %#lx\n", readback[1]);
+        printf("  ktext_base:    %#lx\n", ktext_base);
+        printf("  batch:         %u (size=%u, depth=%u)\n",
+               batch_id, batch_size, probe_depth);
+        printf("  total_probed:  %d\n", total_probed);
+        printf("  total_survived:%d\n", total_survived);
+        printf("  total_skipped: %d (danger zone)\n", total_skipped);
+
+        if (status == 0x0002) {
+            printf("\n  >>> PIVOT GADGET FOUND! <<<\n");
+            printf("  Address:     %#lx\n", found_addr);
+            printf("  ktext offset: %#lx\n", found_off);
+            printf("  kdata offset: -0x%lx\n", ktext_base + 0xC00000 - found_addr);
+        } else if (status == 0x0001) {
+            printf("\n  Batch complete. No pivot found.\n");
+        } else if (status == 0xFFFF) {
+            printf("\n  Batch %u past end of function list (%d total funcs)\n",
+                   batch_id, total_probed);
+        } else if (status == 0xAAAA) {
+            printf("\n  Thread died during probing (in progress)\n");
+        }
+
+        /* Per-function details */
+        printf("\n  --- Per-function details ---\n");
+        for (uint32_t i = 0; i < batch_size; i++) {
+            int slot = 10 + i * 3;
+            if (slot + 2 >= READBACK_SIZE / 8) break;
+            uint64_t func_addr = readback[slot + 0];
+            if (func_addr == 0) break;
+            uint32_t f_probed = (uint32_t)(readback[slot + 1] & 0xFFFF);
+            uint32_t f_survived = (uint32_t)((readback[slot + 1] >> 16) & 0xFFFF);
+            uint32_t f_skipped = (uint32_t)(readback[slot + 1] >> 32);
+            uint32_t last_off = (uint32_t)(readback[slot + 2] & 0xFFFFFFFF);
+            uint32_t f_status = (uint32_t)(readback[slot + 2] >> 32);
+
+            const char* st = f_status == 0x0001 ? "done" :
+                             f_status == 0xBBBB ? "in_progress" :
+                             f_status == 0x4849 ? "FOUND!" : "?";
+            printf("  [%u] %#lx (ktext+%#lx): probed=%u survived=%u skipped=%u last_off=%u %s\n",
+                   i, func_addr, func_addr - ktext_base,
+                   f_probed, f_survived, f_skipped, last_off, st);
+        }
+
+        printf("\n=== END SMART PIVOT SCAN ===\n");
     } else if (magic == 0x50535243) { /* "PSRC" - DMAP pivot scan results */
         uint32_t num_hits = (uint32_t)(readback[0] >> 32);
         uint64_t rb_kdata = readback[1];
