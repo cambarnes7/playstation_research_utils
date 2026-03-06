@@ -147,53 +147,29 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
     else if (nr == 8)
     {
         //
-        // DMEM-based copyin: copy from user VA to kernel VA via physical memory
-        // Bypasses kernel copyin() which crashes for malloc'd addresses
+        // copyin via kernel's own copyin() function
+        // Uses push_stack/trap pattern (same as kproc_create nr=7)
+        // so copyin runs in full kernel context with proper CR3
         //
-        // Get user process CR3 from td -> proc -> vmspace -> pmap -> pm_cr3
-        // cr3_phys (kernel CR3) doesn't map user addresses (KPTI)
+        // copyin(const void *uaddr, void *kaddr, size_t len)
+        //   RDI = user source address
+        //   RSI = kernel destination address
+        //   RDX = size
+        //   returns 0 on success, EFAULT on failure
         //
         uint64_t td = regs[RDI];
-        uint64_t proc = kpeek64(td + td_proc);
-        uint64_t vmspace = kpeek64(proc + 0x200);    // p_vmspace
-        uint64_t user_cr3 = kpeek64(vmspace + 0x2E0 + 0x28); // pmap.pm_cr3
+        uint64_t stack_frame[14] = {
+            (uint64_t)doreti_iret,
+            MKTRAP(TRAP_KEKCALL, 7),
+            [12] = td,
+        };
+        push_stack(regs, stack_frame, sizeof(stack_frame));
 
-        // Stash diagnostic values in td_retval so user can read them
-        // td_retval[0] = user_cr3, td_retval[1] = proc
-        kpoke64(td + td_retval, user_cr3);
-        kpoke64(td + td_retval + 8, vmspace);
-
-        uint64_t user_addr = args[RDI];
-        uint64_t kernel_addr = args[RSI];
-        uint64_t size = args[RDX];
-        uint64_t phys_src, phys_src_end;
-        uint64_t phys_dst, phys_dst_end;
-
-        while(size > 0) {
-            // Resolve user VA via user process CR3
-            if(!virt2phys_cr3(user_addr, &phys_src, &phys_src_end, user_cr3)) {
-                args[RAX] = 100; // user VA resolution failed
-                return 100;
-            }
-            // Resolve kernel VA via kernel CR3
-            if(!virt2phys(kernel_addr, &phys_dst, &phys_dst_end)) {
-                args[RAX] = 200; // kernel VA resolution failed
-                return 200;
-            }
-            // Chunk size = min of remaining bytes, src page remainder, dst page remainder
-            size_t chunk = phys_src_end - phys_src;
-            if(phys_dst_end - phys_dst < chunk)
-                chunk = phys_dst_end - phys_dst;
-            if(size < chunk)
-                chunk = size;
-            // Copy via DMEM: physical src -> physical dst
-            memcpy(DMEM + phys_dst, DMEM + phys_src, chunk);
-            user_addr += chunk;
-            kernel_addr += chunk;
-            size -= chunk;
-        }
-        args[RAX] = 0;
-        return 0;
+        kpoke64(td + td_retval, 0);
+        regs[RDI] = args[RDI];      // user_addr (source)
+        regs[RSI] = args[RSI];      // kernel_addr (destination)
+        regs[RDX] = args[RDX];      // size
+        regs[RIP] = (uint64_t)copyin;
     }
     else if (nr == 9)
     {
@@ -302,6 +278,17 @@ void handle_kekcall_trap(uint64_t* regs, uint32_t trap)
     else if(trap == 6)
     {
         // Return from kekcall nr=7 (kproc_create)
+        uint64_t stack_frame[14];
+        pop_stack(regs, stack_frame, sizeof(stack_frame));
+        uint64_t td = stack_frame[11];
+        kpoke64(td+td_retval, regs[RAX]);
+        regs[RAX] = 0;
+        regs[RIP] = stack_frame[13];
+    }
+    else if(trap == 7)
+    {
+        // Return from kekcall nr=8 (copyin)
+        // copyin returns 0 on success, EFAULT on failure
         uint64_t stack_frame[14];
         pop_stack(regs, stack_frame, sizeof(stack_frame));
         uint64_t td = stack_frame[11];
