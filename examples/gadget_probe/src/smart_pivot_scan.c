@@ -185,41 +185,72 @@ static void sort_u64(uint64_t* arr, int n)
  * looking for td_pcb (kernel stack pointer, 0xffffff80...).
  * Dumps values to out[4..8] for analysis.
  */
+/*
+ * v5.2f: Find td_pcb from curthread, then probe pcb_onfault candidates.
+ *
+ * Output layout (all in visible [0x20..0x38] = out[4..7]):
+ *   out[4] = curthread
+ *   out[5] = td_pcb candidate (first 0xffffff80... hit)
+ *   out[6] = offset where td_pcb was found | (pcb_onfault_off << 16)
+ *   out[7] = pcb_onfault address (if found), else 0xDEAD
+ */
 static uint64_t find_pcb_onfault(volatile uint64_t* out)
 {
     out[3] |= ((uint64_t)0xDDDD << 48);
 
-    /* Get curthread from %gs:0x08 */
     uint64_t curthread;
     __asm__ volatile("movq %%gs:0x08, %0" : "=r"(curthread));
     out[4] = curthread;
 
-    /* Scan curthread+0x388..0x408 for td_pcb candidates.
-     * td_pcb should be a 0xffffff80... address (kernel stack top).
-     * Dump first 4 hits with their offsets. */
-    int hits = 0;
-    for (int off = 0x380; off <= 0x420 && hits < 3; off += 8) {
+    /* Find td_pcb: scan curthread for 0xffffff80... pointer */
+    uint64_t pcb = 0;
+    int td_pcb_off = 0;
+    for (int off = 0x380; off <= 0x420; off += 8) {
         uint64_t val = *(volatile uint64_t*)(curthread + off);
-        if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
-            out[5 + hits] = val;
-            out[8] = (out[8] & ~(0xFFFFULL << (hits * 16))) |
-                     ((uint64_t)off << (hits * 16));
-            hits++;
+        if ((val >> 40) == 0xFFFFFF) {
+            pcb = val;
+            td_pcb_off = off;
+            break;
         }
     }
-    if (hits == 0) {
-        /* Try wider range: 0x300..0x500 */
-        for (int off = 0x300; off <= 0x500 && hits < 3; off += 8) {
+    if (!pcb) {
+        for (int off = 0x300; off <= 0x500; off += 8) {
             uint64_t val = *(volatile uint64_t*)(curthread + off);
-            if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
-                out[5 + hits] = val;
-                out[8] = (out[8] & ~(0xFFFFULL << (hits * 16))) |
-                         ((uint64_t)off << (hits * 16));
-                hits++;
+            if ((val >> 40) == 0xFFFFFF) {
+                pcb = val;
+                td_pcb_off = off;
+                break;
             }
         }
     }
 
+    out[5] = pcb;
+    out[6] = (uint64_t)td_pcb_off;
+
+    if (!pcb) {
+        out[7] = 0xDEAD0001;
+        return 0;
+    }
+
+    /* Probe pcb_onfault: try offsets 0xb0..0xd0.
+     * For a fresh thread, pcb_onfault should be NULL (0).
+     * We also verify by writing a test value and reading back. */
+    for (int poff = 0xb0; poff <= 0xd0; poff += 8) {
+        uint64_t val = *(volatile uint64_t*)(pcb + poff);
+        if (val == 0) {
+            /* Candidate: write test value, read back, restore */
+            *(volatile uint64_t*)(pcb + poff) = 0x4141414141414141ULL;
+            uint64_t readback = *(volatile uint64_t*)(pcb + poff);
+            *(volatile uint64_t*)(pcb + poff) = 0;  /* restore */
+            if (readback == 0x4141414141414141ULL) {
+                out[6] |= ((uint64_t)poff << 16);
+                out[7] = pcb + poff;  /* pcb_onfault address */
+                return pcb + poff;
+            }
+        }
+    }
+
+    out[7] = 0xDEAD0002;  /* pcb found but no onfault candidate */
     return 0;
 }
 
