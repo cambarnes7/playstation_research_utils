@@ -103,60 +103,60 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
     else if (nr == 10)
     {
         //
-        // Make kernel pages executable by clearing NX bit in page tables
+        // Page table diagnostic / NX clearing
         // args[RDI] = kernel virtual address
-        // args[RSI] = size in bytes
-        // Returns: number of pages fixed, or 0xdead on error
+        // args[RSI] = mode: 0=read PTE only, 1=clear NX, 2=clear NX + flush TLB
+        // Returns: PTE value (mode 0), pages_fixed count (mode 1,2), or 0xdead on error
         //
         LOG("Handling make_exec kekcall\n");
         uint64_t addr = args[RDI];
-        uint64_t size = args[RSI];
-        uint64_t end = addr + size;
-        uint64_t pages_fixed = 0;
+        uint64_t mode = args[RSI];
 
-        while (addr < end)
+        // Walk page tables for this single address
+        uint64_t pml = cr3_phys;
+        for (int i = 39; i >= 12; i -= 9)
         {
-            uint64_t pml = cr3_phys;
-            int found = 0;
-            for (int i = 39; i >= 12; i -= 9)
+            if (pml >= ((1ull << 39) - (1ull << 12)))
             {
-                uint64_t entry_phys = pml + ((addr & (0x1ffull << i)) >> (i - 3));
-                uint64_t entry = *(uint64_t*)(DMEM + entry_phys);
-                if (!(entry & 1))
-                {
-                    // Page not present
-                    args[RAX] = 0xdead;
-                    return 0;
-                }
-                if ((entry & 128) || i == 12)
-                {
-                    // Large page or final PT entry - clear NX bit (bit 63)
-                    if (entry & (1ull << 63))
-                    {
-                        *(uint64_t*)(DMEM + entry_phys) = entry & ~(1ull << 63);
-                        pages_fixed++;
-                    }
-                    addr = (addr & ~((1ull << i) - 1)) + (1ull << i);
-                    found = 1;
-                    break;
-                }
-                pml = entry & ((1ull << 52) - (1ull << 12));
-            }
-            if (!found)
-            {
-                args[RAX] = 0xdead;
+                args[RAX] = 0xdead0001;
                 return 0;
             }
+            uint64_t entry_phys = pml + ((addr & (0x1ffull << i)) >> (i - 3));
+            uint64_t entry = *(uint64_t*)(DMEM + entry_phys);
+            if (!(entry & 1))
+            {
+                args[RAX] = 0xdead0002;
+                return 0;
+            }
+            if ((entry & 128) || i == 12)
+            {
+                if (mode == 0)
+                {
+                    // Read-only: return PTE value
+                    args[RAX] = entry;
+                }
+                else if (mode == 1)
+                {
+                    // Clear NX bit (no TLB flush)
+                    *(uint64_t*)(DMEM + entry_phys) = entry & ~(1ull << 63);
+                    args[RAX] = entry; // return original PTE
+                }
+                else
+                {
+                    // Clear NX + flush TLB
+                    *(uint64_t*)(DMEM + entry_phys) = entry & ~(1ull << 63);
+                    uint64_t flush_regs[NREGS] = {
+                        [RIP] = (uint64_t)mov_cr3_rax, 0x20, 2, 0, 0,
+                        [RAX] = cr3_phys,
+                    };
+                    run_gadget(flush_regs);
+                    args[RAX] = entry;
+                }
+                return 0;
+            }
+            pml = entry & ((1ull << 52) - (1ull << 12));
         }
-
-        // Flush TLB by reloading CR3
-        uint64_t flush_regs[NREGS] = {
-            [RIP] = (uint64_t)mov_cr3_rax, 0x20, 2, 0, 0,
-            [RAX] = cr3_phys,
-        };
-        run_gadget(flush_regs);
-
-        args[RAX] = pages_fixed;
+        args[RAX] = 0xdead0003;
         return 0;
     }
     else if (nr == 7)
