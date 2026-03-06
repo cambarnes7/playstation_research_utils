@@ -30,6 +30,14 @@ static uint64_t dbgregs_for_kfunction_fixes[6] = {
     0, 0x405,
 };
 
+// Only DR1 (kmem_alloc_rwx_fix) enabled - no malloc_arena_fix
+// DR7=0x404: bit 2 (L1) + bit 10 (LE)
+static uint64_t dbgregs_for_kmem_alloc_rwx[6] = {
+    0, (uint64_t)kmem_alloc_rwx_fix,
+    0, 0,
+    0, 0x404,
+};
+
 #define PS5_PAGE_SIZE 0x4000
 #define ROUND_PG(x) (((x) + (PS5_PAGE_SIZE - 1)) & ~(PS5_PAGE_SIZE - 1))
 
@@ -134,7 +142,7 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
 
         // Push dbgreg frame ON TOP (processed FIRST)
         // Loads kmem_alloc_rwx_fix breakpoint, restores original after
-        start_syscall_with_dbgregs(regs, dbgregs_for_kfunction_fixes);
+        start_syscall_with_dbgregs(regs, dbgregs_for_kmem_alloc_rwx);
 
         // Set up kmem_alloc(kernel_vmmap, size)
         regs[RSI] = args[RDI];                          // size
