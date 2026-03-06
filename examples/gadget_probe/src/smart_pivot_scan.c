@@ -51,6 +51,9 @@
 #ifndef PROBE_DEPTH
 #define PROBE_DEPTH    128
 #endif
+#ifndef PROBE_START
+#define PROBE_START    1   /* skip offset 0 (function entry = runs real code) */
+#endif
 
 #define MAGIC_SPVT     0x53505654  /* "SPVT" */
 #define KTEXT_SIZE     0xC00000    /* 12MB */
@@ -366,8 +369,11 @@ int module_start(kproc_args* args)
             out[func_slot + 2] = 0;
         }
 
-        /* Probe each byte offset within this function */
-        for (int off = 0; off < depth; off++) {
+        /* Probe each byte offset within this function.
+         * Start at PROBE_START (default 1) to skip function entry point —
+         * offset 0 executes the real function prologue/body which accesses
+         * hardware, takes locks, etc. and kills the thread. */
+        for (int off = PROBE_START; off < depth; off++) {
             uint64_t candidate = func_entry + off;
 
             /* Check danger zone exclusion */
