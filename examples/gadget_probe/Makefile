@@ -17,8 +17,7 @@ TARGET_OFFSET ?= -0x9cf991
 # Smart pivot scanner parameters
 SCAN_BATCH  ?= 0
 BATCH_SIZE  ?= 8
-PROBE_DEPTH ?= 128
-PROBE_START ?= 1
+PROBE_DEPTH ?= 16
 
 # Kdata harvester parameters
 SCAN_CHUNK  ?= 0
@@ -50,8 +49,7 @@ $(ODIR)/smart_pivot_scan.o: $(SDIR)/smart_pivot_scan.c
 	$(CC) -c -o $@ $< $(CFLAGS) \
 		-DSCAN_BATCH=$(SCAN_BATCH) \
 		-DBATCH_SIZE=$(BATCH_SIZE) \
-		-DPROBE_DEPTH=$(PROBE_DEPTH) \
-		-DPROBE_START=$(PROBE_START)
+		-DPROBE_DEPTH=$(PROBE_DEPTH)
 
 # Kdata pointer harvester: scan kdata for ktext function pointers
 kdata_harvest: $(ODIR) $(ODIR)/kdata_harvester.o
