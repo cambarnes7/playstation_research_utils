@@ -144,6 +144,18 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
         regs[RIP] = (uint64_t) kproc_create;
     }
     
+    else if (nr == 8)
+    {
+        //
+        // Direct copyin: copyin(user_addr, kernel_addr, size)
+        // Uses kernel's own copyin function
+        //
+        kpoke64(regs[RDI]+td_retval, 0);
+        regs[RDI] = args[RDI];  // user address (source)
+        regs[RSI] = args[RSI];  // kernel address (dest)
+        regs[RDX] = args[RDX];  // size
+        regs[RIP] = (uint64_t) copyin;
+    }
     else if(nr == 0xffffffff)
     {
         args[RAX] = 0;
