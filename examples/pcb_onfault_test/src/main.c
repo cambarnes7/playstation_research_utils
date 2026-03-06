@@ -68,7 +68,7 @@ int module_start(kproc_args* args)
     out[2] = ktext_base;
 
     /* Validate offset range */
-    if (test_offset < 0x100 || test_offset > 0x148 || (test_offset & 7) != 0) {
+    if (test_offset < 0xA8 || test_offset > 0x160 || (test_offset & 7) != 0) {
         /* Bad offset — refuse to run */
         out[5] = test_offset;
         out32[1] = 0xFD;  /* bad offset */
