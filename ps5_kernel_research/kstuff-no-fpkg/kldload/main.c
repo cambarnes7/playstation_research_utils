@@ -567,7 +567,6 @@ static void _kldload(void* data, size_t data_size)
 
             /* Dump 128 qwords from thread struct */
             printf("\n  --- struct thread @ %#lx (1024 bytes) ---\n", curthread);
-            uint64_t kdata = readback[1];
             for (int i = 0; i < 128 && (5 + i) < READBACK_SIZE / 8; i++) {
                 uint64_t val = readback[5 + i];
                 int off = i * 8;
