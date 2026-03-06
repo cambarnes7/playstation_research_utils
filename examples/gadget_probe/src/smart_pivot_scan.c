@@ -189,6 +189,14 @@ static volatile uint64_t pivot_chain[8];
 /* Entry stack: [candidate, resume, resume, resume, ...] */
 static volatile uint64_t entry_stk[ENTRY_STK_SIZE];
 
+/* Safe buffer: all registers except RAX/RSP point here before each probe.
+ * This prevents page faults from instructions that dereference registers
+ * with garbage values. 2KB to handle various [reg + displacement] patterns. */
+static volatile uint8_t safe_buf[2048] __attribute__((aligned(64)));
+
+/* Candidate address for the current probe (passed to asm via memory) */
+static volatile uint64_t scan_candidate;
+
 __attribute__((naked, used))
 static void pivot_landing(void)
 {
@@ -250,8 +258,10 @@ int module_start(kproc_args* args)
              ((uint64_t)PROBE_DEPTH << 32);
 
     /* Build sorted list of function entry points to probe.
-     * Combine known kstuff offsets with IDT entries and sysent entries. */
-    uint64_t func_list[512];
+     * Combine known kstuff offsets with IDT entries and sysent entries.
+     * MUST be static — kernel threads have no red zone, and large
+     * stack arrays risk overflow on the 16KB kernel stack. */
+    static uint64_t func_list[512];
     int n_funcs = 0;
 
     /* Add known kstuff ktext functions */
@@ -377,6 +387,7 @@ int module_start(kproc_args* args)
             }
 
             scan_got_pivot = 0;
+            scan_candidate = candidate;
 
             __asm__ volatile(
                 /* Set resume targets */
@@ -397,13 +408,37 @@ int module_start(kproc_args* args)
                 /* Save RSP */
                 "movq %%rsp, scan_saved_rsp(%%rip)\n\t"
 
-                /* RAX = pivot_chain (the controlled buffer) */
-                "leaq pivot_chain(%%rip), %%rax\n\t"
-
-                /* Set candidate in entry_stk[0] */
-                "movq %0, %%r8\n\t"
+                /* Load candidate from memory into entry_stk[0] */
+                "movq scan_candidate(%%rip), %%rcx\n\t"
                 "leaq entry_stk(%%rip), %%rdx\n\t"
-                "movq %%r8, (%%rdx)\n\t"
+                "movq %%rcx, (%%rdx)\n\t"
+
+                /* === REGISTER SAFETY ===
+                 * Set ALL registers (except RAX, RSP) to point to safe_buf.
+                 * This prevents page faults from instructions that dereference
+                 * registers with garbage values. Most compiled code does
+                 * [reg + small_offset], so pointing regs to a 2KB buffer
+                 * catches the vast majority of memory accesses. */
+                "leaq safe_buf(%%rip), %%rdi\n\t"
+                "movq %%rdi, %%rsi\n\t"
+                "movq %%rdi, %%rdx\n\t"
+                "movq %%rdi, %%rcx\n\t"
+                "movq %%rdi, %%rbx\n\t"
+                "movq %%rdi, %%rbp\n\t"
+                "movq %%rdi, %%r8\n\t"
+                "movq %%rdi, %%r9\n\t"
+                "movq %%rdi, %%r10\n\t"
+                "movq %%rdi, %%r11\n\t"
+                "movq %%rdi, %%r12\n\t"
+                "movq %%rdi, %%r13\n\t"
+                "movq %%rdi, %%r14\n\t"
+                "movq %%rdi, %%r15\n\t"
+
+                /* Clear direction flag (STD in a candidate would be bad) */
+                "cld\n\t"
+
+                /* RAX = pivot_chain (the controlled buffer for RSP pivot) */
+                "leaq pivot_chain(%%rip), %%rax\n\t"
 
                 /* Switch RSP to entry stack and go */
                 "leaq entry_stk(%%rip), %%rsp\n\t"
@@ -419,9 +454,9 @@ int module_start(kproc_args* args)
                 "movq scan_saved_rsp(%%rip), %%rsp\n\t"
 
                 "3:\n\t"
-                :
-                : "r"(candidate)
-                : "rax", "rcx", "rdx", "r8", "rsi", "rdi", "memory", "cc"
+                ::: "rax", "rbx", "rcx", "rdx", "rsi", "rdi",
+                    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+                    "rbp", "memory", "cc"
             );
 
             if (scan_got_pivot) {

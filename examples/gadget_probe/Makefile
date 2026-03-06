@@ -5,7 +5,8 @@ SDIR    := src
 
 CFLAGS  := -Os -std=c11 -ffunction-sections -fdata-sections -fno-builtin \
            -nostartfiles -nostdlib -Wall -march=btver2 -mtune=btver2 \
-           -m64 -mabi=sysv -mcmodel=small -fpie -fno-stack-protector
+           -m64 -mabi=sysv -mcmodel=small -fpie -fno-stack-protector \
+           -mno-red-zone
 
 LFLAGS  := -Xlinker -T ./linker.x -Wl,--build-id=none -Wl,--gc-sections -nostdlib
 
