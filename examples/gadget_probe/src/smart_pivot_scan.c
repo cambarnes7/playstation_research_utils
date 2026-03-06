@@ -179,25 +179,47 @@ static void sort_u64(uint64_t* arr, int n)
  * Also dumps %gs:0x00..0xf8 (32 qwords) into out[40..71] in case
  * we can hex-dump the full readback later.
  */
+/*
+ * v5.2e: Find td_pcb by dumping curthread fields.
+ * %gs:0x08 = curthread. We read curthread+offset for a range of offsets
+ * looking for td_pcb (kernel stack pointer, 0xffffff80...).
+ * Dumps values to out[4..8] for analysis.
+ */
 static uint64_t find_pcb_onfault(volatile uint64_t* out)
 {
-    /* Tag out[3] high word to mark diagnostic mode */
     out[3] |= ((uint64_t)0xDDDD << 48);
 
-    /* Dump first 4 pcpu qwords into visible header slots */
-    for (int i = 0; i < 4; i++) {
-        uint64_t val;
-        uint64_t off = i * 8;
-        __asm__ volatile(
-            "movq %%gs:(%1), %0"
-            : "=r"(val)
-            : "r"(off)
-        );
-        out[4 + i] = val;
+    /* Get curthread from %gs:0x08 */
+    uint64_t curthread;
+    __asm__ volatile("movq %%gs:0x08, %0" : "=r"(curthread));
+    out[4] = curthread;
+
+    /* Scan curthread+0x388..0x408 for td_pcb candidates.
+     * td_pcb should be a 0xffffff80... address (kernel stack top).
+     * Dump first 4 hits with their offsets. */
+    int hits = 0;
+    for (int off = 0x380; off <= 0x420 && hits < 3; off += 8) {
+        uint64_t val = *(volatile uint64_t*)(curthread + off);
+        if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+            out[5 + hits] = val;
+            out[8] = (out[8] & ~(0xFFFFULL << (hits * 16))) |
+                     ((uint64_t)off << (hits * 16));
+            hits++;
+        }
+    }
+    if (hits == 0) {
+        /* Try wider range: 0x300..0x500 */
+        for (int off = 0x300; off <= 0x500 && hits < 3; off += 8) {
+            uint64_t val = *(volatile uint64_t*)(curthread + off);
+            if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                out[5 + hits] = val;
+                out[8] = (out[8] & ~(0xFFFFULL << (hits * 16))) |
+                         ((uint64_t)off << (hits * 16));
+                hits++;
+            }
+        }
     }
 
-    /* Wide dump removed — %gs at large offsets causes faults on PS5.
-     * The 4 visible qwords (%gs:0x00..0x18) above are sufficient. */
     return 0;
 }
 
@@ -226,9 +248,13 @@ int module_start(kproc_args* args)
         safe_region[i] = nop_ret;
     safe_addr = (uint64_t)((uint8_t*)args + 2304 + 896);
 
-    /* Dump pcpu layout + attempt onfault discovery */
+    /* Dump curthread fields to find td_pcb */
     pcb_onfault_ptr = find_pcb_onfault(out);
-    out[9] = pcb_onfault_ptr;  /* 0 = not found (diagnostic mode) */
+    out[9] = pcb_onfault_ptr;
+
+    /* v5.2e: early return — dump curthread fields only */
+    out[0] = ((uint64_t)0xEE02 << 32) | MAGIC_SPVT;
+    return 0;
 
     /* Build sorted function list */
     int n_funcs = 0;
