@@ -13,9 +13,14 @@ extern char doreti_iret[];
 extern char nop_ret[];
 extern char copyout[];
 extern char copyin[];
+extern char kmem_alloc[];
+extern char kernel_vmmap[];
 extern char malloc[];
 extern char M_something[];
 extern char kproc_create[];
+extern char malloc_arena_fix_start[];
+extern char malloc_arena_fix_end[];
+extern char kmem_alloc_rwx_fix[];
 extern char mov_cr3_rax[];
 
 extern struct sysent sysents[];
