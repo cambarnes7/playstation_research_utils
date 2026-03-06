@@ -1277,6 +1277,146 @@ static void _kldload(void* data, size_t data_size)
                readback[120] == 0xdeadbeefcafe0033ULL ? "OK" : "MISSING");
 
         printf("\n=== END PCPU RECON ===\n");
+    } else if (magic == 0x50434244) { /* "PCBD" - PCB dump v17 */
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+        uint64_t kdata = readback[1];
+        uint64_t ktext = readback[2];
+        uint64_t curthread_addr = readback[3];
+        uint64_t td_pcb_addr = readback[4];
+
+        printf("\n=== PCB DUMP v17 ===\n");
+        printf("  status:        %s\n", status == 1 ? "PASS" : "FAIL");
+        printf("  kdata_base:    %#lx\n", kdata);
+        printf("  ktext_base:    %#lx\n", ktext);
+        printf("  curthread:     %#lx\n", curthread_addr);
+        printf("  td_pcb:        %#lx\n", td_pcb_addr);
+
+        /* Known PCB field names from FreeBSD (offsets may differ on PS5) */
+        static const char* pcb_names[] = {
+            "pcb_r15",       /* 0x00 */
+            "pcb_r14",       /* 0x08 */
+            "pcb_r13",       /* 0x10 */
+            "pcb_r12",       /* 0x18 */
+            "pcb_rbp",       /* 0x20 */
+            "pcb_rsp",       /* 0x28 */
+            "pcb_rbx",       /* 0x30 */
+            "pcb_rip",       /* 0x38 */
+            "pcb_fsbase",    /* 0x40 */
+            "pcb_gsbase",    /* 0x48 */
+            "pcb_kgsbase",   /* 0x50 */
+            "pcb_cr0",       /* 0x58 */
+            "pcb_cr2",       /* 0x60 */
+            "pcb_cr3",       /* 0x68 */
+            "pcb_cr4",       /* 0x70 */
+            "pcb_dr0",       /* 0x78 */
+            "pcb_dr1",       /* 0x80 */
+            "pcb_dr2",       /* 0x88 */
+            "pcb_dr3",       /* 0x90 */
+            "pcb_dr6",       /* 0x98 */
+            "pcb_dr7",       /* 0xa0 */
+        };
+
+        printf("\n  --- curthread PCB raw dump (512 bytes) ---\n");
+        printf("  %-6s %-14s %s\n", "Off", "Guess", "Value");
+        for (int i = 0; i < 64; i++) {
+            uint64_t val = readback[5 + i];
+            uint64_t off = i * 8;
+            const char* name = (i < 21) ? pcb_names[i] : "";
+            const char* note = "";
+
+            if (val >= ktext && val < kdata)
+                note = " [ktext]";
+            else if (val >= kdata && val < kdata + 0x10000000)
+                note = " [kdata]";
+            else if ((val >> 40) == 0xffffff)
+                note = " [kern_heap]";
+            else if ((val >> 40) == 0xffffe0 || (val >> 40) == 0xffffd7)
+                note = " [DMAP]";
+
+            if (val != 0 || i < 21)
+                printf("  +%#-5lx %-14s %#018lx%s\n", off, name, val, note);
+        }
+
+        printf("\n  --- Cross-reference registers ---\n");
+        printf("  actual CR3: %#lx\n", readback[69]);
+        printf("  actual DR0: %#lx\n", readback[70]);
+        printf("  actual DR1: %#lx\n", readback[71]);
+        printf("  actual DR2: %#lx\n", readback[72]);
+        printf("  actual DR3: %#lx\n", readback[73]);
+        printf("  actual DR6: %#lx\n", readback[74]);
+        printf("  actual DR7: %#lx\n", readback[75]);
+
+        /* Find pcb_cr3 by matching actual CR3 */
+        uint64_t actual_cr3 = readback[69];
+        printf("\n  --- pcb_cr3 search (matching actual CR3 %#lx) ---\n", actual_cr3);
+        for (int i = 0; i < 64; i++) {
+            if (readback[5 + i] == actual_cr3) {
+                printf("  MATCH at pcb+%#lx (value=%#lx)\n",
+                       (uint64_t)(i * 8), readback[5 + i]);
+            }
+        }
+
+        /* Find pcb_onfault: should be 0 (no fault handler set) or a ktext addr.
+         * In FreeBSD 9: pcb_onfault is after pcb_flags. On PS5 pcb_flags=+0x100,
+         * so pcb_onfault is likely somewhere around +0x108..+0x118.
+         * Look for zero slots near pcb_flags that could be pcb_onfault. */
+        printf("\n  --- pcb_onfault candidates ---\n");
+        printf("  (slots that are 0 or ktext near pcb_flags at +0x100)\n");
+        /* pcb_flags is at +0x100 = index 32 */
+        uint64_t pcb_flags_val = readback[5 + 32]; /* +0x100 */
+        printf("  pcb+0x100 (pcb_flags): %#lx\n", pcb_flags_val);
+        for (int i = 30; i < 42; i++) {
+            uint64_t val = readback[5 + i];
+            uint64_t off = i * 8;
+            const char* tag = "";
+            if (val == 0)
+                tag = " <-- candidate (NULL=no handler)";
+            else if (val >= ktext && val < kdata)
+                tag = " <-- candidate (ktext addr)";
+            printf("  pcb+%#lx: %#018lx%s\n", off, val, tag);
+        }
+
+        /* Extended dump */
+        printf("\n  --- Extended PCB dump (pcb+0x200..0x2f8) ---\n");
+        for (int i = 0; i < 32; i++) {
+            uint64_t val = readback[76 + i];
+            if (val != 0) {
+                uint64_t off = 0x200 + i * 8;
+                const char* note = "";
+                if ((val >> 40) == 0xffffff)
+                    note = " [kern_heap]";
+                printf("  pcb+%#lx: %#018lx%s\n", off, val, note);
+            }
+        }
+
+        printf("\n  sentinel[108]: %#lx [%s]\n", readback[108],
+               readback[108] == 0xdeadbeefcafe0017ULL ? "OK" : "MISSING");
+
+        /* Idle thread PCB for comparison */
+        uint64_t idle_addr = readback[109];
+        uint64_t idle_pcb = readback[110];
+        printf("\n  --- idle thread PCB (for comparison) ---\n");
+        printf("  idle thread:   %#lx\n", idle_addr);
+        printf("  idle td_pcb:   %#lx\n", idle_pcb);
+
+        if (idle_pcb) {
+            /* Show side-by-side differences in the key region */
+            printf("\n  %-6s %-20s %-20s %s\n", "Off", "curthread PCB", "idle PCB", "Match?");
+            for (int i = 0; i < 64; i++) {
+                uint64_t cur_val = readback[5 + i];
+                uint64_t idle_val = readback[111 + i];
+                if (cur_val != 0 || idle_val != 0) {
+                    printf("  +%#-5lx %#-20lx %#-20lx %s\n",
+                           (uint64_t)(i * 8), cur_val, idle_val,
+                           cur_val == idle_val ? "==" : "");
+                }
+            }
+        }
+
+        printf("\n  sentinel[175]: %#lx [%s]\n", readback[175],
+               readback[175] == 0xdeadbeefcafe0018ULL ? "OK" : "MISSING");
+
+        printf("\n=== END PCB DUMP ===\n");
     } else if (magic == 0x534B5052) { /* "SKPR" - suspend stack probe */
         uint32_t status = (uint32_t)(readback[0] >> 32);
         uint64_t kdata = readback[1];
