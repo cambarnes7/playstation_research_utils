@@ -18,7 +18,7 @@ extern void* (*kernel_dynlib_dlsym)(int pid, unsigned int handle, const char* sy
 extern int (*f_usleep)(unsigned int usec);
 extern int (*printf)(const char* fmt, ...);
 
-#define sleepy_printf(fmt, ...) do { /*printf(fmt, ##__VA_ARGS__); f_usleep(100* 1000);*/ } while(0)
+#define sleepy_printf(fmt, ...) do { printf(fmt, ##__VA_ARGS__); f_usleep(100* 1000); } while(0)
 
 #define PS5_KSTUFF_LDR_BASE 0x0000000926100000
 
@@ -923,7 +923,7 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d, void* (*t_kernel_dynl
     f_usleep = kernel_dynlib_dlsym(-1, 0x1, "usleep");
     printf = kernel_dynlib_dlsym(-1, 0x2, "printf");
     
-    // printf("before r0gdb_init\n");
+    printf("before r0gdb_init\n");
 
     if (r0_table)
     {

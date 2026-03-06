@@ -26,7 +26,7 @@ void* (*kernel_dynlib_dlsym)(int pid, unsigned int handle, const char* sym) = NU
 int (*f_usleep)(unsigned int usec) = NULL;
 int (*printf)(const char* fmt, ...) = NULL;
 
-#define sleepy_printf(fmt, ...) do { /*printf(fmt, ##__VA_ARGS__); f_usleep(100* 1000);*/ } while(0)
+#define sleepy_printf(fmt, ...) do { printf(fmt, ##__VA_ARGS__); f_usleep(100* 1000); } while(0)
 
 #ifndef PS5KEK
 
