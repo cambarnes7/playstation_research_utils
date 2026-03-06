@@ -13,30 +13,12 @@ extern char doreti_iret[];
 extern char nop_ret[];
 extern char copyout[];
 extern char copyin[];
-extern char kmem_alloc[];
-extern char kernel_vmmap[];
 extern char malloc[];
 extern char M_something[];
 extern char kproc_create[];
-extern char malloc_arena_fix_start[];
-extern char malloc_arena_fix_end[];
-extern char kmem_alloc_rwx_fix[];
+extern char mov_cr3_rax[];
 
 extern struct sysent sysents[];
-
-static uint64_t dbgregs_for_kfunction_fixes[6] = {
-    (uint64_t)malloc_arena_fix_start, (uint64_t)kmem_alloc_rwx_fix,
-    (uint64_t) 0, 0,
-    0, 0x405,
-};
-
-// Only DR1 (kmem_alloc_rwx_fix) enabled - no malloc_arena_fix
-// DR7=0x404: bit 2 (L1) + bit 10 (LE)
-static uint64_t dbgregs_for_kmem_alloc_rwx[6] = {
-    0, (uint64_t)kmem_alloc_rwx_fix,
-    0, 0,
-    0, 0x404,
-};
 
 #define PS5_PAGE_SIZE 0x4000
 #define ROUND_PG(x) (((x) + (PS5_PAGE_SIZE - 1)) & ~(PS5_PAGE_SIZE - 1))
@@ -44,23 +26,6 @@ static uint64_t dbgregs_for_kmem_alloc_rwx[6] = {
 
 int try_handle_kernel_fix_trap(uint64_t* regs)
 {
-    if (regs[RIP] == (uint64_t) malloc_arena_fix_start)
-    {
-        LOG("Hit first rwx breakpoint\n");
-
-        // pretend that the system does not have memory backed, will make it ask for more
-        regs[RIP] = (uint64_t) malloc_arena_fix_end;
-        return 1;
-    }
-    else if (regs[RIP] == (uint64_t) kmem_alloc_rwx_fix)
-    {
-        LOG("Replacing it to RWX\n");
-        uelf_write_logf("Stopped at address %lx\n", regs[RIP]);
-        regs[RCX] = (regs[RCX] & 0xffffffff00000000) | 7; // mov ecx, 7 
-        regs[RIP] += 5;
-        return 1;
-    }
-
     return 0;
 }
 
@@ -117,21 +82,11 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
     }
     else if (nr == 6)
     {
-        LOG("Handling kmem_alloc kekcall\n");
         //
-        // kmem_alloc(kernel_vmmap, size) with RWX fix
+        // malloc(size, M_something, M_WAITOK) - kernel heap allocation
         //
-        // Two-frame stack setup:
-        //   1. kekcall frame (deep) - captures return value via trap 6
-        //   2. utils frame (top) - saves/restores debug registers
-        //
-        // When kmem_alloc returns:
-        //   ret → utils trap → restores dbgregs (RAX preserved)
-        //   → kekcall trap → captures RAX in td_retval
-        //
+        LOG("Handling malloc kekcall\n");
         uint64_t td = regs[RDI];
-
-        // Push kekcall return frame FIRST (processed SECOND after utils)
         uint64_t stack_frame[14] = {
             (uint64_t)doreti_iret,
             MKTRAP(TRAP_KEKCALL, 6),
@@ -140,15 +95,70 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
         push_stack(regs, stack_frame, sizeof(stack_frame));
         kpoke64(td + td_retval, 0);
 
-        // Push dbgreg frame ON TOP (processed FIRST)
-        // Loads kmem_alloc_rwx_fix breakpoint, restores original after
-        start_syscall_with_dbgregs(regs, dbgregs_for_kmem_alloc_rwx);
+        regs[RDI] = ROUND_PG(args[RDI]);       // size (page-aligned)
+        regs[RSI] = (uint64_t)M_something;      // type
+        regs[RDX] = 0x0002;                     // M_WAITOK
+        regs[RIP] = (uint64_t)malloc;
+    }
+    else if (nr == 10)
+    {
+        //
+        // Make kernel pages executable by clearing NX bit in page tables
+        // args[RDI] = kernel virtual address
+        // args[RSI] = size in bytes
+        // Returns: number of pages fixed, or 0xdead on error
+        //
+        LOG("Handling make_exec kekcall\n");
+        uint64_t addr = args[RDI];
+        uint64_t size = args[RSI];
+        uint64_t end = addr + size;
+        uint64_t pages_fixed = 0;
 
-        // Set up kmem_alloc(kernel_vmmap, size)
-        regs[RSI] = args[RDI];                          // size
-        regs[RDI] = kpeek64((uint64_t)kernel_vmmap);    // kernel vm_map pointer
-        regs[RIP] = (uint64_t) kmem_alloc;
-    } 
+        while (addr < end)
+        {
+            uint64_t pml = cr3_phys;
+            int found = 0;
+            for (int i = 39; i >= 12; i -= 9)
+            {
+                uint64_t entry_phys = pml + ((addr & (0x1ffull << i)) >> (i - 3));
+                uint64_t entry = *(uint64_t*)(DMEM + entry_phys);
+                if (!(entry & 1))
+                {
+                    // Page not present
+                    args[RAX] = 0xdead;
+                    return 0;
+                }
+                if ((entry & 128) || i == 12)
+                {
+                    // Large page or final PT entry - clear NX bit (bit 63)
+                    if (entry & (1ull << 63))
+                    {
+                        *(uint64_t*)(DMEM + entry_phys) = entry & ~(1ull << 63);
+                        pages_fixed++;
+                    }
+                    addr = (addr & ~((1ull << i) - 1)) + (1ull << i);
+                    found = 1;
+                    break;
+                }
+                pml = entry & ((1ull << 52) - (1ull << 12));
+            }
+            if (!found)
+            {
+                args[RAX] = 0xdead;
+                return 0;
+            }
+        }
+
+        // Flush TLB by reloading CR3
+        uint64_t flush_regs[NREGS] = {
+            [RIP] = (uint64_t)mov_cr3_rax, 0x20, 2, 0, 0,
+            [RAX] = cr3_phys,
+        };
+        run_gadget(flush_regs);
+
+        args[RAX] = pages_fixed;
+        return 0;
+    }
     else if (nr == 7)
     {
         // kproc_create(func, arg, newpp, flags, pages, fmt)
