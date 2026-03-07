@@ -19,6 +19,8 @@
  *   0x1: SAFE_ARM — IDT[3]=doreti_iret, apic_ops[2]=xapic_mode (no CC, baseline)
  *   0x2: BOUNCE_ARM — IDT[3]=doreti_iret, apic_ops[2]=xapic_mode-1 (CC bounce)
  *   0x3: READBACK — dump current IDT[3] + apic_ops[2] state after resume
+ *   0x4: BYTE_TEST — call xapic_mode-1 from kproc with IDT[3]=doreti_iret
+ *         to determine what byte is there (CC vs C3 vs other)
  */
 
 #define MAGIC_RSCN       0x5253434E
@@ -296,6 +298,88 @@ int module_start(kproc_args *args)
         out[10] = doreti_iret;        /* expected handler */
 
         out32[1] = 0x0003;
+
+    } else if (mode == 0x4) {
+        /*
+         * MODE 4: BYTE_TEST — call xapic_mode-1 with doreti_iret handler
+         *
+         * First sets IDT[3] = doreti_iret (IST=0), then calls xapic_mode-1
+         * as a function pointer. Reports:
+         *   - If CC byte: INT3 → doreti_iret → xapic_mode → returns 1
+         *   - If C3 (ret): immediate return, EAX = whatever (not 1)
+         *   - If other: might panic
+         *
+         * Also tests xapic_mode-2, -3, -4 to find nearby CC bytes.
+         */
+
+        /* Set IDT[3] = doreti_iret, IST=0 */
+        idt_set_handler(idt3_addr, doreti_iret, 0);
+
+        out[3] = idt_get_handler(idt3_addr);  /* verify handler set */
+
+        /* Use a sentinel in RAX before call to detect C3 (ret) */
+        typedef int (*xapic_fn)(void);
+
+        /* Test xapic_mode-1 */
+        uint64_t target = original_xapic - 1;
+        xapic_fn fn = (xapic_fn)target;
+
+        /* Pre-load EAX with a known sentinel via inline asm,
+         * then call the function pointer */
+        uint64_t ret_val;
+        __asm__ volatile(
+            "movq $0xBAD0BAD0BAD0BAD0, %%rax\n"
+            "callq *%1\n"
+            "movq %%rax, %0\n"
+            : "=r"(ret_val)
+            : "r"(fn)
+            : "rax", "rcx", "rdx", "rsi", "rdi",
+              "r8", "r9", "r10", "r11", "memory"
+        );
+
+        out[4] = ret_val;         /* return value from xapic_mode-1 */
+        out[5] = target;          /* address we called */
+
+        /* Interpret result */
+        if ((ret_val & 0xFFFFFFFF) == 1) {
+            out[6] = 0x00CC00CC00CC00CCULL;  /* byte is CC! bounce works! */
+        } else if (ret_val == 0xBAD0BAD0BAD0BAD0ULL) {
+            out[6] = 0x00C300C300C300C3ULL;  /* byte is C3 (ret), EAX unchanged */
+        } else {
+            out[6] = ret_val;  /* something else — report raw value */
+        }
+
+        /* Now test xapic_mode-2 through -4 to find CC bytes nearby */
+        for (int off = 2; off <= 4; off++) {
+            uint64_t t = original_xapic - off;
+            xapic_fn f = (xapic_fn)t;
+            uint64_t rv;
+            __asm__ volatile(
+                "movq $0xBAD0BAD0BAD0BAD0, %%rax\n"
+                "callq *%1\n"
+                "movq %%rax, %0\n"
+                : "=r"(rv)
+                : "r"(f)
+                : "rax", "rcx", "rdx", "rsi", "rdi",
+                  "r8", "r9", "r10", "r11", "memory"
+            );
+            /* out[7] = -2 result, out[8] = -3 result (if visible) */
+            if (off <= 3)
+                out[5 + off] = rv;
+        }
+
+        /* Restore IDT[3] to original handler */
+        uint64_t orig_handler_addr = read8(persist + P_IDT3_ORIG_LO);
+        if (orig_handler_addr != 0) {
+            uint64_t orig_hi = read8(persist + P_IDT3_ORIG_HI);
+            write8(idt3_addr, orig_handler_addr);
+            write8(idt3_addr + 8, orig_hi);
+        }
+
+        /* Restore apic_ops[2] to original */
+        write8(apic_ops_2, original_xapic);
+
+        out32[1] = 0x0004;
 
     } else {
         out32[1] = 0xFF;

@@ -844,11 +844,55 @@ Call flow:
 - Mode 0x2 (BOUNCE_ARM): IDT[3]=doreti_iret, apic_ops[2]=xapic_mode-1 (full bounce)
 - Mode 0x3 (READBACK): Verify state after resume
 
-### Status: TESTING
+### v7 Mode 0x1 Results — SAFE_ARM ✓ (PASSED)
 
-### Next Steps
+**Setup**: IDT[3] handler = doreti_iret, apic_ops[2] = original xapic_mode (no CC)
 
-1. Test mode 0x1 — does changing IDT[3] handler to doreti_iret break suspend/resume?
-2. If mode 0x1 works → test mode 0x2 (full CC bounce)
-3. If bounce works → evolve to payload-carrying chain (pop_all_iret + IST + per-CPU stacks)
+**ARM output** (kdata_base=0xffffffff901b0000):
+```
+out[3] = 0xffffffff8f7e07b4  → doreti_iret address ✓
+out[4] = 0xffffffff8f844340  → original xapic_mode
+out[5] = 0xffffffff8f84433f  → xapic_mode - 1 (bounce target)
+out[6] = 0xffffffff8f844178  → original IDT[3] handler (ktext+0x294178)
+out[7] = 0xffffffff8f7e07b4  → new handler = doreti_iret ✓
+```
+
+**READBACK after rest mode**:
+```
+out[3] = "PERSIST"  → IDT[3] handler = doreti_iret survived ✓
+out[4] = "PERSIST"  → apic_ops[2] unchanged ✓
+out[5] = 0xdead1d7ab00ce007  → v7 sentinel ✓
+out[6] = 0x1  → armed mode was 0x1
+out[7] = 0xffffffff8f7e07b4  → current handler = doreti_iret ✓
+```
+
+**Conclusion**: Changing IDT[3] handler to doreti_iret does NOT break suspend/resume.
+
+### v7 Mode 0x2 Results — BOUNCE_ARM ✗ (FAILED)
+
+**Setup**: IDT[3] handler = doreti_iret, apic_ops[2] = xapic_mode - 1
+
+**ARM output** (kdata_base=0xffffffff9db00000):
+```
+out[3] = 0xffffffff9d1307b4  → doreti_iret ✓
+out[4] = 0xffffffff9d194340  → original xapic_mode
+out[5] = 0xffffffff9d19433f  → xapic_mode - 1
+out[6] = 0xffffffff9d1307b4  → IDT[3] handler set ✓
+out[7] = 0xffffffff9d19433f  → apic_ops[2] set ✓
+```
+
+**Result**: System enters rest mode but **never boots back**.
+
+**Analysis**: Two hypotheses:
+1. **xapic_mode - 1 is NOT CC** — could be `C3` (ret from previous function) → returns wrong EAX (not 1) → LAPIC mode detection fails → crash
+2. **xapic_mode - 1 IS CC** — bounce fires but something about the INT3+iretq context during suspend fails
+
+**Key insight**: We confirmed copyin-1 is CC (v5), but xapic_mode is a completely different function. Inter-function padding isn't guaranteed to be CC — the previous function could end right at xapic_mode-1 with its own `ret` (C3).
+
+### Next Step: Byte Identification Test (v7b mode 0x4)
+
+Need to call xapic_mode-1 from kproc context (with IDT[3]=doreti_iret already set) and check the return value:
+- Returns 1 → byte IS CC, bounce works in normal context → problem is suspend-specific
+- Returns != 1 → byte is NOT CC (likely C3/ret returning garbage EAX)
+- Panics → byte is something else entirely
 
