@@ -915,3 +915,72 @@ Reports cc_bitmap, ret1_bitmap (CC entries that also return 1 = golden for simpl
 
 **Status**: Built (1056 bytes), awaiting deployment.
 
+### Phase 9a: v8a Canary — Byte Read Crash
+
+Simplified v8 to a minimal canary (v8a): no IDT changes, no function calls, just reads apic_ops entries and reports bytes at fn-1. Magic written early for quick detection.
+
+**v8a Result**: Kernel panic. Root cause: some apic_ops entries are NULL or point to addresses where fn-1 faults. Original sanity check `fn > 0xFFFF000000000000` passed for fn=0 (since 0-1 = 0xFFFFFFFFFFFFFFFF). Fixed with NULL check + ktext range validation, but still crashed — likely entry [25] at +0x4F69F0 is at a page boundary or the range check was too narrow.
+
+### Phase 9b: v8b Canary — Function Pointer Dump Only
+
+Stripped out all byte reads. Just dumps the 28 fn ptrs. Key fix: **magic written LAST** with `mfence` barrier, so kldload only reads back when payload is fully complete.
+
+**v8b Result**: SUCCESS. Status 0x008B confirmed, all 28 entries populated, no crash.
+
+### Full apic_ops Vtable Dump (FW 4.03)
+
+```
+ktext_base varies per boot (KASLR), offsets are stable:
+
+idx  ktext offset  PS5 name (kldload)       FreeBSD header name
+---  ------------  ----------------------   ----------------------
+ [0]  +0x28DB88    create                   create
+ [1]  +0x28D310    init                     init
+ [2]  +0x294340    xapic_mode               xapic_mode
+ [3]  +0x290808    is_x2apic                is_x2apic
+ [4]  +0x293F18    setup                    setup
+ [5]  +0x294100    dump                     dump
+ [6]  +0x2943B8    disable                  disable
+ [7]  +0x290330    set_id                   eoi (MISMATCH)
+ [8]  +0x28E9D0    ipi_raw                  id (MISMATCH)
+ [9]  +0x28DC60    ipi_vectored             intr_pending (MISMATCH)
+[10]  +0x290240    ipi_wait                 set_logical_id (MISMATCH)
+[11]  +0x290AA8    ipi_alloc                cpuid (MISMATCH)
+[12]  +0x28D770    ipi_free                 alloc_vector (MISMATCH)
+[13]  +0x28E708    set_lvt_mask             alloc_vectors (MISMATCH)
+[14]  +0x28E700    set_lvt_mode             enable_vector (MISMATCH)
+[15]  +0x28DC58    set_lvt_polarity         disable_vector (MISMATCH)
+[16]  +0x2902B8    set_lvt_triggermode      free_vector (MISMATCH)
+[17]  +0x2941D0    lvt_eoi_clear            enable_pmc (MISMATCH)
+[18]  +0x294348    set_tpr                  disable_pmc (MISMATCH)
+[19]  +0x294320    get_timer_freq           reenable_pmc (MISMATCH)
+[20]  +0x28D130    timer_enable_intr        enable_cmc (MISMATCH)
+[21]  +0x28DB80    timer_disable_intr       enable_mca_elvt (MISMATCH)
+[22]  +0x2906D0    timer_set_divisor        ipi_raw (MISMATCH)
+[23]  +0x29E830    timer_initial_count      ipi_vectored (MISMATCH)
+[24]  +0x290800    timer_current_count      ipi_wait (MISMATCH)
+[25]  +0x4F69F0    self_ipi                 ipi_alloc (MISMATCH)
+[26]  +0x28DFA8    ??? (unnamed)            ipi_free
+[27]  +0x28E760    ??? (unnamed)            set_lvt_mask
+```
+
+**Struct Mismatch Analysis**: The PS5 kernel uses a Sony-modified `struct apic_ops`:
+- Entries [0-6] match upstream FreeBSD (create through disable)
+- From [7] onward, the PS5 struct diverges completely — Sony reorganized the vtable
+- The kldload `apic_op_names[26]` (with timer/self_ipi) is the PS5-specific layout
+- Upstream FreeBSD header has 31 fields (with vector/PMC/CMC/ELVT groups)
+- PS5 has 28 populated entries, 2 more than the existing names array covers
+
+**Notable Patterns**:
+- Entry [25] at +0x4F69F0 is a major outlier (~200KB away from the cluster) — likely a Sony-added function or different compilation unit
+- Entries [13]+[14] at +0x28E708/+0x28E700 differ by only 8 bytes — trivial wrapper pair
+- Entry [21] at +0x28DB80 is 8 bytes before [0] at +0x28DB88 — another adjacent pair
+- All entries non-NULL — all 28 vtable slots are populated
+
+**Safe Hook Candidates** (based on function semantics, CC status unknown):
+- SAFE: [2] xapic_mode (tested), [3] is_x2apic (read-only), [19] get_timer_freq (read-only)
+- DANGEROUS: [6] disable, [8/22] ipi_raw, [9/23] ipi_vectored (side effects)
+- ALL need fn-1 byte check before use as doreti_iret bounce targets
+
+**Next**: Need pcb_onfault-protected byte probing to determine CC padding for each entry.
+

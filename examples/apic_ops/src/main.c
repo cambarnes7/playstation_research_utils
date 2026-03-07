@@ -46,9 +46,11 @@ static const char* apic_op_names[] = {
     "timer_initial_count",/* 23 */
     "timer_current_count",/* 24 */
     "self_ipi",         /* 25 */
+    "unknown_26",       /* 26 */
+    "unknown_27",       /* 27 */
 };
 
-#define NUM_APIC_OPS 26
+#define NUM_APIC_OPS 28
 
 static inline uint64_t rdmsr(uint32_t msr)
 {

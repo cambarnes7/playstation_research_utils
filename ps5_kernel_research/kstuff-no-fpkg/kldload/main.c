@@ -237,16 +237,17 @@ static void _kldload(void* data, size_t data_size)
             "ipi_free", "set_lvt_mask", "set_lvt_mode", "set_lvt_polarity",
             "set_lvt_triggermode", "lvt_eoi_clear", "set_tpr", "get_timer_freq",
             "timer_enable_intr", "timer_disable_intr", "timer_set_divisor",
-            "timer_initial_count", "timer_current_count", "self_ipi"
+            "timer_initial_count", "timer_current_count", "self_ipi",
+            "unknown_26", "unknown_27"
         };
 
         uint64_t ktext_base = readback[2];
         printf("\n  %-4s %-24s %-20s %s\n", "Slot", "Name", "Address", "ktext offset");
         printf("  %-4s %-24s %-20s %s\n", "----", "----", "-------", "------------");
 
-        for (uint32_t i = 0; i < num_ops && i < 26; i++) {
+        for (uint32_t i = 0; i < num_ops && i < 28; i++) {
             uint64_t addr = readback[11 + i]; /* apic_ops start at offset 0x58 = index 11 */
-            const char* name = (i < 26) ? apic_op_names[i] : "???";
+            const char* name = (i < 28) ? apic_op_names[i] : "???";
             if (addr >= ktext_base) {
                 printf("  [%2d] %-24s %#-20lx ktext+0x%lx\n",
                        i, name, addr, addr - ktext_base);
