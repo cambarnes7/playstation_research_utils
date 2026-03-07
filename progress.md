@@ -889,10 +889,21 @@ out[7] = 0xffffffff9d19433f  → apic_ops[2] set ✓
 
 **Key insight**: We confirmed copyin-1 is CC (v5), but xapic_mode is a completely different function. Inter-function padding isn't guaranteed to be CC — the previous function could end right at xapic_mode-1 with its own `ret` (C3).
 
-### Next Step: Byte Identification Test (v7b mode 0x4)
+### Byte Identification Test Results (v7b mode 0x4)
 
-Need to call xapic_mode-1 from kproc context (with IDT[3]=doreti_iret already set) and check the return value:
-- Returns 1 → byte IS CC, bounce works in normal context → problem is suspend-specific
-- Returns != 1 → byte is NOT CC (likely C3/ret returning garbage EAX)
-- Panics → byte is something else entirely
+Called xapic_mode-1 from kproc context with IDT[3]=doreti_iret, RAX pre-loaded with sentinel `0xBAD0BAD0BAD0BAD0`:
+
+**Results:**
+```
+out[4] = 0xbad0bad0bad0bad0  → EAX sentinel UNCHANGED → C3 (ret)
+out[6] = 0x00c300c300c300c3  → verdict: C3
+out[7] = 0xbad0bad0bad0bad0  → xapic_mode-2 also C3 (still in prev function epilogue)
+```
+
+**Conclusion**: **xapic_mode-1 = C3 (ret), NOT CC (INT3)**. No CC padding exists before xapic_mode — the previous function's epilogue is immediately adjacent. The doreti_iret bounce CANNOT use xapic_mode directly.
+
+**Next approaches**:
+1. Scan all 28 apic_ops function entries at -1 for CC bytes
+2. Use copyin-1 (confirmed CC) with pop_all_iret + IST chain redirecting to xapic_mode
+3. Find CC before any ktext function that returns 1
 
