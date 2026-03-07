@@ -232,7 +232,15 @@ Pivoted to empirically mapping the kernel thread structure to get correct pcb_on
 | v16 | Dump 1024 bytes of struct thread | **WORKED** — found td_pcb at +0x3f8, td_name at +0x290 |
 | v17 | Dump 256 bytes of struct pcb | **COMPLETE** — revealed full PCB layout |
 
-### Strategy 7: Suspend/Resume PCB Analysis — CURRENT
+### Strategy 7: pcb_onfault Discovery — COMPLETE
+
+Found pcb_onfault at **PCB+0x108** via `pcb_onfault_test` payload.
+
+**Initial bug**: Faulting address `0xDEAD000000000000` was non-canonical → #GP → pcb_onfault never consulted (only checked in #PF handler). Fixed to `0xFFFFDEAD00000000` (canonical, unmapped → proper #PF).
+
+**Confirmed result**: `fault_result=0xCAFE0001`, sentinel intact, onfault cleared by kernel after recovery. PCB+0x108 is immediately after pcb_flags at PCB+0x100, consistent with FreeBSD layout.
+
+### Strategy 8: Suspend/Resume PCB Analysis
 
 Shifted focus from gadget scanning to exploiting the suspend/resume path. The hypothesis: if we can control what cpu_switch restores after resume, we get code execution before the hypervisor re-locks things.
 
@@ -316,6 +324,7 @@ Shifted focus from gadget scanning to exploiting the suspend/resume path. The hy
 | **nop_ret** | kdata - 0x9d20ca | `ret` gadget for safe hijack test |
 | **PCB hijack works** | v2 trampoline confirmed | Sentinel written on resume, kernel stable |
 | **HV active at PCB hijack** | CR0.WP stuck (v3) | writecr0 intercepted during resume at cpu_switch point |
+| **pcb_onfault offset** | **PCB+0x108** | pcb_onfault_test: confirmed with fault recovery |
 | **NPT NX during suspend** | Blocks non-ktext exec | Even `mov eax,1; ret` in kdata panics during suspend |
 | **apic_ops[2] persists** | Overwrite survives rest mode | Confirmed across 8+ sessions |
 | **No CFI on apic_ops** | Indirect calls unchecked | Can point at any ktext address |
