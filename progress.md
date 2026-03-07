@@ -760,12 +760,95 @@ Stage 4 (kdata+0x700): return attempt
 | get_timer_freq | apic[19] | Safe return function |
 | nop_ret | -0x9d20ca | No-op return |
 
+### resume_chain v3 Results — FAILED (enters rest, doesn't resume)
+
+Deployed the full 6-stage INT3+IST chain:
+- System enters rest mode (chain arms successfully)
+- **System never boots back from rest mode**
+
+**Diagnostics (v5)**:
+- Mode 0x1 (kdata dump): All zeros at kdata+0x000..0x447 — chain area not corrupting globals ✓
+- Mode 0x2 (CC byte test): Instant panic — confirms byte at copyin-1 IS 0xCC ✓
+
+**Leading failure hypotheses**:
+1. Multi-CPU race: all CPUs call apic_ops[2]=CC simultaneously, shared IST5 → stack corruption
+2. rep_movsb gadget might not exist at offset -0x99002a (can't verify, XOM)
+3. Chain crashes before restoring apic_ops[2], leaving CC pointer for resume
+4. On resume, corrupted chain data → crash
+
+---
+
+## Phase 7: IDT/TSS Persistence Verification (resume_chain v6)
+
+**Critical question**: Do IDT and TSS modifications survive suspend/resume?
+
+### Test Design
+- Mode 0x1 (ARM): Modify IDT[3] IST field (0→1), write marker to TSS[0] IST1, save originals to kdata persistence area, keep apic_ops[2] = original xapic_mode (safe)
+- Mode 0x2 (READBACK): After resume, compare current IDT[3] and TSS IST1 with saved armed values
+
+### Results — BOTH PERSIST ✓
+```
+IDT[3]:  0x0050455253495354 → "PERSIST" (modification survived!)
+TSS IST: 0x0050455253495354 → "PERSIST" (modification survived!)
+Sentinel: 0xdead1d7acc000001 → match ✓
+IDT[3] armed = IDT[3] current (identical qwords)
+```
+
+**Conclusions**:
+1. IDT modifications persist through rest mode (handler + IST field)
+2. TSS IST modifications persist through rest mode
+3. ACPI wakeup does NOT restore IDT/TSS from clean copies
+4. INT3+IST approach is viable
+
+---
+
+## Phase 8: doreti_iret Bounce (resume_chain v7)
+
+### The Insight
+
+Instead of a complex 6-stage ROP chain, use the CPU's trap mechanism as a self-sustaining trampoline. This eliminates ALL failure points from v3:
+
+| v3 Problem | v7 Solution |
+|-----------|-------------|
+| Multi-CPU race on shared IST5 | No IST — each CPU uses own stack |
+| Unverifiable rep_movsb gadget | No gadgets needed — just `iretq` |
+| 6-stage chain complexity | Single instruction handler |
+| Must restore IDT/apic_ops | Self-sustaining, no restoration needed |
+
+### How It Works
+
+```
+1. IDT[3] handler = doreti_iret (just `iretq`)
+2. apic_ops[2] = xapic_mode - 1 (hoping it's a CC byte)
+
+Call flow:
+  call *apic_ops[2]
+    → CC byte at xapic_mode-1
+    → INT3 trap
+    → CPU pushes {RIP=xapic_mode, CS, RFLAGS, RSP, SS} on current stack
+    → doreti_iret = iretq
+    → pops everything back
+    → RIP = xapic_mode, RSP = original
+    → xapic_mode: mov eax, 1; ret
+    → clean return to caller!
+```
+
+### Properties
+- **Self-sustaining**: Works every call, every CPU, every suspend/resume cycle
+- **No chain data**: No IST stacks, no kdata buffers
+- **Multi-CPU safe**: Each CPU's trap frame on its own stack
+- **Minimal surface**: Single `iretq` instruction as handler
+
+### Test Modes
+- Mode 0x1 (SAFE_ARM): IDT[3]=doreti_iret, apic_ops[2]=original (baseline — no CC)
+- Mode 0x2 (BOUNCE_ARM): IDT[3]=doreti_iret, apic_ops[2]=xapic_mode-1 (full bounce)
+- Mode 0x3 (READBACK): Verify state after resume
+
+### Status: TESTING
+
 ### Next Steps
 
-1. **Deploy idt_safe_test mode 0x1 (IST5)** → rest mode → power cycle (can't readback, but we know it works)
-2. **Deploy resume_chain mode 0x3 (safe: no INT3)** → verifies IDT/TSS setup without firing chain
-3. **Deploy resume_chain mode 0x1 (full chain)** → rest mode → resume → chain fires
-4. **If system resumes normally**: chain worked! Deploy readback (mode 0x2) to check LSTAR
-5. **If system crashes during resume**: chain fired but return is broken → fix return mechanism
-6. **If LSTAR unchanged after confirmed chain execution**: HV is active at apic_ops[2] timing too
+1. Test mode 0x1 — does changing IDT[3] handler to doreti_iret break suspend/resume?
+2. If mode 0x1 works → test mode 0x2 (full CC bounce)
+3. If bounce works → evolve to payload-carrying chain (pop_all_iret + IST + per-CPU stacks)
 
