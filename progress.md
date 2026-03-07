@@ -959,7 +959,7 @@ idx  ktext offset  PS5 name (kldload)       FreeBSD header name
 [22]  +0x2906D0    timer_set_divisor        ipi_raw (MISMATCH)
 [23]  +0x29E830    timer_initial_count      ipi_vectored (MISMATCH)
 [24]  +0x290800    timer_current_count      ipi_wait (MISMATCH)
-[25]  +0x4F69F0    self_ipi                 ipi_alloc (MISMATCH)
+[25]  +0x5569F0    self_ipi                 ipi_alloc (MISMATCH)
 [26]  +0x28DFA8    ??? (unnamed)            ipi_free
 [27]  +0x28E760    ??? (unnamed)            set_lvt_mask
 ```
@@ -972,7 +972,7 @@ idx  ktext offset  PS5 name (kldload)       FreeBSD header name
 - PS5 has 28 populated entries, 2 more than the existing names array covers
 
 **Notable Patterns**:
-- Entry [25] at +0x4F69F0 is a major outlier (~200KB away from the cluster) — likely a Sony-added function or different compilation unit
+- Entry [25] at +0x5569F0 is a major outlier (~350KB away from the cluster) — likely a Sony-added function or different compilation unit
 - Entries [13]+[14] at +0x28E708/+0x28E700 differ by only 8 bytes — trivial wrapper pair
 - Entry [21] at +0x28DB80 is 8 bytes before [0] at +0x28DB88 — another adjacent pair
 - All entries non-NULL — all 28 vtable slots are populated
@@ -981,6 +981,8 @@ idx  ktext offset  PS5 name (kldload)       FreeBSD header name
 - SAFE: [2] xapic_mode (tested), [3] is_x2apic (read-only), [19] get_timer_freq (read-only)
 - DANGEROUS: [6] disable, [8/22] ipi_raw, [9/23] ipi_vectored (side effects)
 - ALL need fn-1 byte check before use as doreti_iret bounce targets
+
+**Cross-boot verification**: Second boot (ktext=0xffffffffc4ae0000) confirmed all 28 offsets identical. Entry [25] offset corrected from +0x4F69F0 to +0x5569F0 (arithmetic error in first analysis).
 
 **Next**: Need pcb_onfault-protected byte probing to determine CC padding for each entry.
 
