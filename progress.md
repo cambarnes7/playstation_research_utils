@@ -254,47 +254,46 @@ Shifted focus from gadget scanning to exploiting the suspend/resume path. The hy
 
 **Implication**: cpu_switch restores pcb_rip into RAX and does `jmp *%rax`. If we overwrite pcb_rip before suspend, the CPU will jump to our chosen address on resume. pcb_rsp is also controllable for stack pivoting.
 
-#### pcb_overwrite (two-phase) — IN PROGRESS
+#### pcb_overwrite — DEAD END (v1-v5)
 
-**Phase 1** (pre-suspend, fw_ver=0x403):
-- Snapshots idle PCB
-- Overwrites `idle_pcb->pcb_rip` from sw_return to `nop_ret` (a `ret` gadget in ktext)
-- Keeps pcb_rsp unchanged (safe — real idle stack)
-- Writes sentinels to kdata for persistence verification
-- On resume: cpu_switch loads nop_ret → `ret` → pops mi_switch return addr → normal execution
+**Concept**: Overwrite idle thread's `pcb_rip` so that on resume, `cpu_switch` jumps to our code instead of `sw_return`. A gated stub at the hijack address either skips hv_probe (gate=0, safe nop) or runs hv_probe (gate=1, set just before standby).
 
-**Phase 2** (post-resume, fw_ver=0x2):
-- Reads current idle PCB
-- Checks kdata sentinels
-- Compares current pcb_rip against backed-up original
-- If pcb_rip is back to sw_return → **hijack confirmed**: our nop_ret ran, then cpu_switch re-saved sw_return
+**v1** — bare `ret` gadget (nop_ret) in pcb_rip:
+- PCB overwrite succeeds, readback confirms
+- **Kernel panics**: sw_return is NOT just `ret` — it contains critical cleanup (scheduler lock release, CR3 restore, etc.). Bare `ret` skips all of it → deadlock/fault
 
-**Also supports dry run** (fw_ver=0x3): snapshots everything without overwriting.
+**v2** — trampoline stub: `write sentinel → jmp sw_return`:
+- **CONFIRMED WORKING** — trampoline executed on resume, wrote sentinel, jumped to sw_return, kernel resumed cleanly
+- **Arbitrary code execution via PCB hijack proven**
 
-**Diagnostic modes added:**
-- fw_ver=0x4 (HALF-ARMED): kdata writes only, no PCB overwrite
-- fw_ver=0x5 (PCB-ONLY): PCB overwrite only, no kdata writes
+**v3** — HV probe via trampoline: `writecr0(cr0 & ~CR0_WP)` to test HV:
+- **CONFIRMED WORKING (once)** — HV probe ran during resume
+- **Result: CR0.WP stuck** → HV is active at PCB hijack point
+- PCB hijack runs **too late** — HV has already restarted by the time cpu_switch runs
+- Subsequent runs kernel panicked (tight persistence loop + ungated hv_probe = repeated VMEXITs from idle thread)
 
-**RESULTS — Phase 1 (ARMED):**
+**v4** — gated stub + persistence loop variations:
+- Added gate mechanism: gate=0 (safe nop during normal ops), gate=1 (run hv_probe, set just before standby)
+- **Tight loop (200M writes/sec)** → panic (cache line contention with cpu_switch)
+- **Userspace loop (kekcall_copyin + usleep)** → stable but pcb_rip always lost (userspace threads stopped before kernel's final cpu_switch)
+- **Pthread hammer (31K writes/sec)** → panic
+- **Gentle kernel loop (100 pauses, ~170K writes/sec)** → panic
+- **Fast-track kldload (skip readback, immediate standby)** → panic
 
-1. **PCB overwrite succeeds** — pcb_rip readback confirms nop_ret written
-2. **Kernel panics ~2-5s after overwrite** — panic happens when CPU 0 next switches to idle thread
-3. **Diagnostic runs**: half-armed survived (kdata writes fine), PCB-only also survived (no immediate panic from write itself)
-4. **Earlier panics on some boots were from flaky jailbreak sessions**, not fundamental write issues
-5. **Root cause of post-overwrite panic**: sw_return is NOT just `ret`. It contains critical cleanup code (likely: releasing scheduler lock, restoring CR3/segment registers, re-enabling interrupts). Our bare `ret` gadget (nop_ret) skips this cleanup → deadlock/fault
+**v5** — write-once, no persistence loop:
+- Kernel thread writes pcb_rip once and exits immediately
+- kldload busy-polls (no usleep) via kekcall for instant detection
+- Immediately sets gate=1 + sceSystemStateMgrEnterStandby()
+- **Still panics** — setting gate=1 allows the stub to run hv_probe during the standby sequence; writecr0 triggers a VMEXIT that crashes
 
-**sw_return analysis attempt:**
-- Modified gadget_reader to dump 256 bytes at sw_return (kdata - 0x5A16AB = ktext + 0x65e955)
-- Fixed kldload decoder bug: region parsing started at byte offset 24 instead of 40 (dmap_base + cr3_val fields were added to header without updating decoder)
-- DMAP reads returned garbage on latest boot — dmap_base calculation may be unreliable across boots
-- **Decision**: Don't need to reverse-engineer sw_return. Instead, build a trampoline that does custom work then jumps to sw_return for proper cleanup
+**Root cause analysis**: The fundamental problem has two sides:
+1. **Any kernel-side persistence loop → panic** (multi-core race: writing pcb_rip while cpu_switch is using the idle PCB on another core corrupts context switch state)
+2. **gate=1 + active stub → panic** (stub runs hv_probe during standby processing, writecr0 VMEXIT crashes)
+3. **No loop + no gate → pcb_rip lost** (cpu_switch overwrites pcb_rip with sw_return before standby completes)
 
-**TRAMPOLINE APPROACH (next step):**
-- Allocate executable kernel memory (malloc + NX clear)
-- Write shellcode: `write sentinel to kdata` → `jmp sw_return`
-- Set pcb_rip → trampoline address
-- On resume: cpu_switch restores regs → jmp trampoline → our code runs → jmp sw_return → kernel continues normally
-- This avoids needing to replicate sw_return's cleanup; we just defer to it
+**Conclusion**: PCB hijack is a dead end for reliable HV probing. v3 proved it works for code execution (trampoline + jmp sw_return), and confirmed **HV is active at the PCB hijack point**. Need earlier execution to catch the pre-HV window.
+
+**Key finding from v3**: Consider apic_ops[2] hijack for pre-HV window — but this was already explored in Sessions 8-9 and blocked by **NPT NX** (HV enforces NX on all non-ktext pages during suspend, so apic_ops[2] must point to a ktext address).
 
 ---
 
@@ -315,6 +314,11 @@ Shifted focus from gadget scanning to exploiting the suspend/resume path. The hy
 | **pcb_rip stable** | ktext+0x65e955 (sw_return) | pcb_diff: identical before/after |
 | **pcb_rsp stable** | `0xffffff8008a4b828` | pcb_diff: identical before/after |
 | **nop_ret** | kdata - 0x9d20ca | `ret` gadget for safe hijack test |
+| **PCB hijack works** | v2 trampoline confirmed | Sentinel written on resume, kernel stable |
+| **HV active at PCB hijack** | CR0.WP stuck (v3) | writecr0 intercepted during resume at cpu_switch point |
+| **NPT NX during suspend** | Blocks non-ktext exec | Even `mov eax,1; ret` in kdata panics during suspend |
+| **apic_ops[2] persists** | Overwrite survives rest mode | Confirmed across 8+ sessions |
+| **No CFI on apic_ops** | Indirect calls unchecked | Can point at any ktext address |
 
 ### Thread Structure Layout (v16, FW 4.03)
 
@@ -360,10 +364,26 @@ Shifted focus from gadget scanning to exploiting the suspend/resume path. The hy
 
 ---
 
+## Current Blockers & Constraints
+
+1. **NPT NX during suspend**: HV enforces No-Execute on ALL non-ktext pages during `cpususpend_handler`. Custom code in kdata/kmod pages panics. apic_ops[2] MUST point to a ktext address.
+2. **XOM on ktext**: Can't read or write ktext. Can only execute existing code at known offsets.
+3. **PCB hijack too late**: HV is already active when cpu_switch runs during resume. PCB hijack gives code execution but NOT pre-HV access.
+4. **PCB hijack unreliable**: Persistence loop crashes (multi-core race), no loop loses pcb_rip.
+
+## What Works
+
+- apic_ops[2] overwrite persists through suspend/resume
+- Can point apic_ops[2] at any ktext address (no CFI)
+- kdata persists (code, pointers, markers all survive)
+- Guest PTE modifications persist (NX clearing survives)
+- PCB hijack CAN execute code on resume (v2 proven) but unreliable and too late for HV probing
+
 ## Next Steps
 
-1. **Build trampoline payload** — shellcode that writes sentinel + jumps to sw_return
-2. **Deploy pcb_overwrite v2** — pcb_rip → trampoline, pcb_rsp unchanged (safe idle stack)
-3. **Enter rest mode → wake → re-exploit → Phase 2** — verify sentinel survived + kernel stable
-4. **If trampoline works**: Extend shellcode to do real work (hook syscall, install backdoor, etc.)
-5. **Full exploit chain**: trampoline → install persistent kernel hooks → survive across multiple suspend/resume cycles
+The path forward requires finding useful **ktext gadgets** to point apic_ops[2] at during resume. Since we can't inject custom code (NPT NX blocks it) and can't read ktext (XOM), we need:
+
+1. **Identify ktext gadgets** that do something useful when called as apic_ops[2] during LAPIC resume
+2. **Register state mapping** — determine exact register values at the apic_ops[2] call site during resume (reg_probe captured normal-ops state; resume state may differ)
+3. **ROP via cpu_switch**: If we can find a gadget that loads a PCB pointer from a register we control, we can pivot to cpu_switch's restore half → stack pivot → ROP chain in kdata
+4. **Alternative: explore other resume-time hooks** — are there other function pointers in kdata called during resume besides apic_ops?
