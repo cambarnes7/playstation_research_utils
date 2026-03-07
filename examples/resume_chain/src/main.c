@@ -85,10 +85,13 @@ int module_start(kproc_args *args)
     /* Read byte at fn-1 for each entry */
     for (int i = 0; i < APIC_OPS_COUNT; i++) {
         uint64_t fn = out[8 + i];
-        if (fn > 0xFFFF000000000000ULL) {  /* sanity: looks like kernel addr */
+        if (fn == 0) {
+            out[36 + i] = 0xDEAD0000;  /* NULL ptr */
+        } else if (fn >= ktext_base && fn < ktext_base + 0x2000000) {
+            /* Valid ktext pointer — safe to read fn-1 */
             out[36 + i] = read1(fn - 1);
         } else {
-            out[36 + i] = 0xDEAD;  /* invalid ptr marker */
+            out[36 + i] = 0xDEAD0000 | (fn & 0xFFFF);  /* unexpected addr */
         }
     }
 
