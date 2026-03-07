@@ -422,15 +422,27 @@ RESUME:  ACPI wakeup code → resumectx(susppcbs[0]) → kernel continues
 ### New Payloads Built
 
 #### register_capture (`examples/register_capture/`)
-Installs a trampoline at kdata+0x400 that captures ALL 16 GPRs + RSP + RFLAGS + return address when the kernel calls apic_ops[2] during normal LAPIC operations. Writes to kdata+0x200 capture buffer. Restores original apic_ops[2] after capture.
+Installs a trampoline that captures ALL 16 GPRs + RSP + RFLAGS + return address when the kernel calls apic_ops[2]. Writes to kdata+0x200 capture buffer.
 
-**Critical output**: RDI value at call site determines which gadget approach works.
+**Result**: capture_count=0 after three iterations. apic_ops[2] (xapic_mode) is NOT called during normal steady-state operation — only during LAPIC init (boot) and LAPIC resume (after suspend). Trampoline approach is a dead end for normal-ops testing. Need to test during suspend/resume cycle instead.
+
+**Iterations**:
+- v1: Trampoline at kdata+0x400 — NX bit blocked execution, capture_count=0
+- v2: Added DMAP-based NX clearing — instant kernel panic (DMAP probe reads unmapped addresses)
+- v3: Static buffer in .data section — no panic, but capture_count=0 (apic_ops[2] never called)
 
 #### savectx_finder (`examples/savectx_finder/`)
-Scans kdata for pointers in range [cpu_switch, cpu_switch+0x2000] to locate savectx/resumectx addresses. Also scans ACPI low-memory wakeup region for suspend PCB references.
+Three modes:
+- **Mode 0x403 (SCAN)**: Scans kdata for pointers in range [cpu_switch, cpu_switch+0x2000] to locate savectx/resumectx addresses
+- **Mode 0x2 (ARM)**: Points apic_ops[2] at `justreturn` (ktext `ret` gadget, kdata-0x9cf990) + writes "JUSTRETA" sentinel to kdata+0x200. Leave armed for suspend/resume test
+- **Mode 0x3 (READBACK)**: Post-resume verification — checks sentinel persistence, reads apic_ops[2] value, restores original xapic_mode via set_tpr-8 trick
+
+**v2 changes**: Removed dangerous DMAP probe code (same crash pattern as register_capture v2). Removed mode 0x1 (DMAP low-memory scan). Added modes 0x2/0x3 for justreturn suspend/resume test.
 
 ### Next Steps
 
-1. **Deploy register_capture** → learn RDI and all register values at apic_ops[2] call site
-2. **Deploy savectx_finder** → find exact savectx/resumectx ktext addresses
-3. **Based on results**: if RDI → controllable memory, point apic_ops[2] at `resumectx` with fake PCB for full CPU state control via ROP chain in kdata
+1. **Deploy savectx_finder mode 0x403** → scan for savectx/resumectx ktext addresses
+2. **Deploy savectx_finder mode 0x2** → arm apic_ops[2] with justreturn
+3. **Suspend/resume PS5**
+4. **Deploy savectx_finder mode 0x3** → verify justreturn executed cleanly during resume
+5. **If justreturn works**: escalate to savectx/resumectx for register capture and full CPU state control
