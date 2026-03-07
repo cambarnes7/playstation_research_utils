@@ -1786,7 +1786,15 @@ static void _kldload(void* data, size_t data_size)
 
             /* Auto-enter rest mode after arming */
             if (phase == 1) {
-                printf("\n  >>> AUTO-STANDBY: entering rest mode in 3 seconds... <<<\n");
+                /* Set the gate at kdata+0x460 to enable hv_probe on resume.
+                 * Gate=0 during persistence loop: stub is a safe nop (no VMEXITs).
+                 * Gate=1 just before standby: stub will run hv_probe on resume. */
+                uint64_t gate_val = 1;
+                uint64_t gate_addr = readback[1] + 0x460; /* kdata_base + KDATA_GATE_OFF */
+                printf("\n  >>> Setting gate at %#lx = 1 (enabling hv_probe for resume)... <<<\n", gate_addr);
+                kekcall_copyin(&gate_val, gate_addr, 8);
+
+                printf("  >>> AUTO-STANDBY: entering rest mode in 3 seconds... <<<\n");
                 fflush(stdout);
                 sleep(3);
                 printf("  >>> Calling sceSystemStateMgrEnterStandby()... <<<\n");
