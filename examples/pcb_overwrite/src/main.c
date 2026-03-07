@@ -554,25 +554,16 @@ static void phase1_arm(uint64_t kdata_base, uint64_t exec_code,
     out32[1] = 0x0001;
 
     /*
-     * PERSISTENCE LOOP: continuously re-overwrite pcb_rip to race against
-     * cpu_switch (which may save sw_return back into the PCB at any time).
+     * v4: No persistence loop in kernel. The tight kernel loop caused panics
+     * by monopolizing a CPU core and creating constant cache line contention
+     * with cpu_switch. Instead, kldload hammers pcb_rip from userspace via
+     * kekcall_copyin with usleep between writes. This naturally yields the
+     * CPU and avoids kernel-level contention.
      *
-     * This loop runs AFTER output is signaled complete (out32[1] = 1), so
-     * kldload can read results immediately while we keep pcb_rip armed.
-     * kldload then calls sceSystemStateMgrEnterStandby() programmatically.
-     *
-     * The loop runs for ~60 seconds (approximate). When the console enters
-     * rest mode, the CPU halts and this loop stops naturally.
-     *
-     * 8-byte aligned writes are atomic on x86_64, so no tearing risk.
+     * The kernel thread's job is done: stub is built, pcb_rip has been
+     * overwritten once (may be overwritten back by cpu_switch shortly),
+     * and all addresses are recorded in the output buffer for kldload.
      */
-    if (!dry_run && idle_pcb >= MIN_KERN_ADDR) {
-        volatile uint64_t* pcb_rip_ptr = (volatile uint64_t*)(idle_pcb + PCB_RIP);
-        /* ~60 seconds at estimated ~200M iters/sec on Zen 2 */
-        for (volatile uint64_t j = 0; j < 12000000000ULL; j++) {
-            *pcb_rip_ptr = stub_addr;
-        }
-    }
 }
 
 static void phase2_verify(uint64_t kdata_base, volatile uint64_t* out,

