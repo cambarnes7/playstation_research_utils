@@ -1798,10 +1798,23 @@ static void _kldload(void* data, size_t data_size)
 
             printf("\n  --- kdata persistence ---\n");
             uint64_t sent = readback[20];
-            printf("  sentinel:        %#lx %s\n", sent,
-                   sent == 0x484A4B5F52414E21ULL ? "[HJK_RAN! - TRAMPOLINE EXECUTED!]" :
-                   sent == 0 ? "[zero - trampoline did NOT run]" : "[unexpected value]");
-            printf("  snap_magic:      %#lx\n", readback[21]);
+            uint64_t stub_sent = readback[21];
+            printf("  hv_probe sent:   %#lx %s\n", sent,
+                   sent == 0x484A4B5F52414E21ULL ? "[HJK_RAN! - hv_probe() executed!]" :
+                   sent == 0 ? "[zero - hv_probe did NOT write]" : "[unexpected]");
+            printf("  stub sentinel:   %#lx %s\n", stub_sent,
+                   stub_sent == 0x535455425F524E21ULL ? "[STUB_RN! - asm stub executed!]" :
+                   stub_sent == 0 ? "[zero - stub did NOT execute]" : "[unexpected]");
+
+            if (stub_sent == 0 && sent == 0) {
+                printf("\n  DIAGNOSIS: Neither sentinel written.\n");
+                printf("  -> Stub NEVER ran. PCB overwrite was likely lost before suspend.\n");
+                printf("  -> A cpu_switch may have re-saved sw_return into PCB.\n");
+                printf("  -> Tip: enter rest mode IMMEDIATELY after phase 1.\n");
+            } else if (stub_sent == 0x535455425F524E21ULL && sent == 0) {
+                printf("\n  DIAGNOSIS: Stub ran but hv_probe() did NOT execute.\n");
+                printf("  -> The `call hv_probe` failed (wrong addr? crashed?)\n");
+            }
 
             printf("\n  --- pcb_rip analysis ---\n");
             uint64_t orig = readback[24];

