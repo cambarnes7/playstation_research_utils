@@ -3,6 +3,13 @@
 /*
  * pcb_overwrite v2 — Hijack idle PCB with trampoline → sw_return
  *
+ * === CONFIRMED WORKING 2026-03-07 ===
+ *   Phase 1 (fw_ver=0x403): Armed trampoline, overwrote pcb_rip ✓
+ *   Suspend/resume: Console entered rest mode and resumed cleanly ✓
+ *   Phase 2 (fw_ver=0x2): Sentinel 0x484A4B5F52414E21 ("HJK_RAN!") found ✓
+ *   pcb_rip restored to sw_return by cpu_switch after trampoline ran ✓
+ *   VERDICT: FULL SUCCESS — arbitrary kernel code execution via PCB hijack
+ *
  * v1 LEARNED:
  *   - PCB overwrite succeeds (pcb_rip readback confirmed)
  *   - But nop_ret (bare `ret` gadget) skips sw_return cleanup → kernel panic
