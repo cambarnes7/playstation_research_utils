@@ -643,9 +643,129 @@ IST entries at TSS + 36 + (N-1)*8 for IST N (N=1..7):
 - IST3: TSS + 52  (= TSS + 28 + 3*8)
 - IST7: TSS + 84  (= TSS + 28 + 7*8)
 
+### IST Assignments (FW 4.03)
+
+| IST | Used By | Notes |
+|-----|---------|-------|
+| IST1 | FreeBSD #DF handler | **DO NOT TOUCH** — causes triple fault |
+| IST2 | Unknown | Untested |
+| IST3 | ps5-kstuff #GP (IDT[13]) | kekcall dispatch |
+| IST4 | System (preserved by kstuff) | kstuff saves/restores this |
+| IST5 | **Unused** | Safe for our use |
+| IST6 | Unknown/Unused | Likely safe |
+| IST7 | ps5-kstuff #DB (IDT[1]) | Debug trap |
+
+---
+
+## Phase 6a: IDT/TSS Safety Test Results
+
+### Test 1: IST1 (FAILED — IST collision)
+
+**Payload**: `idt_safe_test` mode 0x1 with IST1
+- Modified IDT[3] IST field = 1, TSS IST1 = kdata+0x300
+- Rest mode entry: **succeeded**
+- Resume from rest mode: **succeeded**
+- Sending kldload.elf after resume: **FROZEN** — required holding power button
+- **Root cause**: IST1 is used by FreeBSD Double Fault (#DF) handler. Overwriting TSS IST1 meant any double fault → CPU loads RSP from kdata+0x300 (garbage) → triple fault → CPU halt
+
+### Test 2: IST5 (PARTIAL SUCCESS — rest mode safe, kldload crashes)
+
+**Payload**: `idt_safe_test` mode 0x1 with IST5 (OUR_IST_NUM=5)
+- Modified IDT[3] IST field = 5, TSS IST5 = kdata+0x300
+
+**Output**:
+```
+[0x00] magic=0x49445453 status=0x0001  ← success
+[0x08] kdata_base=0xffffffff8f470000
+[0x10] ktext_base=0xffffffff8e870000
+[0x18] idt_base=0xffffffff9593dc80
+[0x20] tss_base=0xffffffff95940830
+[0x28] orig IDT[3] lo=0x8eb0ee0000204178  ← IST=0, DPL=3, handler=0xffffffff8eb04178
+[0x30] orig IDT[3] hi=0x00000000ffffffff
+[0x38] mod  IDT[3] lo=0x8eb0ee0500204178  ← IST=5 ✓
+```
+
+**Results**:
+- Rest mode entry: **succeeded** ✓
+- Resume from rest mode: **succeeded** ✓
+- Sending kldload.elf after resume: **instant kernel panic** (clean shutdown, not frozen)
+- **Improvement over IST1**: Clean panic vs freeze. #DF handler works → panic handler can execute
+
+**Key findings**:
+1. **HV does NOT block rest mode with IDT/TSS modifications** — confirmed
+2. **IDT[3] IST field persists through rest mode** (kldload crash proves INT3 still uses IST5 after resume)
+3. **TSS IST5 persists through rest mode** (same evidence — IST5 must still point to kdata+0x300)
+4. **kldload crash is expected**: IDT[3] IST=5 → any INT3 during normal operation → RSP=kdata+0x300 (garbage stack) → panic
+5. **Original IDT[3] has DPL=3** (0xEE = present, DPL=3, interrupt gate) — INT3 callable from usermode
+
+**Conclusion**: IDT/TSS modifications are safe through rest mode. The chain must **self-restore** IDT[3] and apic_ops[2] after executing, otherwise kldload can't run afterward.
+
+---
+
+## Phase 6b: resume_chain v2 — Self-Restoring ROP Chain
+
+### Design
+
+The v1 chain crashed after wrmsr with no way to verify results or use kldload afterward. v2 adds self-restoration: after wrmsr, the chain restores IDT[3] original and apic_ops[2] original using `rep_movsb_pop_rbp_ret` gadget (memcpy), then attempts return via `get_timer_freq`.
+
+### Chain Stages (v2)
+
+```
+INT3 (CC byte in ktext) fires during LAPIC resume
+  ↓ CPU loads RSP from TSS IST5 = kdata+0x300
+  ↓ CPU pushes trap frame to [kdata+0x2D8..0x2F8]
+
+Stage 0 (kdata+0x300): pop_all_iret
+  → Pops 5 trap values (RIP→RDI, CS→RSI, RFLAGS→RDX, RSP→RCX, SS→R8)
+  → Pops 10 controlled values (R9..R15)
+  → iretq → Stage 1
+
+Stage 1 (kdata+0x400): pop_all_iret → wrmsr
+  → Loads ECX=0xC0000082 (LSTAR MSR#)
+  → Loads EAX=LSTAR_low32, EDX=LSTAR_high32
+  → iretq → wrmsr_ret (writes LSTAR back to current value for v1 safe test)
+  → ret → Stage 2
+
+Stage 2 (kdata+0x500): pop_all_iret → restore IDT[3]
+  → Loads RDI=IDT[3] addr, RSI=save[0..1] addr, RCX=16
+  → iretq → rep_movsb_pop_rbp_ret (copies 16 bytes: original IDT[3] restored!)
+  → pop rbp, ret → Stage 3
+
+Stage 3 (kdata+0x600): pop_all_iret → restore apic_ops[2]
+  → Loads RDI=apic_ops[2] addr, RSI=save[3] addr, RCX=8
+  → iretq → rep_movsb_pop_rbp_ret (copies 8 bytes: original apic_ops[2] restored!)
+  → pop rbp, ret → Stage 4
+
+Stage 4 (kdata+0x700): return attempt
+  → doreti_iret → iretq → get_timer_freq (dummy RSP)
+  → get_timer_freq returns → crash expected (v1)
+  → But IDT[3] and apic_ops[2] are ALREADY RESTORED before crash
+```
+
+### Key Properties
+
+- **Self-restoring**: Even if the return crashes, IDT[3] and apic_ops[2] are already restored by Stages 2-3
+- **After power cycle + re-exploit**: kldload works normally (IDT[3] IST back to 0)
+- **Chain verification**: If system resumes and kldload works → chain executed AND restored successfully
+- **TSS IST5 left modified**: Harmless once IDT[3] IST=0 (no vector uses IST5 anymore)
+
+### Gadgets Used
+
+| Gadget | Offset | Role |
+|--------|--------|------|
+| pop_all_iret | -0x9cf8ab | Register loading (4 uses) |
+| wrmsr_ret | -0x9d20cc | Write MSR |
+| rep_movsb_pop_rbp_ret | -0x99002a | Restore IDT[3] and apic_ops[2] |
+| doreti_iret | -0x9cf84c | iretq chain link |
+| get_timer_freq | apic[19] | Safe return function |
+| nop_ret | -0x9d20ca | No-op return |
+
 ### Next Steps
 
-1. **Phase 1**: Build `idt_safe_test` — minimal IDT modification + rest mode cycle
-2. **Phase 2**: Build `resume_chain` — full INT3+IST ROP chain for resume
-3. **Phase 3**: Deploy and test — verify chain fires, test HV activity
+1. **Deploy idt_safe_test mode 0x1 (IST5)** → rest mode → power cycle (can't readback, but we know it works)
+2. **Deploy resume_chain mode 0x3 (safe: no INT3)** → verifies IDT/TSS setup without firing chain
+3. **Deploy resume_chain mode 0x1 (full chain)** → rest mode → resume → chain fires
+4. **If system resumes normally**: chain worked! Deploy readback (mode 0x2) to check LSTAR
+5. **If system crashes during resume**: chain fired but return is broken → fix return mechanism
+6. **If LSTAR unchanged after confirmed chain execution**: HV is active at apic_ops[2] timing too
 
