@@ -426,11 +426,7 @@ int module_start(kproc_args* args)
         out[14] = new_lstar;
         out[15] = s5_rflags_slot;   /* dest for trapped RFLAGS+RSP copy */
         out[16] = trap_rflags_addr; /* src for trapped RFLAGS+RSP copy */
-        /* Byte verification: read 8 bytes at each gadget address */
-        out[17] = read8(cc_candidate);     /* should start with 0xCC (INT3) */
-        out[18] = read8((uint64_t)rep_movsb);  /* should be F3 A4 5D C3 ... */
-        out[19] = read8((uint64_t)wrmsr_ret);  /* should be 0F 30 [90] C3 ... */
-        out[20] = read8((uint64_t)pop_all_iret); /* first bytes of pop_all_iret */
+        /* NOTE: cannot read8() ktext addresses — XONLY pages fault */
 
         out32[1] = 0x0001;
 
