@@ -20,6 +20,7 @@
 #define OFF_RDMSR_START      (-0x9d0cfa)
 #define OFF_POP_ALL_IRET     (-0x9cf8ab)
 #define OFF_COPYIN           (-0x9908e0)
+#define OFF_SW_RETURN        (-0x5A16AB)  /* pcb_rip target inside cpu_switch */
 
 /* kernel_pmap_store is at kdata_base + this offset */
 #define OFF_KERNEL_PMAP_STORE  0x3257a78
@@ -252,10 +253,12 @@ int module_start(kproc_args* args)
     read_region(&out->regions[n++], kdata_base + OFF_POP_ALL_IRET - 16, OFF_POP_ALL_IRET - 16, dmap_base);
 
     /*
-     * Region 7: copyin (256 bytes)
-     * Kernel copyin function - useful as arbitrary write primitive.
+     * Region 7: sw_return (256 bytes)
+     * The address stored in idle PCB's pcb_rip — cpu_switch jumps here
+     * after restoring registers. Need to see what cleanup it does
+     * (lock release? interrupt enable?) that nop_ret skips.
      */
-    read_region(&out->regions[n++], kdata_base + OFF_COPYIN, OFF_COPYIN, dmap_base);
+    read_region(&out->regions[n++], kdata_base + OFF_SW_RETURN, OFF_SW_RETURN, dmap_base);
 
     out->num_regions = n;
 
