@@ -915,3 +915,234 @@ Reports cc_bitmap, ret1_bitmap (CC entries that also return 1 = golden for simpl
 
 **Status**: Built (1056 bytes), awaiting deployment.
 
+---
+
+## Build Process Documentation
+
+### Overview
+
+There are **three distinct build pipelines** in this repo, each producing different artifact types for different purposes.
+
+---
+
+### 1. Research Payloads (examples/ directory) — Produces `.bin` + `.elf`
+
+These are the standalone kernel research payloads (resume_chain, chain_prep, suspend_stackprobe, etc.).
+
+**Toolchain**: Standard host `gcc` + `objcopy` (NOT the PS5 SDK). No cross-compiler needed — the PS5 kernel runs on x86-64 anyway.
+
+**Exact build steps** (using `resume_chain` as example):
+
+```bash
+cd examples/resume_chain
+
+# Step 1: Compile C source to object file
+gcc -c -o build/main.o src/main.c \
+    -Os -std=c11 -ffunction-sections -fdata-sections -fno-builtin \
+    -nostartfiles -nostdlib -Wall -march=btver2 -mtune=btver2 \
+    -m64 -mabi=sysv -mcmodel=small -fpie -fno-stack-protector
+
+# Step 2: Link object file into ELF using custom linker script
+gcc build/main.o -o resume_chain.elf \
+    -Os -std=c11 -ffunction-sections -fdata-sections -fno-builtin \
+    -nostartfiles -nostdlib -Wall -march=btver2 -mtune=btver2 \
+    -m64 -mabi=sysv -mcmodel=small -fpie -fno-stack-protector \
+    -Xlinker -T ./linker.x -Wl,--build-id=none -Wl,--gc-sections -nostdlib
+
+# Step 3: Strip ELF to flat binary
+objcopy -S -O binary resume_chain.elf resume_chain.bin
+
+# Step 4: Move ELF into build/
+mv resume_chain.elf build/
+```
+
+**Or simply**: `make` in the example directory.
+
+**Key compiler flags explained**:
+- `-Os` — optimize for size (these payloads must be small)
+- `-nostartfiles -nostdlib` — no libc, no crt0 — this is a bare-metal kernel payload
+- `-march=btver2 -mtune=btver2` — PS5's AMD Zen 2 CPU (btver2 is the closest base arch)
+- `-fpie` — position-independent (payload gets loaded at arbitrary kdata addresses)
+- `-fno-stack-protector` — no stack canaries (no libc to support them)
+- `-mcmodel=small` — small code model, all symbols within 2GB
+
+**Linker script** (`linker.x`):
+- Entry point: `module_start` (function in main.c)
+- Sections: `.text` (code) → `.rodata` (constants) → `.data` (initialized data) → `.bss` (zeroed data)
+- Discards: `.comment`, `.note.GNU-stack`, `.eh_frame`, `.interp`, `.note.gnu.property`
+- Each section gets its own PT_LOAD segment
+- The `.text.module_start` section is placed FIRST so the entry point is at offset 0 in the binary
+
+**What `.bin` vs `.elf` means**:
+- `.elf` — standard ELF executable with section headers, symbol table, debug info. Used for analysis/debugging with tools like `readelf`, `objdump`, `gdb`
+- `.bin` — flat raw binary, just the code+data bytes with no headers. This is what actually gets loaded into PS5 kernel memory. The entry point is byte 0. The `.bin` is produced by `objcopy -S -O binary` which strips all ELF metadata and outputs just the loadable segments laid out sequentially.
+
+**All examples use the same Makefile pattern.** Each example directory has:
+- `Makefile` — identical structure, just different `TARGET` and `ELF` names
+- `linker.x` — identical linker script across all examples
+- `src/main.c` — the actual payload code
+- `build/` — output directory for `.o` and `.elf`
+- `<name>.bin` — final flat binary in the example root
+
+---
+
+### 2. kstuff (ps5-kstuff) — Produces `payload.bin` / `payload.elf`
+
+This is the main ps5-kstuff kernel payload from prosper0gdb/flatz. Located at `ps5_kernel_research/kstuff-no-fpkg/ps5-kstuff/`.
+
+**Toolchain**: Host `gcc` + `yasm` (assembler) + `objcopy` + `python3`
+
+**Full dependency chain**:
+
+```
+payload.elf
+├── lib/lib-elf-ps5.a          (runtime library)
+│   ├── crt-elf.o              (yasm: crt-elf.asm)
+│   ├── crt-elf-c.o            (gcc: crt-elf-c.c)
+│   ├── dl.o                   (gcc: dl.c)
+│   └── syscalls-ps5.o         (yasm: syscalls-ps5.asm ← python3 syscalls-ps5.py)
+├── prosper0gdb/prosper0gdb.o  (gcc: r0gdb.c + r0run.o + offsets.c)
+│   └── r0run.o                (yasm: r0run.asm)
+├── main.c                     (main payload logic)
+├── sqlite_triggers.c
+├── kelf                       (embedded kernel ELF — the ROP chain)
+│   └── kelf.o                 (yasm: kelf.asm + structs.inc)
+└── uelf/uelf.bin              (embedded userland ELF)
+    └── uelf/uelf              (gcc: uelf/*.c + BearSSL + libtomcrypt)
+        ├── uelf/crt.o         (yasm: uelf/crt.asm)
+        ├── BearSSL/build/libbearssl.a  (bash build_bearssl.sh)
+        └── libtomcrypt/libtomcrypt.a   (bash build_libtomcrypt.sh)
+```
+
+**Exact build commands** (in order):
+
+```bash
+cd ps5_kernel_research/kstuff-no-fpkg
+
+# 1. Build runtime library
+cd lib
+python3 syscalls-ps5.py > syscalls-ps5.asm
+yasm -f elf64 crt-elf.asm -o crt-elf.o
+gcc -c -isystem ../freebsd-headers -nostdinc -fno-stack-protector -O3 crt-elf-c.c -o crt-elf-c.o -fPIE -ffreestanding
+gcc -c -isystem ../freebsd-headers -nostdinc -fno-stack-protector dl.c -o dl.o -fPIE -ffreestanding
+yasm -f elf64 syscalls-ps5.asm -o syscalls-ps5.o
+ld -r crt-elf.o crt-elf-c.o dl.o syscalls-ps5.o -o lib-elf-ps5.a
+cd ..
+
+# 2. Build prosper0gdb
+cd prosper0gdb
+yasm -f elf64 -g dwarf2 r0run.asm -o r0run.o
+gcc -O0 -g -isystem ../freebsd-headers -nostdinc -nostdlib -fno-stack-protector \
+    -r -Wl,--unique='*' -ffunction-sections -fdata-sections \
+    -DPS5KEK r0gdb.c r0run.o offsets.c -o prosper0gdb.o -fPIE -ffreestanding \
+    -fno-unwind-tables -fno-asynchronous-unwind-tables
+cd ..
+
+# 3. Build kelf (kernel ROP chain)
+cd ps5-kstuff
+cp structs-ps5.inc structs.inc
+yasm -f elf64 -g dwarf2 kelf.asm -o kelf.o
+gcc -nostdlib -shared kelf.o -o kelf
+
+# 4. Build BearSSL and libtomcrypt
+bash build_bearssl.sh
+bash build_libtomcrypt.sh
+
+# 5. Build uelf (userland ELF)
+yasm uelf/crt.asm -f elf64 -o uelf/crt.o
+gcc -Wl,-Bsymbolic -Wl,-gc-sections -ffunction-sections -fdata-sections -O3 -g \
+    -isystem ../freebsd-headers -nostdinc -nostdlib -mgeneral-regs-only \
+    -fno-stack-protector -fPIE -fPIC -shared -fvisibility=hidden -ffreestanding \
+    uelf/crt.o uelf/*.c -L BearSSL/build -lbearssl -L libtomcrypt -ltomcrypt \
+    -o uelf/uelf -Wl,-z,max-page-size=4096
+objcopy --strip-all uelf/uelf uelf/uelf.bin
+
+# 6. Build final payload
+gcc -O0 -isystem ../freebsd-headers -nostdinc -nostdlib -fno-stack-protector -static \
+    ../lib/lib-elf-ps5.a ../prosper0gdb/prosper0gdb.o main.c -DPS5KEK \
+    ../prosper0gdb/dbg.c sqlite_triggers.c \
+    -Wl,-gc-sections -o payload.elf -fPIE -ffreestanding -no-pie \
+    -Wl,-z,max-page-size=16384 -Wl,-zcommon-page-size=16384
+
+# 7. Convert to binary and patch ELF header
+objcopy payload.elf --only-section .text --only-section .data --only-section .bss \
+    --only-section .rodata -O binary payload.bin
+python3 ../lib/frankenelf.py payload.bin
+```
+
+**Or simply**: `make` in the `ps5-kstuff/` directory (it builds deps automatically).
+
+**frankenelf.py**: Post-processes the `.bin` by patching the ELF magic bytes from standard `\x7fELF` to `\xeb\x0bPLD` and adjusting segment sizes. This makes the binary look like a "PLD" format that the PS5 loader expects rather than a standard ELF.
+
+**Key differences from examples/ payloads**:
+- Uses `yasm` assembler for hand-written assembly (kelf.asm, crt.asm, r0run.asm, syscalls)
+- Uses `-O0` (no optimization) for debuggability
+- Page size set to 16384 (PS5 page size) via linker flags
+- Links against FreeBSD headers (`-isystem ../freebsd-headers`)
+- The `kelf` binary is assembled from `kelf.asm` which contains the actual kernel ROP chain gadgets
+- `uelf` is a separate shared library with BearSSL + libtomcrypt for crypto ops
+- Uses `objcopy --only-section` (keeps specific sections) instead of `-S -O binary` (keeps everything)
+
+---
+
+### 3. kldload — Produces `kldload.elf`
+
+This is a PS5 userland payload that loads kernel modules. Located at `ps5_kernel_research/kstuff-no-fpkg/kldload/`.
+
+**Toolchain**: PS5 Payload SDK (`prospero-clang`) — this is a DIFFERENT toolchain from the others!
+
+**SDK location**: `/opt/ps5-payload-sdk/`
+
+**SDK tools used**:
+- `prospero-clang` — Clang 18.1.3 targeting `x86_64-sie-ps5` (Sony Interactive Entertainment PS5 target triple)
+- `prospero-lld` — LLVM linker for PS5
+- `prospero-deploy` — sends payload to PS5 over network
+- Other tools: `prospero-ar`, `prospero-nm`, `prospero-objcopy`, `prospero-strip`
+
+**Exact build commands**:
+
+```bash
+cd ps5_kernel_research/kstuff-no-fpkg/kldload
+
+# The SDK include sets CC=/opt/ps5-payload-sdk/bin/prospero-clang, etc.
+# via: include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
+
+# Build
+/opt/ps5-payload-sdk/bin/prospero-clang -Wall -Werror -o kldload.elf \
+    main.c kekcall.asm -O0 -lSceSystemService
+strip kldload.elf
+
+# Deploy to PS5 (optional)
+/opt/ps5-payload-sdk/bin/prospero-deploy -h <PS5_IP> -p 9021 kldload.elf
+```
+
+**Or simply**: `PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk make` in the `kldload/` directory.
+
+**Key differences**:
+- This is a **userland** payload, not a kernel payload — it runs as a PS5 process
+- Uses `prospero-clang` (PS5 SDK Clang) instead of host `gcc`
+- Links against `-lSceSystemService` (Sony PS5 system library)
+- Includes `kekcall.asm` for making kernel executive calls from userland
+- Output is a standard PS5 ELF (not a flat binary) — the PS5 loader handles it directly
+- `strip` removes debug symbols for size
+
+---
+
+### Quick Reference
+
+| Artifact | Directory | Toolchain | Compiler | Assembler | Key Output |
+|----------|-----------|-----------|----------|-----------|------------|
+| Research payloads | `examples/*` | Host | `gcc` | N/A | `.bin` (flat binary) |
+| ps5-kstuff | `kstuff-no-fpkg/ps5-kstuff` | Host | `gcc` | `yasm` | `payload.bin` (frankenelf) |
+| kldload | `kstuff-no-fpkg/kldload` | PS5 SDK | `prospero-clang` | `prospero-as` | `kldload.elf` (PS5 ELF) |
+
+### Prerequisites
+
+To build everything from scratch you need:
+- `gcc` (any recent version, tested with 13.3.0)
+- `objcopy` (GNU Binutils, tested with 2.42)
+- `yasm` assembler (for kstuff assembly files — kelf.asm, crt.asm, etc.)
+- `python3` (for syscall generation scripts and frankenelf.py)
+- PS5 Payload SDK at `/opt/ps5-payload-sdk/` (only needed for kldload.elf)
+- `make`
+
