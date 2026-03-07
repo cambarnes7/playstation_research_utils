@@ -28,11 +28,9 @@
  *   [6]   phase (1=dmap_test, 2=pagewalk, 3=ktext_read, 4=done)
  *   -- Phase 1: DMAP discovery via pmap --
  *   [7]   pm_pml4 (VA of PML4, or 0xDEAD000X on error)
- *   -- Phase 2-3: ktext access --
- *   [15]  pml4_ktext_entry
- *   [16]  first_ktext_page_pa
- *   [17]  error code if walk/read fails (0xDEAD0002/3)
- *   [18]  first 8 bytes of ktext via DMAP
+ *   -- Phase 3: XOM diagnostics (if ktext DMAP read fails) --
+ *   [5]   first_ktext_page_pa (overwritten from td_pcb)
+ *   [7]   DMAP leaf PTE for ktext PA (check bit 58=XOTEXT, bit 63=NX)
  *   -- Phase 4: scan results --
  *   [19]  num_pages_scanned / kdata_pa (if XOM)
  *   [20]  num_gadgets_found / kdata_test (if XOM)
@@ -348,22 +346,14 @@ int module_start(kproc_args* args)
         return 0;
     }
 
-    /* Read PML4 entry for ktext region (now using confirmed DMAP) */
-    uint64_t ktext_pml4_idx = (ktext_base >> PML4_SHIFT) & PT_INDEX_MASK;
-    uint64_t pml4_ktext_addr = dmap_base + pml4_pa + ktext_pml4_idx * 8;
-    uint64_t pml4_ktext_entry = 0;
-    safe_read8(pml4_ktext_addr, &pml4_ktext_entry);
-    out[15] = pml4_ktext_entry;
-
     /* ========== Phase 2: Walk page tables for ktext ========== */
     out[6] = 2;
 
-    /* Get PA of first ktext page */
+    uint64_t ktext_pml4_idx = (ktext_base >> PML4_SHIFT) & PT_INDEX_MASK;
     uint64_t first_ktext_pa = va_to_pa(ktext_base, dmap_base, cr3);
-    out[16] = first_ktext_pa;
 
     if (!first_ktext_pa) {
-        out[17] = 0xDEAD0002;  /* page walk failed */
+        out[5] = 0xDEAD0002;  /* page walk failed */
         out32[1] = 0x0003;
         out[63] = 0xdeadbeefcafe0025ULL;
         return 0;
@@ -375,17 +365,67 @@ int module_start(kproc_args* args)
     uint64_t ktext_dmap_addr = dmap_base + first_ktext_pa;
     uint64_t test_val = 0;
     int read_ok = safe_read8(ktext_dmap_addr, &test_val);
-    out[18] = test_val;  /* first 8 bytes of ktext via DMAP */
 
     if (!read_ok) {
-        out[17] = 0xDEAD0003;  /* DMAP read of ktext faulted — XOM enforced */
+        /* ktext DMAP read failed. Diagnose: read the DMAP PTE for this PA
+         * to check for XOM/XOTEXT bit, and test kdata to confirm DMAP works */
 
-        /* Try a known-readable kdata page for comparison */
+        /* Get the leaf PTE for the DMAP mapping of ktext PA.
+         * Walk: dmap_base + first_ktext_pa → get its PTE via DMAP page walk */
+        uint64_t dmap_ktext_va = dmap_base + first_ktext_pa;
+        uint64_t dmap_pte = 0;
+
+        /* Walk PML4 → PDPT → PD → PT for this DMAP VA */
+        uint64_t pml4e = 0, pdpte = 0, pde = 0, pte = 0;
+        uint64_t pa;
+
+        /* PML4 entry */
+        pa = pml4_pa + ((dmap_ktext_va >> PML4_SHIFT) & PT_INDEX_MASK) * 8;
+        safe_read8(dmap_base + pa, &pml4e);
+
+        if (pml4e & PTE_PRESENT) {
+            /* PDPT entry */
+            pa = (pml4e & PAGE_MASK) + ((dmap_ktext_va >> PDPT_SHIFT) & PT_INDEX_MASK) * 8;
+            safe_read8(dmap_base + pa, &pdpte);
+
+            if ((pdpte & PTE_PRESENT) && (pdpte & PTE_PS)) {
+                /* 1GB page — the PDPT entry IS the leaf */
+                dmap_pte = pdpte;
+            } else if (pdpte & PTE_PRESENT) {
+                /* PD entry */
+                pa = (pdpte & PAGE_MASK) + ((dmap_ktext_va >> PD_SHIFT) & PT_INDEX_MASK) * 8;
+                safe_read8(dmap_base + pa, &pde);
+
+                if ((pde & PTE_PRESENT) && (pde & PTE_PS)) {
+                    dmap_pte = pde;  /* 2MB page */
+                } else if (pde & PTE_PRESENT) {
+                    pa = (pde & PAGE_MASK) + ((dmap_ktext_va >> PT_SHIFT) & PT_INDEX_MASK) * 8;
+                    safe_read8(dmap_base + pa, &pte);
+                    dmap_pte = pte;  /* 4KB page */
+                }
+            }
+        }
+
+        /* Test kdata via DMAP to confirm DMAP works for non-XOM pages */
         uint64_t kdata_pa = va_to_pa(kdata_base, dmap_base, cr3);
         uint64_t kdata_test = 0;
-        safe_read8(dmap_base + kdata_pa, &kdata_test);
-        out[19] = kdata_pa;        /* kdata PA */
-        out[20] = kdata_test;      /* kdata bytes via DMAP (should work) */
+        int kdata_ok = safe_read8(dmap_base + kdata_pa, &kdata_test);
+
+        /* Pack XOM diagnostics into visible slots [5] and [7]:
+         * [5] = first_ktext_pa (physical address of ktext page)
+         * [6] = phase (stays 3)
+         * [7] = DMAP PTE for ktext page (check bit 58 = XOTEXT, bit 63 = NX)
+         *
+         * Also store in invisible slots for completeness:
+         * [8]  = kdata_pa
+         * [9]  = kdata_test (should be non-zero if DMAP works)
+         * [10] = kdata_ok (1=success)
+         */
+        out[5] = first_ktext_pa;
+        out[7] = dmap_pte;
+        out[8] = kdata_pa;
+        out[9] = kdata_test;
+        out[10] = kdata_ok;
 
         out32[1] = 0x0003;  /* partial: DMAP works but ktext XOM enforced */
         out[63] = 0xdeadbeefcafe0025ULL;
