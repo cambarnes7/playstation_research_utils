@@ -221,7 +221,7 @@ Execute candidate ktext offsets and check if RSP changed (indicating a pivot).
 - **v13**: Fixed stack layout for recovery label
 - **Problem**: Still needed reliable pcb_onfault for surviving bad candidates
 
-### Strategy 6: Thread Structure Research (v14-v17) — CURRENT
+### Strategy 6: Thread Structure Research (v14-v17)
 
 Pivoted to empirically mapping the kernel thread structure to get correct pcb_onfault offset.
 
@@ -230,7 +230,46 @@ Pivoted to empirically mapping the kernel thread structure to get correct pcb_on
 | v14 | Dereference pcb pointer at td+0x3f8 | **CRASHED** — bad pcb sub-offsets |
 | v15 | Minimal smoke test (no dereferences) | **WORKED** — confirmed infrastructure solid |
 | v16 | Dump 1024 bytes of struct thread | **WORKED** — found td_pcb at +0x3f8, td_name at +0x290 |
-| v17 | Dump 256 bytes of struct pcb | **PENDING** — will reveal pcb_onfault, pcb_cr3, pcb_rsp |
+| v17 | Dump 256 bytes of struct pcb | **COMPLETE** — revealed full PCB layout |
+
+### Strategy 7: Suspend/Resume PCB Analysis — CURRENT
+
+Shifted focus from gadget scanning to exploiting the suspend/resume path. The hypothesis: if we can control what cpu_switch restores after resume, we get code execution before the hypervisor re-locks things.
+
+#### pcb_diff (two-phase)
+
+**Phase 1** (pre-suspend): Snapshots the idle thread's full PCB (40 qwords) to kdata+0x200 (persistent through suspend).
+
+**Phase 2** (post-resume): Reads the snapshot back, dumps current PCB, compares every field.
+
+**RESULT — CRITICAL FINDINGS:**
+
+1. **kdata persists across suspend/resume** — snap_magic `0x534E4150444946FF` survived intact
+2. **cpu_switch RUNS during resume** — it saved new register state into the idle PCB
+3. **Only pcb_r13 changed** — from `0xffffd86043104680` to `0xffffd86005f0a700` (new curthread pointer, expected)
+4. **pcb_rip is STABLE** at ktext+0x65e955 (sw_return in cpu_switch)
+5. **pcb_rsp is STABLE** at `0xffffff8008a4b828`
+6. **pcb_rbp, pcb_rbx, pcb_r15, pcb_r14, pcb_r12 — all stable**
+7. **CR/DR fields are zero** — cpu_switch doesn't save them (handled by suspend/resume path separately)
+
+**Implication**: cpu_switch restores pcb_rip into RAX and does `jmp *%rax`. If we overwrite pcb_rip before suspend, the CPU will jump to our chosen address on resume. pcb_rsp is also controllable for stack pivoting.
+
+#### pcb_overwrite (two-phase) — IN PROGRESS
+
+**Phase 1** (pre-suspend, fw_ver=0x403):
+- Snapshots idle PCB
+- Overwrites `idle_pcb->pcb_rip` from sw_return to `nop_ret` (a `ret` gadget in ktext)
+- Keeps pcb_rsp unchanged (safe — real idle stack)
+- Writes sentinels to kdata for persistence verification
+- On resume: cpu_switch loads nop_ret → `ret` → pops mi_switch return addr → normal execution
+
+**Phase 2** (post-resume, fw_ver=0x2):
+- Reads current idle PCB
+- Checks kdata sentinels
+- Compares current pcb_rip against backed-up original
+- If pcb_rip is back to sw_return → **hijack confirmed**: our nop_ret ran, then cpu_switch re-saved sw_return
+
+**Also supports dry run** (fw_ver=0x3): snapshots everything without overwriting.
 
 ---
 
@@ -246,8 +285,11 @@ Pivoted to empirically mapping the kernel thread structure to get correct pcb_on
 | td_pcb offset | **+0x3f8** | v16: only kern_heap ptr in thread struct |
 | td_name offset | +0x290 | v16: contains "my_kthread" |
 | td_proc (likely) | +0x008 | v16: DMAP pointer |
-| pcb_onfault | TBD | v17 will reveal |
-| pcb_cr3 | TBD | v17 will reveal |
+| **kdata persists** | Confirmed | pcb_diff phase 2: snap_magic survived suspend/resume |
+| **cpu_switch runs on resume** | Confirmed | pcb_diff: pcb_r13 changed to new curthread |
+| **pcb_rip stable** | ktext+0x65e955 (sw_return) | pcb_diff: identical before/after |
+| **pcb_rsp stable** | `0xffffff8008a4b828` | pcb_diff: identical before/after |
+| **nop_ret** | kdata - 0x9d20ca | `ret` gadget for safe hijack test |
 
 ### Thread Structure Layout (v16, FW 4.03)
 
@@ -295,7 +337,8 @@ Pivoted to empirically mapping the kernel thread structure to get correct pcb_on
 
 ## Next Steps
 
-1. **Run v17** to dump struct pcb and find pcb_onfault offset
-2. **Build v18**: execute-test scanner with correct pcb_onfault fault recovery
-3. Systematically probe ktext offsets near known functions for stack pivot gadgets
-4. If execute-test fails: consider alternative approaches (hypervisor interaction, different gadget types)
+1. **Run pcb_overwrite Phase 1** — overwrite idle pcb_rip to nop_ret, then enter rest mode
+2. **Run pcb_overwrite Phase 2** — verify hijack worked (pcb_rip restored to sw_return = SUCCESS)
+3. **If hijack confirmed**: Build ROP payload that pivots stack to kdata and executes a chain
+4. **Full exploit chain**: pcb_rip → stack pivot gadget, pcb_rsp → kdata ROP stack, persist across suspend
+5. **Fallback**: If nop_ret test fails (panic), investigate why cpu_switch restore doesn't behave as expected

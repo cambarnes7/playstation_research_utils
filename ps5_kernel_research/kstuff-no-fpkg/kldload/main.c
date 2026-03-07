@@ -1710,6 +1710,115 @@ static void _kldload(void* data, size_t data_size)
 
         printf("\n=== END PCB DIFF ===\n");
 
+    } else if (magic == 0x5043424F) { /* "PCBO" - PCB overwrite results */
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+        uint64_t phase = readback[3];
+
+        printf("\n=== PCB OVERWRITE RESULTS ===\n");
+        printf("  status:          %s\n",
+               status == 1 ? "OK" : status == 0xFE ? "ERROR (invalid pcb)" :
+               status == 0xFF ? "ERROR (bad mode)" : "UNKNOWN");
+        printf("  kdata_base:      %#lx\n", readback[1]);
+        printf("  ktext_base:      %#lx\n", readback[2]);
+        printf("  phase:           %lu%s\n", phase,
+               phase == 3 ? " (DRY RUN)" : phase == 1 ? " (ARMED)" : "");
+
+        if (phase == 1 || phase == 3) {
+            printf("\n  --- Addresses ---\n");
+            printf("  pcpu0:           %#lx\n", readback[4]);
+            printf("  idlethread:      %#lx\n", readback[5]);
+            printf("  idle_pcb:        %#lx\n", readback[6]);
+            printf("  nop_ret:         %#lx\n", readback[7]);
+            printf("  orig pcb_rip:    %#lx (sw_return)\n", readback[8]);
+            printf("  orig pcb_rsp:    %#lx\n", readback[9]);
+            printf("  apic_ops[2]:     %#lx\n", readback[10]);
+
+            printf("\n  --- Idle PCB snapshot ---\n");
+            static const char* pnames[] = {
+                "pcb_r15", "pcb_r14", "pcb_r13", "pcb_r12",
+                "pcb_rbp", "pcb_rsp", "pcb_rbx", "pcb_rip"
+            };
+            for (int i = 0; i < 8; i++)
+                printf("  %-12s %#018lx\n", pnames[i], readback[12 + i]);
+
+            printf("\n  --- pcb_rip overwrite ---\n");
+            printf("  BEFORE:          %#lx\n", readback[20]);
+            printf("  AFTER:           %#lx\n", readback[21]);
+            printf("  TARGET:          %#lx (nop_ret)\n", readback[22]);
+
+            if (phase == 1) {
+                if (readback[21] == readback[22])
+                    printf("  *** OVERWRITE CONFIRMED ***\n");
+                else
+                    printf("  *** OVERWRITE FAILED (readback mismatch) ***\n");
+            } else {
+                printf("  (dry run — no overwrite performed)\n");
+            }
+
+            printf("\n  kdata sentinel:  %#lx @ %#lx\n", readback[25], readback[24]);
+
+            if (phase == 1) {
+                printf("\n  >>> pcb_rip OVERWRITTEN: sw_return -> nop_ret <<<\n");
+                printf("  >>> Enter rest mode NOW <<<\n");
+                printf("  >>> On resume: cpu_switch will jmp to nop_ret <<<\n");
+                printf("  >>> nop_ret does `ret` -> back to mi_switch -> normal <<<\n");
+                printf("  >>> After re-exploit, send pcb_overwrite.bin fw_ver=0x2 <<<\n");
+            }
+
+            printf("\n  sentinel: %#lx\n", readback[30]);
+
+        } else if (phase == 2) {
+            printf("\n  --- Post-resume state ---\n");
+            printf("  pcpu0:           %#lx\n", readback[4]);
+            printf("  curthread:       %#lx\n", readback[5]);
+            printf("  idlethread:      %#lx\n", readback[6]);
+            printf("  idle_pcb:        %#lx\n", readback[7]);
+
+            printf("\n  --- Current idle PCB ---\n");
+            static const char* pn2[] = {
+                "pcb_r15", "pcb_r14", "pcb_r13", "pcb_r12",
+                "pcb_rbp", "pcb_rsp", "pcb_rbx", "pcb_rip"
+            };
+            for (int i = 0; i < 8; i++)
+                printf("  %-12s %#018lx\n", pn2[i], readback[10 + i]);
+
+            printf("\n  --- kdata persistence ---\n");
+            uint64_t sent = readback[20];
+            printf("  sentinel:        %#lx %s\n", sent,
+                   sent == 0x5043424F48494A4BULL ? "[SURVIVED]" : "[LOST/CHANGED]");
+            printf("  snap_magic:      %#lx\n", readback[21]);
+
+            printf("\n  --- pcb_rip analysis ---\n");
+            uint64_t orig = readback[24];
+            uint64_t curr = readback[25];
+            uint64_t nop  = readback[26];
+            uint64_t verdict = readback[27];
+
+            printf("  original rip:    %#lx (backed up in kdata)\n", orig);
+            printf("  current rip:     %#lx\n", curr);
+            printf("  nop_ret:         %#lx\n", nop);
+
+            if (verdict == 1) {
+                printf("\n  *** VERDICT: pcb_rip RESTORED to sw_return ***\n");
+                printf("  *** cpu_switch ran our nop_ret, then re-saved sw_return ***\n");
+                printf("  *** === PCB_RIP HIJACK CONFIRMED === ***\n");
+                printf("  *** The idle thread executed OUR chosen address on resume! ***\n");
+            } else if (verdict == 2) {
+                printf("\n  *** VERDICT: pcb_rip STILL set to nop_ret ***\n");
+                printf("  *** Overwrite persisted but cpu_switch hasn't re-saved yet ***\n");
+                printf("  *** Hijack status: UNCERTAIN ***\n");
+            } else if (verdict == 3) {
+                printf("\n  *** VERDICT: pcb_rip is UNEXPECTED value ***\n");
+                printf("  *** Resume path may have written a different return addr ***\n");
+            } else {
+                printf("\n  *** VERDICT: NO BACKUP FOUND ***\n");
+            }
+
+            printf("\n  sentinel: %#lx\n", readback[30]);
+        }
+
+        printf("\n=== END PCB OVERWRITE ===\n");
+
     } else {
         /* Generic readback - check for test markers */
         uint64_t val0 = readback[0];
