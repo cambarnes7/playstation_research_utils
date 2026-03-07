@@ -28,10 +28,9 @@
  *   [6]   phase (1=dmap_test, 2=pagewalk, 3=ktext_read, 4=done)
  *   -- Phase 0+1: diagnostics + DMAP discovery --
  *   [7]   safe_read8 diag (0xAAAA0001=ok, 0xDEAD0000=fault)
- *   [8]   (indices_tried<<32) | 0xD0000000 | found_idx  [packed, always non-zero]
- *   [9]   pml4_dmap_entry (DMAP's own PML4 entry, 0 if not found)
- *   [10]  first_success_val (first readable PML4 value)
- *   [11]  error code if DMAP not found (0xDEAD0001)
+ *   [8]   0xD0000000 | (num_candidates<<16) | found_idx  (0=not found, 1-5=which)
+ *   [9]   first_success_val (first readable PML4 entry value)
+ *   [10]  error code if DMAP not found (0xDEAD0001)
  *   -- Phase 2-3: ktext access --
  *   [15]  pml4_ktext_entry
  *   [16]  first_ktext_page_pa
@@ -310,59 +309,65 @@ int module_start(kproc_args* args)
         return 0;
     }
 
-    /* ========== Phase 1: Find DMAP base by brute-force ========== */
+    /* ========== Phase 1: Find DMAP base ========== */
 
     uint64_t pml4_pa = cr3 & PAGE_MASK;
     int dmap_accessible = 0;
 
     /*
-     * DMAP maps all physical RAM at a fixed VA base aligned to 512GB.
-     * Scan kernel-half PML4 indices 256..509.
-     * For each candidate, try reading the ktext PML4 entry (known-present)
-     * through that candidate DMAP mapping. If read succeeds + entry present,
-     * cross-validate by reading the candidate's own PML4 entry.
+     * DMAP base = (DMPML4I << 39) | (DMPDPI << 30) | 0xFFFF800000000000
+     * Try known candidates from etaHEN (includes non-512GB-aligned bases).
+     * Validate by reading kdata_base's VA through candidate DMAP:
+     *   1. Walk kdata_base's page tables via candidate to get its PA
+     *   2. If walk succeeds, read PA via candidate and compare to direct read
+     *
+     * Simpler validation: just try reading the PML4 table (at CR3 PA)
+     * through each candidate. If the read succeeds and returns a present
+     * entry for the ktext PML4 slot, it's likely correct.
      */
-    uint64_t pml4_dmap_entry = 0;
-    uint32_t found_idx = 0;
-    uint32_t indices_tried = 0;
-    uint64_t first_success_val = 0;
-
     uint64_t ktext_pml4_idx = (ktext_base >> PML4_SHIFT) & PT_INDEX_MASK;
 
-    for (uint32_t idx = 256; idx < 510; idx++) {
-        uint64_t candidate = 0xFFFF000000000000ULL | ((uint64_t)idx << PML4_SHIFT);
+    /* Candidates from etaHEN + standard FreeBSD, ordered by likelihood */
+    static const uint64_t dmap_candidates[] = {
+        0xFFFFFF0000000000ULL,  /* DMPML4I=0xFE, DMPDPI=0 (PS5 most likely) */
+        0xFFFFFE8000000000ULL,  /* DMPML4I=0xFD, DMPDPI=2 */
+        0xFFFFF80000000000ULL,  /* DMPML4I=0xF0, DMPDPI=0 (standard FreeBSD) */
+        0xFFFF808000000000ULL,  /* DMPML4I=0x01, DMPDPI=2 */
+        0xFFFF800000000000ULL,  /* DMPML4I=0x00, DMPDPI=0 */
+    };
+    #define NUM_DMAP_CANDIDATES 5
+
+    uint32_t found_idx = 0;
+    uint64_t first_success_val = 0;
+
+    for (uint32_t i = 0; i < NUM_DMAP_CANDIDATES; i++) {
+        uint64_t candidate = dmap_candidates[i];
+
+        /* Write progress to slot 8 BEFORE each attempt (crash diagnostic) */
+        out[8] = 0xD0000000ULL | (i + 1);
+
+        /* Try reading PML4 entry for ktext through this candidate */
         uint64_t test_addr = candidate + pml4_pa + ktext_pml4_idx * 8;
         uint64_t entry = 0;
-
-        indices_tried++;
 
         if (safe_read8(test_addr, &entry)) {
             if (!first_success_val) first_success_val = entry;
 
             if (entry & PTE_PRESENT) {
-                /* Cross-validate: read pml4[idx] (DMAP's own entry) */
-                uint64_t self_addr = candidate + pml4_pa + idx * 8;
-                uint64_t self_entry = 0;
-                if (safe_read8(self_addr, &self_entry) && (self_entry & PTE_PRESENT)) {
-                    dmap_base = candidate;
-                    pml4_dmap_entry = self_entry;
-                    found_idx = idx;
-                    dmap_accessible = 1;
-                    break;
-                }
+                dmap_base = candidate;
+                found_idx = i + 1;
+                dmap_accessible = 1;
+                break;
             }
         }
     }
 
-    /* Pack DMAP discovery results densely right after safe_read8 diag.
-     * Slot 8 is guaranteed non-zero (indices_tried >= 1 + marker bit). */
     out[4]  = dmap_base;
-    out[8]  = ((uint64_t)indices_tried << 32) | 0xD0000000ULL | found_idx;
-    out[9]  = pml4_dmap_entry;       /* DMAP's own PML4 entry (0 if not found) */
-    out[10] = first_success_val;     /* first readable PML4 value */
+    out[8]  = 0xD0000000ULL | ((uint64_t)NUM_DMAP_CANDIDATES << 16) | found_idx;
+    out[9]  = first_success_val;
 
     if (!dmap_accessible) {
-        out[11] = 0xDEAD0001;
+        out[10] = 0xDEAD0001;
         out32[1] = 0x0003;  /* partial result */
         out[63] = 0xdeadbeefcafe0025ULL;
         return 0;
