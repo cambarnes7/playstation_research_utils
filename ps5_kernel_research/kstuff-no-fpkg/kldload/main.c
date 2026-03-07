@@ -38,6 +38,9 @@ extern uint64_t kekcall_read_kmem(uint64_t mode, uint64_t addr);
 extern uint64_t kekcall_make_exec(uint64_t kern_addr, uint64_t mode);
 extern uint64_t kekcall_check(void);
 
+/* SCE system call for entering rest mode (standby) */
+int sceSystemStateMgrEnterStandby(void);
+
 static uint64_t kdata_base_addr = 0;
 static uint32_t fw_version = 0;
 
@@ -1773,13 +1776,28 @@ static void _kldload(void* data, size_t data_size)
 
             if (phase == 1) {
                 printf("\n  >>> pcb_rip OVERWRITTEN: sw_return -> HV probe stub <<<\n");
-                printf("  >>> Enter rest mode NOW <<<\n");
+                printf("  >>> Kernel payload is hammering pcb_rip in persistence loop <<<\n");
                 printf("  >>> On resume: stub calls hv_probe() then jmp sw_return <<<\n");
                 printf("  >>> hv_probe tests: CR0.WP clear + ktext write <<<\n");
                 printf("  >>> After re-exploit, send pcb_overwrite.bin fw_ver=0x2 <<<\n");
             }
 
             printf("\n  sentinel: %#lx\n", readback[30]);
+
+            /* Auto-enter rest mode after arming */
+            if (phase == 1) {
+                printf("\n  >>> AUTO-STANDBY: entering rest mode in 3 seconds... <<<\n");
+                fflush(stdout);
+                sleep(3);
+                printf("  >>> Calling sceSystemStateMgrEnterStandby()... <<<\n");
+                fflush(stdout);
+                int sret = sceSystemStateMgrEnterStandby();
+                printf("  >>> sceSystemStateMgrEnterStandby() returned %d <<<\n", sret);
+                if (sret != 0) {
+                    printf("  >>> AUTO-STANDBY FAILED (ret=%d). Enter rest mode MANUALLY! <<<\n", sret);
+                }
+                fflush(stdout);
+            }
 
         } else if (phase == 2) {
             printf("\n  --- Post-resume state ---\n");

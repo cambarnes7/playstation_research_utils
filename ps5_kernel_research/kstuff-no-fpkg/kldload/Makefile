@@ -13,7 +13,7 @@ CFLAGS := -Wall -Werror
 all: kldload.elf
 
 kldload.elf:
-	$(CC) -o $@ main.c kekcall.asm -O0
+	$(CC) -o $@ main.c kekcall.asm -O0 -lSceSystemService
 	strip $@
 
 clean:
