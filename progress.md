@@ -907,3 +907,11 @@ out[7] = 0xbad0bad0bad0bad0  → xapic_mode-2 also C3 (still in prev function ep
 2. Use copyin-1 (confirmed CC) with pop_all_iret + IST chain redirecting to xapic_mode
 3. Find CC before any ktext function that returns 1
 
+### Phase 9: CC Byte Scanner (resume_chain v8)
+
+Automated scan of all 28 apic_ops entries at fn-1 using sentinel-in-RAX technique. IDT[3]=doreti_iret for CC bounce, pcb_onfault + callee-saved RBX RSP backup for fault recovery. Skips 4 dangerous entries (disable, ipi_raw, ipi_vectored, calibrate). Also tests copyin-1, copyout-1, cpu_switch-1, malloc-1 as extras.
+
+Reports cc_bitmap, ret1_bitmap (CC entries that also return 1 = golden for simple bounce), and per-entry raw values.
+
+**Status**: Built (1056 bytes), awaiting deployment.
+
