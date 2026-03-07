@@ -45,7 +45,6 @@
 
 /* FW 4.03 offsets */
 #define CPU_SWITCH_OFF       (-0x9d6f80)   /* cpu_switch relative to kdata_base */
-#define JUSTRETURN_OFF       (-0x9cf990)   /* justreturn relative to kdata_base */
 #define APIC_OPS_OFF_KTEXT   0x1934AC8     /* apic_ops offset from ktext_base */
 
 #define KDATA_SENTINEL_OFF   0x200
@@ -143,28 +142,33 @@ int module_start(kproc_args* args)
         out32[1] = 0x0001;
 
     } else if (mode == 0x2) {
-        /* ARM MODE: point apic_ops[2] at justreturn + write kdata sentinel */
+        /* ARM MODE: point apic_ops[2] at get_timer_freq + write kdata sentinel
+         *
+         * justreturn (bare ret) panics because RAX=0 → caller thinks "not XAPIC"
+         * → tries X2APIC MSR access → panic. get_timer_freq (apic_ops[19])
+         * returns a large non-zero value → truthy → "yes XAPIC" → safe.
+         * Proven in suspend_stackprobe. */
         uint64_t apic_ops_addr = ktext_base + APIC_OPS_OFF_KTEXT;
         volatile uint64_t* apic_table = (volatile uint64_t*)apic_ops_addr;
 
-        uint64_t justreturn = kdata_base + JUSTRETURN_OFF;
+        uint64_t get_timer_freq = apic_table[19];  /* safe ktext func, returns non-zero */
         uint64_t original_xapic = apic_table[2];
         uint64_t sentinel_addr = kdata_base + KDATA_SENTINEL_OFF;
 
         /* Write sentinel to kdata persistence region */
         write8(sentinel_addr, SENTINEL_VAL);
 
-        /* Overwrite apic_ops[2] with justreturn */
-        apic_table[2] = justreturn;
+        /* Overwrite apic_ops[2] with get_timer_freq */
+        apic_table[2] = get_timer_freq;
 
         /* Report */
-        out[4] = justreturn;
+        out[4] = get_timer_freq;
         out[5] = original_xapic;
         out[6] = sentinel_addr;
         out[7] = SENTINEL_VAL;
 
         /* Verify readback */
-        out[8] = apic_table[2];   /* should == justreturn */
+        out[8] = apic_table[2];   /* should == get_timer_freq */
         out[9] = read8(sentinel_addr);  /* should == SENTINEL_VAL */
 
         out32[1] = 0x0001;
@@ -174,7 +178,7 @@ int module_start(kproc_args* args)
         uint64_t apic_ops_addr = ktext_base + APIC_OPS_OFF_KTEXT;
         volatile uint64_t* apic_table = (volatile uint64_t*)apic_ops_addr;
 
-        uint64_t justreturn = kdata_base + JUSTRETURN_OFF;
+        uint64_t get_timer_freq = apic_table[19];  /* what we armed with */
         uint64_t sentinel_addr = kdata_base + KDATA_SENTINEL_OFF;
 
         /* Read sentinel */
@@ -194,8 +198,8 @@ int module_start(kproc_args* args)
         apic_table[2] = orig_xapic;
         out[7] = orig_xapic;
 
-        /* justreturn for comparison */
-        out[8] = justreturn;
+        /* get_timer_freq for comparison */
+        out[8] = get_timer_freq;
 
         /* Verify restoration */
         out[9] = apic_table[2];  /* should == orig_xapic */
