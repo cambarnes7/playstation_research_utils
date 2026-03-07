@@ -1737,10 +1737,11 @@ static void _kldload(void* data, size_t data_size)
             printf("  pcpu0:           %#lx\n", readback[4]);
             printf("  idlethread:      %#lx\n", readback[5]);
             printf("  idle_pcb:        %#lx\n", readback[6]);
-            printf("  trampoline:      %#lx\n", readback[7]);
+            printf("  stub (entry):    %#lx\n", readback[7]);
             printf("  orig pcb_rip:    %#lx (sw_return)\n", readback[8]);
             printf("  orig pcb_rsp:    %#lx\n", readback[9]);
             printf("  exec_code:       %#lx\n", readback[10]);
+            printf("  hv_probe fn:     %#lx\n", readback[11]);
 
             printf("\n  --- Idle PCB snapshot ---\n");
             static const char* pnames[] = {
@@ -1753,7 +1754,7 @@ static void _kldload(void* data, size_t data_size)
             printf("\n  --- pcb_rip overwrite ---\n");
             printf("  BEFORE:          %#lx\n", readback[20]);
             printf("  AFTER:           %#lx\n", readback[21]);
-            printf("  TARGET:          %#lx (trampoline)\n", readback[22]);
+            printf("  TARGET:          %#lx (stub)\n", readback[22]);
 
             if (phase == 1) {
                 if (readback[21] == readback[22])
@@ -1765,14 +1766,16 @@ static void _kldload(void* data, size_t data_size)
             }
 
             printf("\n  kdata sentinel:  %#lx @ %#lx\n", readback[25], readback[24]);
-            printf("\n  sw_return:       %#lx\n", readback[26]);
-            printf("  trampoline size: %lu bytes\n", readback[27]);
+            printf("  sw_return:       %#lx\n", readback[26]);
+            printf("  stub size:       %lu bytes\n", readback[27]);
+            printf("  ktext probe @:   %#lx\n", readback[28]);
+            printf("  hv_probe fn @:   %#lx\n", readback[29]);
 
             if (phase == 1) {
-                printf("\n  >>> pcb_rip OVERWRITTEN: sw_return -> trampoline <<<\n");
+                printf("\n  >>> pcb_rip OVERWRITTEN: sw_return -> HV probe stub <<<\n");
                 printf("  >>> Enter rest mode NOW <<<\n");
-                printf("  >>> On resume: cpu_switch will jmp to trampoline <<<\n");
-                printf("  >>> Trampoline writes sentinel, then jmp sw_return <<<\n");
+                printf("  >>> On resume: stub calls hv_probe() then jmp sw_return <<<\n");
+                printf("  >>> hv_probe tests: CR0.WP clear + ktext write <<<\n");
                 printf("  >>> After re-exploit, send pcb_overwrite.bin fw_ver=0x2 <<<\n");
             }
 
@@ -1803,29 +1806,60 @@ static void _kldload(void* data, size_t data_size)
             printf("\n  --- pcb_rip analysis ---\n");
             uint64_t orig = readback[24];
             uint64_t curr = readback[25];
-            uint64_t nop  = readback[26];
+            uint64_t sw   = readback[26];
             uint64_t verdict = readback[27];
 
             printf("  original rip:    %#lx (backed up in kdata)\n", orig);
             printf("  current rip:     %#lx\n", curr);
-            printf("  sw_return:       %#lx\n", nop);
+            printf("  sw_return:       %#lx\n", sw);
 
             if (verdict == 1) {
-                printf("\n  *** VERDICT: FULL SUCCESS ***\n");
-                printf("  *** Trampoline ran → wrote sentinel → jumped to sw_return ***\n");
-                printf("  *** Kernel resumed normally, cpu_switch re-saved sw_return ***\n");
-                printf("  *** === KERNEL CODE EXECUTION VIA PCB HIJACK CONFIRMED === ***\n");
+                printf("\n  *** VERDICT: FULL SUCCESS — trampoline executed ***\n");
             } else if (verdict == 2) {
                 printf("\n  *** VERDICT: pcb_rip restored but sentinel missing ***\n");
-                printf("  *** sw_return ran but trampoline sentinel write failed? ***\n");
             } else if (verdict == 3) {
-                printf("\n  *** VERDICT: trampoline addr still in pcb_rip ***\n");
-                printf("  *** cpu_switch hasn't context-switched to idle yet ***\n");
+                printf("\n  *** VERDICT: stub addr still in pcb_rip ***\n");
             } else if (verdict == 4) {
                 printf("\n  *** VERDICT: pcb_rip is UNEXPECTED value ***\n");
-                printf("  *** Resume path may have written a different return addr ***\n");
             } else {
                 printf("\n  *** VERDICT: UNKNOWN ***\n");
+            }
+
+            /* v3: HV probe results */
+            uint64_t hv_result = readback[38];
+            if (hv_result != 0) {
+                printf("\n  --- HV Probe Results (v3) ---\n");
+                uint64_t cr0_before = readback[32];
+                uint64_t cr4_val    = readback[33];
+                uint64_t cr0_after  = readback[34];
+                uint64_t probe_addr = readback[35];
+                uint64_t kt_orig    = readback[36];
+                uint64_t kt_rdback  = readback[37];
+                uint64_t efer_val   = readback[39];
+
+                printf("  CR0 (before):    %#lx  WP=%lu\n", cr0_before, (cr0_before >> 16) & 1);
+                printf("  CR0 (after WP clear): %#lx  WP=%lu\n", cr0_after, (cr0_after >> 16) & 1);
+                printf("  CR4:             %#lx\n", cr4_val);
+                printf("  EFER:            %#lx  SVME=%lu\n", efer_val, (efer_val >> 12) & 1);
+                printf("  ktext probe @:   %#lx\n", probe_addr);
+                printf("  ktext original:  %#018lx\n", kt_orig);
+                printf("  ktext readback:  %#018lx\n", kt_rdback);
+
+                if (hv_result == 1) {
+                    printf("\n  *** HV PROBE: WP CLEARED + KTEXT WRITABLE ***\n");
+                    printf("  *** >>> HYPERVISOR WAS NOT ACTIVE DURING RESUME <<< ***\n");
+                    printf("  *** >>> KERNEL TEXT CAN BE PATCHED IN THIS WINDOW <<< ***\n");
+                } else if (hv_result == 2) {
+                    printf("\n  *** HV PROBE: CR0.WP STUCK — HV is active ***\n");
+                    printf("  *** HV intercepted CR0 write during resume ***\n");
+                    printf("  *** PCB hijack runs TOO LATE — need earlier execution ***\n");
+                    printf("  *** Consider: apic_ops[2] hijack for pre-HV window ***\n");
+                } else if (hv_result == 3) {
+                    printf("\n  *** HV PROBE: WP cleared but ktext write FAILED ***\n");
+                    printf("  *** NPT may still be active despite no CR0 intercept ***\n");
+                }
+            } else if (sent == 0x484A4B5F52414E21ULL) {
+                printf("\n  (HV probe results: all zero — probe may not have written)\n");
             }
 
             printf("\n  sentinel: %#lx\n", readback[30]);
