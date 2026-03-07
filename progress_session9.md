@@ -162,9 +162,87 @@ td_name       = thread + 0x290
 
 ---
 
+## Session 9 Results
+
+### Option 3: R8 Gamble — CONFIRMED PANIC
+
+**Payload:** `r8_gamble.bin` (mode 0, fw_ver=0x403)
+**Target:** cpu_switch entry at `kdata_base - 0x9d6f80`
+
+**Output (pre-suspend, armed successfully):**
+```
+kdata_base     = 0xffffffff9a680000
+ktext_base     = 0xffffffff99a80000
+target         = 0xffffffff99ca9080 (cpu_switch entry)
+original_xapic = 0xffffffff99d14340
+cpu_switch     = 0xffffffff99ca9080
+offset         = 0x0 (function entry)
+status         = 0x0001 (armed)
+```
+
+**Result:** Kernel panic during resume. System never came back from rest mode.
+
+**Analysis:** cpu_switch entry does `movq TD_PCB(%rdi), %r8` as its first instruction.
+RDI at the apic_ops[2] call site is not a valid thread pointer → immediate fault
+on dereferencing RDI+0x3f8. This was expected.
+
+**Decision:** Skip modes 1-3 (R8 equally unlikely to be a valid PCB pointer).
+Proceed to Option 2 — gather real data instead of gambling.
+
+### Known ktext Offsets (confirmed this session)
+```
+cpu_switch        = kdata_base - 0x9d6f80
+cpu_switch_dr2gpr = kdata_base - 0x9d6d93  (+0x1ED into cpu_switch)
+cpu_switch_gpr2dr = kdata_base - 0x9d6c7a  (+0x306 into cpu_switch)
+nop_ret           = kdata_base - 0x9d20ca
+doreti_iret       = kdata_base - 0x9cf84c
+```
+
+---
+
+## Option 2: PCB Diff Across Suspend/Resume — IN PROGRESS
+
+### Strategy
+
+Two-phase payload using fw_ver as mode selector:
+
+**Phase 1 (pre-suspend, fw_ver=0x403):**
+1. Dump idle thread's full PCB to kdata (persistent region at kdata_base+0x200)
+   - All saved registers: r15, r14, r13, r12, rbp, rsp, rbx, rip
+   - System regs: fsbase, gsbase, kgsbase, cr0, cr2, cr3, cr4
+   - Debug regs: dr0-dr7
+   - Flags, onfault, etc.
+2. Also dump curthread PCB for comparison
+3. Record pcpu[0] state (curthread, idlethread, curpcb)
+4. Set apic_ops[2] to ORIGINAL xapic_mode (safe, no hook)
+5. Report all values to output buffer AND persist to kdata
+
+**Phase 2 (post-resume, fw_ver=0x2):**
+1. Dump idle thread's PCB again (same fields)
+2. Read the pre-suspend values back from kdata
+3. Compare every field: flag each as CHANGED or SAME
+4. Report the diff to output buffer
+
+**What we learn:**
+- If pcb_rsp/pcb_rip changed → cpu_switch saved new context during resume,
+  and the new values ARE the register state at that point
+- If pcb_cr3 changed → pmap switch happened (expected, CR3 changes across resume)
+- If debug regs changed → DR state tells us about HV/kernel debug usage
+- If nothing changed → cpu_switch did NOT run on the idle thread during resume,
+  meaning the resume path uses a different mechanism
+
+### Why This Works
+- kdata persists through suspend/resume (proven 8 sessions)
+- We write pre-suspend PCB snapshot to kdata
+- Post-resume, we read it back and compare with current PCB
+- apic_ops[2] stays original → no panic risk, clean suspend/resume cycle
+- We re-exploit after resume and deploy the readback payload
+
+---
+
 ## Next Actions
 
-1. Build Option 3 payload (R8 gamble) — expect panic, but try it
-2. After the expected panic, build Option 2 payload (PCB diff across suspend/resume)
+1. ~~Build Option 3 payload (R8 gamble) — expect panic, but try it~~ DONE — panics as expected
+2. Build Option 2 payload (PCB diff across suspend/resume) ← CURRENT
 3. Use Option 2 results to understand the resume execution context
 4. Design the actual persistence hook based on real data
