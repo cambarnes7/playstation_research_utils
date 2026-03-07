@@ -1541,6 +1541,175 @@ static void _kldload(void* data, size_t data_size)
 
         printf("\n  sentinel: %#lx\n", readback[100]);
         printf("\n=== END SUSPEND STACK PROBE ===\n");
+    } else if (magic == 0x5238474D) { /* "R8GM" - R8 gamble results */
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+        printf("\n=== R8 GAMBLE RESULTS ===\n");
+        printf("  status:          %s\n",
+               status == 1 ? "ARMED" : status == 0xFE ? "ERROR (target not in ktext)" :
+               status == 0xFF ? "ERROR (bad mode)" : "UNKNOWN");
+        printf("  kdata_base:      %#lx\n", readback[1]);
+        printf("  ktext_base:      %#lx\n", readback[2]);
+        printf("  mode:            %lu\n", readback[3]);
+        printf("  target:          %#lx\n", readback[4]);
+        printf("  orig xapic:      %#lx\n", readback[5]);
+        printf("  cpu_switch:      %#lx\n", readback[6]);
+        printf("  offset into sw:  %#lx\n", readback[7]);
+
+        printf("\n  --- pcpu[0] ---\n");
+        printf("  pcpu0:           %#lx\n", readback[8]);
+        printf("  idlethread:      %#lx\n", readback[9]);
+        printf("  idle_pcb:        %#lx\n", readback[10]);
+
+        printf("\n  --- idle PCB (current) ---\n");
+        static const char* pcb_names_r8[] = {
+            "pcb_r15", "pcb_r14", "pcb_r13", "pcb_r12",
+            "pcb_rbp", "pcb_rsp", "pcb_rbx", "pcb_rip",
+            "pcb_cr3", "pcb_flags"
+        };
+        for (int i = 0; i < 10; i++)
+            printf("  %-12s %#018lx\n", pcb_names_r8[i], readback[11 + i]);
+
+        printf("\n  --- fake PCB at kdata+0x200 ---\n");
+        printf("  fake_pcb @:      %#lx\n", readback[21]);
+        static const char* fake_names[] = {
+            "pcb_r15", "pcb_r14", "pcb_r13", "pcb_r12",
+            "pcb_rbp", "pcb_rsp", "pcb_rbx", "pcb_rip"
+        };
+        for (int i = 0; i < 8; i++)
+            printf("  %-12s %#018lx\n", fake_names[i], readback[22 + i]);
+
+        printf("\n  --- apic_ops ---\n");
+        printf("  [0]:             %#lx\n", readback[30]);
+        printf("  [1]:             %#lx\n", readback[31]);
+        printf("  [2] before:      %#lx\n", readback[32]);
+        printf("  [3]:             %#lx\n", readback[33]);
+        printf("  [2] readback:    %#lx\n", readback[34]);
+
+        printf("\n  --- known ktext ---\n");
+        printf("  nop_ret:         %#lx\n", readback[35]);
+        printf("  doreti_iret:     %#lx\n", readback[36]);
+        printf("  dr2gpr:          %#lx\n", readback[37]);
+        printf("  gpr2dr:          %#lx\n", readback[38]);
+
+        if (status == 1)
+            printf("\n  >>> ARMED: apic_ops[2] -> %#lx (cpu_switch+%#lx) <<<\n",
+                   readback[4], readback[7]);
+
+        printf("\n  sentinel: %#lx\n", readback[50]);
+        printf("\n=== END R8 GAMBLE ===\n");
+
+    } else if (magic == 0x50444946) { /* "PDIF" - PCB diff results */
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+        uint64_t phase = readback[3];
+
+        printf("\n=== PCB DIFF RESULTS ===\n");
+        printf("  status:          %s\n",
+               status == 1 ? "OK" : status == 0xFD ? "ERROR (no snapshot)" :
+               status == 0xFE ? "ERROR (invalid pcb)" :
+               status == 0xFF ? "ERROR (bad mode)" : "UNKNOWN");
+        printf("  kdata_base:      %#lx\n", readback[1]);
+        printf("  ktext_base:      %#lx\n", readback[2]);
+        printf("  phase:           %lu\n", phase);
+
+        printf("\n  --- pcpu[0] ---\n");
+        printf("  curthread:       %#lx\n", readback[4]);
+        printf("  idlethread:      %#lx\n", readback[5]);
+        printf("  curpcb:          %#lx\n", readback[6]);
+        printf("  idle_pcb:        %#lx\n", readback[8]);
+
+        static const char* pcb_field_names[] = {
+            "pcb_r15     +0x00", "pcb_r14     +0x08",
+            "pcb_r13     +0x10", "pcb_r12     +0x18",
+            "pcb_rbp     +0x20", "pcb_rsp     +0x28",
+            "pcb_rbx     +0x30", "pcb_rip     +0x38",
+            "pcb_fsbase  +0x40", "pcb_gsbase  +0x48",
+            "pcb_kgsbase +0x50", "pcb_cr0     +0x58",
+            "pcb_cr2     +0x60", "pcb_cr3     +0x68",
+            "pcb_cr4     +0x70", "pcb_dr0     +0x78",
+            "pcb_dr1     +0x80", "pcb_dr2     +0x88",
+            "pcb_dr3     +0x90", "pcb_dr6     +0x98",
+            "pcb_dr7     +0xA0", "pcb_gdt_lo  +0xA8",
+            "pcb_gdt_hi  +0xB0", "pcb_idt_lo  +0xB8",
+            "pcb_idt_hi  +0xC0", "pcb_ldt_lo  +0xC8",
+            "pcb_ldt_hi  +0xD0", "pcb_tr      +0xD8",
+            "pcb_pad1    +0xE0", "pcb_pad2    +0xE8",
+            "pcb_pad3    +0xF0", "pcb_pad4    +0xF8",
+            "pcb_flags   +0x100","pcb_pad5    +0x108",
+            "pcb_onfault +0x110","pcb_pad6    +0x118",
+            "pcb_gs32sd  +0x120","pcb_pad7    +0x128",
+            "pcb_tssp    +0x130","pcb_save    +0x138"
+        };
+
+        if (phase == 1) {
+            printf("\n  --- Phase 1: PRE-SUSPEND SNAPSHOT ---\n");
+            printf("  Snapshotting %d qwords of idle PCB to kdata+0x200\n\n", 40);
+
+            for (int i = 0; i < 40; i++) {
+                const char* name = (i < 40) ? pcb_field_names[i] : "???";
+                printf("  %-20s %#018lx\n", name, readback[10 + i]);
+            }
+
+            printf("\n  --- curthread PCB (first 10 qwords) ---\n");
+            for (int i = 0; i < 10; i++) {
+                const char* name = (i < 40) ? pcb_field_names[i] : "???";
+                printf("  %-20s %#018lx\n", name, readback[50 + i]);
+            }
+
+            printf("\n  snapshot @:      %#lx (%lu qwords)\n", readback[60], readback[61]);
+            printf("  apic_ops[2]:     %#lx (original, NOT hooked)\n", readback[62]);
+            printf("\n  >>> SNAPSHOT SAVED TO KDATA <<<\n");
+            printf("  >>> Enter rest mode, resume, re-exploit <<<\n");
+            printf("  >>> Then send pcb_diff.bin with fw_ver=0x2 <<<\n");
+
+            printf("\n  sentinel: %#lx\n", readback[70]);
+
+        } else if (phase == 2) {
+            printf("\n  --- Phase 2: POST-RESUME DIFF ---\n");
+
+            if (status == 0xFD) {
+                printf("  *** No valid snapshot found at kdata+0x200! ***\n");
+                printf("  *** Run Phase 1 first, then suspend/resume ***\n");
+                printf("  snap_magic:      %#lx\n", readback[133]);
+            } else if (status == 1) {
+                uint64_t changed = readback[130];
+                uint64_t same = readback[131];
+
+                printf("  snap_magic:      %#lx %s\n", readback[133],
+                       readback[133] == 0x534E4150444946FFULL ? "[valid]" : "[INVALID]");
+                printf("  apic_ops[2]:     %#lx (post-resume)\n", readback[132]);
+                printf("\n  Fields changed:  %lu / %lu\n", changed, changed + same);
+                printf("\n  %-20s  %-20s %-20s %s\n",
+                       "FIELD", "BEFORE", "AFTER", "STATUS");
+                printf("  %-20s  %-20s %-20s %s\n",
+                       "-----", "------", "-----", "------");
+
+                for (int i = 0; i < 40; i++) {
+                    uint64_t before = readback[10 + i * 3 + 0];
+                    uint64_t after  = readback[10 + i * 3 + 1];
+                    uint64_t flag   = readback[10 + i * 3 + 2];
+                    const char* name = (i < 40) ? pcb_field_names[i] : "???";
+                    const char* st = flag ? "*** CHANGED ***" : "same";
+                    printf("  %-20s  %#018lx %#018lx %s\n",
+                           name, before, after, st);
+                }
+
+                printf("\n  === SUMMARY ===\n");
+                if (changed > 0) {
+                    printf("  %lu PCB fields CHANGED across suspend/resume!\n", changed);
+                    printf("  cpu_switch likely ran during resume.\n");
+                    printf("  Changed fields contain the register state at that point.\n");
+                } else {
+                    printf("  ALL PCB fields identical before and after suspend.\n");
+                    printf("  cpu_switch did NOT save to idle PCB during resume.\n");
+                    printf("  Resume path uses a different mechanism.\n");
+                }
+            }
+
+            printf("\n  sentinel: %#lx\n", readback[140]);
+        }
+
+        printf("\n=== END PCB DIFF ===\n");
+
     } else {
         /* Generic readback - check for test markers */
         uint64_t val0 = readback[0];
