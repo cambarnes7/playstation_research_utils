@@ -224,76 +224,64 @@ int module_start(kproc_args *args)
 
     } else if (mode == 0x2) {
         /*
-         * MODE 2: READBACK — check if IDT/TSS modifications survived
+         * MODE 2: READBACK — verdicts packed into first visible slots
+         *
+         * out[3]: IDT verdict  (0x50=PERSIST, 0x52=RESTORE, 0x55=UNKNOWN)
+         * out[4]: TSS verdict  (0x50=PERSIST, 0x52=RESTORE, 0x55=UNKNOWN)
+         * out[5]: sentinel     (should match SENTINEL_VAL)
+         * out[6]: IDT[3] armed lo  (what we wrote)
+         * out[7]: IDT[3] current lo (after resume)
          */
 
         /* Read sentinel */
         uint64_t sentinel = read8(persist + P_SENTINEL);
-        out[7] = sentinel;
-        out[8] = SENTINEL_VAL;  /* expected */
-        out[9] = (sentinel == SENTINEL_VAL) ? 0x0001 : 0x0000;  /* match? */
+        out[5] = sentinel;
 
-        /* Read saved originals and armed values */
-        uint64_t saved_idt3_orig_lo = read8(persist + P_IDT3_ORIG);
-        uint64_t saved_idt3_orig_hi = read8(persist + P_IDT3_ORIG + 8);
+        /* Read saved values from persistence area */
         uint64_t saved_idt3_armed_lo = read8(persist + P_IDT3_ARMED);
         uint64_t saved_idt3_armed_hi = read8(persist + P_IDT3_ARMED + 8);
-        uint64_t saved_ist1_orig = read8(persist + P_TSS_IST1_ORIG);
+        uint64_t saved_idt3_orig_lo = read8(persist + P_IDT3_ORIG);
+        uint64_t saved_idt3_orig_hi = read8(persist + P_IDT3_ORIG + 8);
         uint64_t saved_ist1_armed = read8(persist + P_TSS_IST1_ARMED);
+        uint64_t saved_ist1_orig = read8(persist + P_TSS_IST1_ORIG);
 
-        /* Read current IDT[3] */
+        /* Read current values */
         uint64_t cur_idt3_lo = read8(idt3_addr);
         uint64_t cur_idt3_hi = read8(idt3_addr + 8);
-
-        /* Read current TSS[0] IST1 */
         uint64_t cur_ist1 = read8(tss0_ist1);
 
-        /* Report IDT[3] */
-        out[10] = saved_idt3_orig_lo;    /* original lo */
-        out[11] = saved_idt3_orig_hi;    /* original hi */
-        out[12] = saved_idt3_armed_lo;   /* armed lo */
-        out[13] = saved_idt3_armed_hi;   /* armed hi */
-        out[14] = cur_idt3_lo;           /* current lo (after resume) */
-        out[15] = cur_idt3_hi;           /* current hi (after resume) */
-
-        /* IDT[3] comparison */
+        /* IDT[3] verdict → out[3] */
         if (cur_idt3_lo == saved_idt3_armed_lo && cur_idt3_hi == saved_idt3_armed_hi) {
-            out[16] = 0x50455253495354ULL;  /* "PERSIST" — modification survived! */
+            out[3] = 0x50455253495354ULL;  /* "PERSIST" */
         } else if (cur_idt3_lo == saved_idt3_orig_lo && cur_idt3_hi == saved_idt3_orig_hi) {
-            out[16] = 0x524553544F5245ULL;  /* "RESTORE" — reverted to original */
+            out[3] = 0x524553544F5245ULL;  /* "RESTORE" */
         } else {
-            out[16] = 0x554E4B4E4F574EULL;  /* "UNKNOWN" — something else entirely */
+            out[3] = 0x554E4B4E4F574EULL;  /* "UNKNOWN" */
         }
 
-        /* Report TSS IST1 */
-        out[17] = saved_ist1_orig;       /* original IST1 */
-        out[18] = saved_ist1_armed;      /* armed IST1 */
-        out[19] = cur_ist1;              /* current IST1 (after resume) */
-
-        /* TSS IST1 comparison */
+        /* TSS IST1 verdict → out[4] */
         if (cur_ist1 == saved_ist1_armed) {
-            out[20] = 0x50455253495354ULL;  /* "PERSIST" */
+            out[4] = 0x50455253495354ULL;  /* "PERSIST" */
         } else if (cur_ist1 == saved_ist1_orig) {
-            out[20] = 0x524553544F5245ULL;  /* "RESTORE" */
+            out[4] = 0x524553544F5245ULL;  /* "RESTORE" */
         } else {
-            out[20] = 0x554E4B4E4F574EULL;  /* "UNKNOWN" */
+            out[4] = 0x554E4B4E4F574EULL;  /* "UNKNOWN" */
         }
 
-        /* Dump current TSS IST1-IST7 for all CPUs (CPU 0-7) */
-        for (int cpu = 0; cpu < 8; cpu++) {
-            uint64_t tss_cpu = tss_base + cpu * TSS_STRIDE;
-            uint64_t ist1 = read8(tss_cpu + TSS_IST1_OFF);
-            out[25 + cpu] = ist1;
-        }
+        /* Comparison data in remaining visible slots */
+        out[6] = saved_idt3_armed_lo;    /* IDT[3] armed lo */
+        out[7] = cur_idt3_lo;            /* IDT[3] current lo */
 
-        /* Dump current IDT[0]-IDT[7] for comparison */
-        for (int i = 0; i < 8; i++) {
-            uint64_t entry_addr = idt_base + i * IDT_ENTRY_SIZE;
-            out[35 + i * 2] = read8(entry_addr);
-            out[36 + i * 2] = read8(entry_addr + 8);
-        }
+        /* Extended data (visible if output shows >8 entries) */
+        out[8] = saved_idt3_armed_hi;    /* IDT[3] armed hi */
+        out[9] = cur_idt3_hi;            /* IDT[3] current hi */
+        out[10] = saved_ist1_armed;      /* TSS IST1 armed */
+        out[11] = cur_ist1;              /* TSS IST1 current */
+        out[12] = saved_ist1_orig;       /* TSS IST1 original */
+        out[13] = saved_idt3_orig_lo;    /* IDT[3] original lo */
+        out[14] = saved_idt3_orig_hi;    /* IDT[3] original hi */
 
-        out32[1] = 0x0001;  /* status: readback complete */
+        out32[1] = 0x0002;  /* status: readback complete */
 
     } else {
         out32[1] = 0xFF;  /* unknown mode */
