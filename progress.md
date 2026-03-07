@@ -988,14 +988,9 @@ idx  ktext offset  PS5 name (kldload)       FreeBSD header name
 
 Built v8c canary using the proven pcb_onfault pattern from `pivot_scan_safe`. For each of the 28 apic_ops entries, arms pcb_onfault before reading fn-1, with fault recovery via saved_rsp restoration. Magic written last with mfence.
 
-Safety measures:
-- pcb_onfault armed before every read, cleared after every read
-- RSP saved/restored on fault path
-- Only reads 1 byte per probe (no writes, no execution)
-- NULL check before probing
-- td_pcb validated non-NULL before any probing begins
+**v8c Result**: Kernel panic. Root cause: static global variables (`saved_rsp`, `onfault_ptr`, `fault_flag`) were in `.bss` section. `objcopy -O binary` doesn't include uninitialized .bss data in the flat binary, so RIP-relative accesses to those globals hit unmapped memory.
 
-Reports: cc_bitmap (which entries have CC/INT3 at fn-1), fault_bitmap (which faulted), per-entry byte values. Kldload updated with formatted v8c display.
+**v8c2 fix**: Eliminated ALL global variables. `onfault_addr` passed as a function parameter (register). Recovery label uses only the kernel-preserved stack frame (no need for saved_rsp — confirmed by pcb_onfault_test which also doesn't save RSP). Fault result returned directly in a register via inline asm output operand. Binary: 656 bytes, zero .bss symbols.
 
-**Status**: Built (736 bytes), awaiting deployment.
+**Status**: v8c2 built, awaiting deployment.
 
