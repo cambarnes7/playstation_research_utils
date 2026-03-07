@@ -271,6 +271,31 @@ Shifted focus from gadget scanning to exploiting the suspend/resume path. The hy
 
 **Also supports dry run** (fw_ver=0x3): snapshots everything without overwriting.
 
+**Diagnostic modes added:**
+- fw_ver=0x4 (HALF-ARMED): kdata writes only, no PCB overwrite
+- fw_ver=0x5 (PCB-ONLY): PCB overwrite only, no kdata writes
+
+**RESULTS — Phase 1 (ARMED):**
+
+1. **PCB overwrite succeeds** — pcb_rip readback confirms nop_ret written
+2. **Kernel panics ~2-5s after overwrite** — panic happens when CPU 0 next switches to idle thread
+3. **Diagnostic runs**: half-armed survived (kdata writes fine), PCB-only also survived (no immediate panic from write itself)
+4. **Earlier panics on some boots were from flaky jailbreak sessions**, not fundamental write issues
+5. **Root cause of post-overwrite panic**: sw_return is NOT just `ret`. It contains critical cleanup code (likely: releasing scheduler lock, restoring CR3/segment registers, re-enabling interrupts). Our bare `ret` gadget (nop_ret) skips this cleanup → deadlock/fault
+
+**sw_return analysis attempt:**
+- Modified gadget_reader to dump 256 bytes at sw_return (kdata - 0x5A16AB = ktext + 0x65e955)
+- Fixed kldload decoder bug: region parsing started at byte offset 24 instead of 40 (dmap_base + cr3_val fields were added to header without updating decoder)
+- DMAP reads returned garbage on latest boot — dmap_base calculation may be unreliable across boots
+- **Decision**: Don't need to reverse-engineer sw_return. Instead, build a trampoline that does custom work then jumps to sw_return for proper cleanup
+
+**TRAMPOLINE APPROACH (next step):**
+- Allocate executable kernel memory (malloc + NX clear)
+- Write shellcode: `write sentinel to kdata` → `jmp sw_return`
+- Set pcb_rip → trampoline address
+- On resume: cpu_switch restores regs → jmp trampoline → our code runs → jmp sw_return → kernel continues normally
+- This avoids needing to replicate sw_return's cleanup; we just defer to it
+
 ---
 
 ## Key Discoveries
@@ -337,8 +362,8 @@ Shifted focus from gadget scanning to exploiting the suspend/resume path. The hy
 
 ## Next Steps
 
-1. **Run pcb_overwrite Phase 1** — overwrite idle pcb_rip to nop_ret, then enter rest mode
-2. **Run pcb_overwrite Phase 2** — verify hijack worked (pcb_rip restored to sw_return = SUCCESS)
-3. **If hijack confirmed**: Build ROP payload that pivots stack to kdata and executes a chain
-4. **Full exploit chain**: pcb_rip → stack pivot gadget, pcb_rsp → kdata ROP stack, persist across suspend
-5. **Fallback**: If nop_ret test fails (panic), investigate why cpu_switch restore doesn't behave as expected
+1. **Build trampoline payload** — shellcode that writes sentinel + jumps to sw_return
+2. **Deploy pcb_overwrite v2** — pcb_rip → trampoline, pcb_rsp unchanged (safe idle stack)
+3. **Enter rest mode → wake → re-exploit → Phase 2** — verify sentinel survived + kernel stable
+4. **If trampoline works**: Extend shellcode to do real work (hook syscall, install backdoor, etc.)
+5. **Full exploit chain**: trampoline → install persistent kernel hooks → survive across multiple suspend/resume cycles

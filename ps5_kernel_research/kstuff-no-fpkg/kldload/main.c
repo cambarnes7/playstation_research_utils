@@ -56,7 +56,7 @@ static void _kldload(void* data, size_t data_size)
     /* Allocate kernel memory for code, process name, and thread args */
     printf("[debug] about to call malloc(%ld) via kekcall nr=6...\n", (long)data_size);
 
-    uint64_t exec_code = kekcall_malloc(data_size);
+    uint64_t exec_code = kekcall_malloc(data_size + 256); /* extra 256 for trampoline */
     uint64_t kproc_name = kekcall_malloc(0x100);
     uint64_t kthread_args = kekcall_malloc(0x1000); /* 4KB for args/results */
 
@@ -69,15 +69,17 @@ static void _kldload(void* data, size_t data_size)
         return;
     }
 
-    /* Prepare kthread_args: kdata_base (uint64) + fw_ver (uint32) */
+    /* Prepare kthread_args: kdata_base (uint64) + fw_ver (uint32) + exec info */
     struct {
         uint64_t kdata_base;
         uint32_t fw_ver;
-        uint32_t pad;
+        uint32_t data_size;
+        uint64_t exec_code;
     } args_buf;
     args_buf.kdata_base = kdata_base_addr;
     args_buf.fw_ver = fw_version;
-    args_buf.pad = 0;
+    args_buf.data_size = (uint32_t)data_size;
+    args_buf.exec_code = exec_code;
 
     printf("[debug] kdata_base=%#lx fw_ver=%u\n", kdata_base_addr, fw_version);
 
