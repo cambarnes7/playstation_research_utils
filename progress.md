@@ -448,10 +448,204 @@ Three modes:
 
 **v2 changes**: Removed dangerous DMAP probe code (same crash pattern as register_capture v2). Removed mode 0x1 (DMAP low-memory scan). Added modes 0x2/0x3 for justreturn suspend/resume test.
 
+### pivot_scan_safe v5 — DMAP ktext Byte Scanner
+
+Attempted to read ktext bytes through DMAP to scan for gadget patterns.
+
+**Results:**
+- DMAP base discovered: `0xFFFF9DA700000000` (via `pm_pml4 - CR3`)
+- ktext PA found: `0x0000000004290000` (page table walk succeeded)
+- **DMAP ktext read: FAILED** — ktext physical pages are **completely unmapped from DMAP** (PTE = 0)
+- kdata DMAP reads work fine — only ktext is excluded
+- **Conclusion**: Cannot read ktext bytes through any path. Must use execution-based probing.
+
+---
+
+## Phase 5: Execution-Based Gadget Probing
+
+**Status: PLANNING**
+
+### The Core Challenge
+
+We need a **stack pivot gadget** in ktext so that apic_ops[2] can redirect RSP to a controlled ROP chain during LAPIC resume. The constraints:
+
+1. **Cannot read ktext** — XOM enforced at VA level, DMAP pages unmapped at PT level
+2. **Cannot execute non-ktext during suspend** — NPT NX enforced by hypervisor
+3. **apic_ops[2] has no CFI** — can point at any ktext address
+4. **kdata persists** — our data/pointers survive suspend/resume
+5. **Register state at apic_ops[2] during resume is UNKNOWN** — register_capture got count=0 (only called during LAPIC resume), R8 gamble proved RDI is not valid
+
+### The Circular Problem
+
+- To pick the right gadget → need to know register state at resume
+- To capture registers at resume → need a ktext trampoline (NPT NX blocks non-ktext)
+- To find a ktext trampoline → need to find a gadget first
+
+### Gadget Candidates (Ranked by Likelihood of Existing)
+
+| Gadget | Bytes | Likelihood | Controllable Register | Notes |
+|--------|-------|------------|----------------------|-------|
+| `leave; ret` | `C9 C3` | **VERY HIGH** | RBP | Compilers actually emit this. Standard epilogue |
+| `pop rsp; ret` | `5C C3` | **HIGH** | Stack (need controlled stack) | Only 2 bytes, common coincidence |
+| `mov rsp, rbp; pop rbp; ret` | `48 89 EC 5D C3` | **HIGH** | RBP | Standard epilogue variant |
+| `xchg rsp, rax; ret` | `48 94 C3` | **LOW** | RAX | 3-byte coincidence, never intentionally emitted |
+
+**Key insight**: `xchg rsp, rax; ret` (`48 94 C3`) is a coincidental byte alignment that may or may not exist in Sony's specific compiler output. It is NOT a real instruction sequence any compiler generates. Searching for it is a gamble.
+
+`leave; ret` (`C9 C3`) is **almost certainly present** — it's a real compiler-emitted epilogue. If RBP happens to point to kdata we control during the resume call, it gives us the same pivot capability.
+
+### Breaking the Circle: The `leave; ret` Strategy
+
+`leave; ret` does: `RSP = RBP; pop RBP; ret` (executes the address at `[RBP]`).
+
+Even without knowing RBP's value at resume, we can use `leave; ret` as a **diagnostic tool**:
+
+1. **Find a `leave; ret` gadget** in ktext (high confidence it exists)
+2. **Point apic_ops[2] at it** and trigger suspend/resume
+3. **Observe the crash** — the panic address tells us what RBP contained
+   - If RBP → kdata range: we can control the pivot destination
+   - If RBP → stack/heap: we learn the stack layout for alternative pivots
+   - If RBP → 0 or garbage: `leave; ret` won't work, try `pop rsp; ret` instead
+
+This turns a potential crash into **information gathering** — each crash teaches us the register state we couldn't capture any other way.
+
+### Probing Strategy
+
+**Smart candidate selection** near the 28 known apic_ops function entry points:
+
+1. Functions in x86-64 are padded with `0xCC` (int3) bytes between them
+2. Function epilogues (`leave; ret`, `pop; ret`, `ret`) appear just before the padding
+3. We know 28 function start addresses → probe offsets -3, -4, -5, -6 from each
+4. Skip -1, -2 (almost certainly `0xCC` padding → kernel panic)
+5. ~112 candidates for `leave; ret` (`C9 C3`)
+
+**Probing mechanism**: Single-probe-per-deployment via `fw_ver` encoding:
+- `fw_ver = 0x0001XXYY` → probe apic_ops[YY] at offset -XX
+- Kernel thread jumps to candidate with pcb_onfault set for #PF recovery
+- Reports: 0 = returned normally (not a pivot), 1 = RSP changed (pivot!), 2 = faulted (#PF)
+- If #BP (0xCC) → kernel panic, reboot, try next candidate
+
+### The Goal
+
+**Ultimate objective**: Find a ktext gadget that, when called via apic_ops[2] during LAPIC resume, redirects execution to a ROP chain in kdata. This ROP chain would:
+
+1. Execute `wrmsr` to modify LSTAR or other MSRs before the hypervisor re-locks them
+2. Or execute `mov cr0, X` to disable CR0.WP before HV restarts
+3. Or dump HV state (VMCS fields, EPT/NPT root) for analysis
+4. The key is that LAPIC resume happens **during the suspend/resume sequence** — potentially in a window where the HV is not yet fully active
+
+If the HV IS already active at the apic_ops[2] call point (as PCB hijack v3 suggested), the ROP chain can still be used to probe exactly what the HV allows/blocks at that stage, mapping the HV's enforcement boundary.
+
+### Revised Strategy: INT3 + IST (No Stack Pivot Needed)
+
+**Key insight**: We don't need a stack pivot gadget at all. The CPU's IST (Interrupt Stack Table) mechanism gives us RSP control directly when an interrupt fires. This is the **same technique ps5-kstuff uses** for its kekcall infrastructure.
+
+**How it works:**
+1. Modify IDT[3] (INT 3 handler): handler = `pop_all_iret`, IST = 1
+2. Modify TSS IST1 for all CPUs: point to kdata chain buffer
+3. Write ROP chain to kdata at the IST1 address
+4. Point apic_ops[2] at a `CC` byte in ktext (function padding, near-certain to exist)
+5. Suspend/resume → LAPIC resume calls apic_ops[2] → CC fires INT 3 → CPU loads RSP from IST1 → pop_all_iret consumes chain → iretq → full ROP
+
+The first 5 pops of pop_all_iret consume the CPU-pushed trap frame (RIP, CS, RFLAGS, RSP, SS → loaded into RDI, RSI, RDX, RCX, R8). Pops 6-15 read our controlled values from kdata (R9, RAX, RBX, RBP, R10-R15). The iretq at the end jumps to our target with controlled RSP.
+
+**Previous approach (blind gadget scanning) abandoned** — we have all needed gadgets at known offsets from ps5-kstuff.
+
+---
+
+## Phase 6: IDT/TSS Safety Research
+
+**Question**: Will modifying IDT/TSS entries block rest mode entry (like ktext PTE modifications did)?
+
+### Evidence FOR safety (strong):
+
+1. **apic_ops[2] modification persists** through 8+ suspend/resume cycles. apic_ops is a kdata function pointer table — same category as IDT.
+2. **HV integrity monitor only checks ktext PTEs**, not kdata structures. The XOTEXT bit clearing on ktext PTEs triggered the monitor, but ALL kdata modifications (apic_ops, markers, QA flags) survive fine.
+3. **ps5-kstuff modifies both IDT and TSS** (main.c lines 1170-1181):
+   - IDT[1] (#DB handler), IDT[2] (NMI → doreti_iret), IDT[13] (#GP handler)
+   - TSS IST3, IST7 for all CPUs
+   - System runs stably after these modifications.
+4. **IDT and TSS are in kdata** — read-write kernel data segment. No known HV checksum mechanism for arbitrary kdata.
+
+### Evidence AGAINST (concerns):
+
+1. **IDT/TSS + rest mode never explicitly tested** — ps5-kstuff modifies these but doesn't test suspend/resume afterward.
+2. **During suspend processing**, HV is active. Modified interrupt handlers called during suspend could cause unexpected behavior.
+3. **ACPI wakeup code** may reload IDT/GDT/TSS from known-good copies, overwriting our changes.
+4. **DR registers likely do NOT persist** through suspend/resume (not in suspend PCB).
+
+### Assessment Table
+
+| Structure | In kdata? | HV checksums? | Survives rest mode? |
+|-----------|-----------|---------------|---------------------|
+| apic_ops  | Yes       | No (confirmed) | **Yes (8+ tests)** |
+| kdata markers | Yes  | No (confirmed) | **Yes (confirmed)** |
+| ktext PTEs | No       | **Yes**       | **No — blocks rest mode** |
+| IDT       | Yes       | No (inferred) | **Likely yes** (untested) |
+| TSS IST   | Yes       | No (inferred) | **Likely yes** (untested) |
+| DR regs   | CPU state | N/A           | **Likely no** |
+
+**Conclusion**: IDT/TSS modifications should be safe based on the pattern that ALL kdata modifications survive. Needs empirical confirmation.
+
+---
+
+## Known Gadgets Reference (FW 4.03, ps5-kstuff offsets)
+
+All offsets relative to kdata_base (negative = ktext):
+
+| Gadget | Offset | Purpose |
+|--------|--------|---------|
+| doreti_iret | -0x9cf84c | iretq — universal chain link |
+| pop_all_iret | -0x9cf8ab | Pop 15 regs + add rsp 0x20 + iretq |
+| pop_all_except_rdi_iret | -0x9cf8a7 | Skip RDI pop variant |
+| nop_ret | -0x9d20ca | ret (no-op return) |
+| wrmsr_ret | -0x9d20cc | wrmsr; ret — write MSR |
+| rdmsr_start | -0x9d0cfa | rdmsr — read MSR |
+| mov_cr3_rax | -0x396f9e | mov cr3, rax |
+| mov_rdi_cr3 | -0x39700e | mov rdi, cr3 |
+| rep_movsb_pop_rbp_ret | -0x99002a | rep movsb; pop rbp; ret |
+| cpu_switch | -0x9d6f80 | Context switch function |
+| copyin | -0x9908e0 | Copy user→kernel |
+| copyout | -0x990990 | Copy kernel→user |
+| push_pop_all_iret | -0x96be70 | Push/pop all regs + iretq |
+| justreturn | -0x9cf990 | Exception return path (doreti) |
+| justreturn_pop | -0x9cf988 | doreti path + 8 |
+| add_rsp_iret | -0x9cf853 | add rsp, N; iretq |
+| swapgs_add_rsp_iret | -0x9cf856 | swapgs; add rsp; iretq |
+| malloc | -0xa9b00 | kernel malloc(9) |
+
+### IDT/TSS Offsets (kdata-relative)
+
+| Structure | Offset | Size |
+|-----------|--------|------|
+| IDT base | +0x64cdc80 | 256 × 16 bytes |
+| TSS base | +0x64d0830 | per-CPU, 0x68 stride |
+| GDT base | +0x64cee30 | — |
+| PCPU base | +0x64d2280 | — |
+| apic_ops | ktext+0x1934AC8 | 28 × 8 bytes |
+
+### IDT Gate Descriptor Format (16 bytes)
+
+```
+Bytes 0-1:   offset_low (handler bits 15:0)
+Bytes 2-3:   segment_selector (0x20 = kernel CS)
+Byte 4:      IST (bits 2:0), reserved (bits 7:3)
+Byte 5:      type_dpl_p (0x8E = interrupt gate, DPL=0, present)
+Bytes 6-7:   offset_mid (handler bits 31:16)
+Bytes 8-11:  offset_high (handler bits 63:32)
+Bytes 12-15: reserved
+```
+
+### TSS IST Layout
+
+IST entries at TSS + 36 + (N-1)*8 for IST N (N=1..7):
+- IST1: TSS + 36  (= TSS + 28 + 1*8)
+- IST3: TSS + 52  (= TSS + 28 + 3*8)
+- IST7: TSS + 84  (= TSS + 28 + 7*8)
+
 ### Next Steps
 
-1. **Deploy savectx_finder mode 0x403** → scan for savectx/resumectx ktext addresses
-2. **Deploy savectx_finder mode 0x2** → arm apic_ops[2] with justreturn
-3. **Suspend/resume PS5**
-4. **Deploy savectx_finder mode 0x3** → verify justreturn executed cleanly during resume
-5. **If justreturn works**: escalate to savectx/resumectx for register capture and full CPU state control
+1. **Phase 1**: Build `idt_safe_test` — minimal IDT modification + rest mode cycle
+2. **Phase 2**: Build `resume_chain` — full INT3+IST ROP chain for resume
+3. **Phase 3**: Deploy and test — verify chain fires, test HV activity
+
