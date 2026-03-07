@@ -58,7 +58,13 @@
 #define IDT_OFF          0x64cdc80   /* IDT base, kdata-relative */
 #define TSS_OFF          0x64d0830   /* TSS base, kdata-relative */
 #define TSS_STRIDE       0x68        /* per-CPU TSS size */
-#define TSS_IST1_OFF     36          /* IST1 offset within TSS (28 + 1*8) */
+/*
+ * IST selection: IST1 is used by the original FreeBSD kernel (likely #DF).
+ * IST3 and IST7 are used by ps5-kstuff. IST4 is preserved by kstuff (used
+ * by the system). IST5 and IST6 appear unused — use IST5.
+ */
+#define OUR_IST_NUM      5
+#define TSS_IST_OFF(n)   (28 + (n)*8)  /* IST N offset within TSS */
 #define NCPUS            16
 
 #define APIC_OPS_OFF_KTEXT  0x1934AC8  /* apic_ops offset from ktext_base */
@@ -207,7 +213,7 @@ int module_start(kproc_args* args)
         save[1] = orig_hi;    /* original IDT[3] high */
 
         /* Read original TSS[0] IST1 */
-        uint64_t orig_ist1 = read8(tss_base + TSS_IST1_OFF);
+        uint64_t orig_ist1 = read8(tss_base + TSS_IST_OFF(OUR_IST_NUM));
         save[2] = orig_ist1;  /* original TSS[0] IST1 */
 
         /* Report originals */
@@ -222,7 +228,7 @@ int module_start(kproc_args* args)
             new_lo = orig_lo;
             new_hi = orig_hi;
             /* Byte 4 (bits 32-39 of lo) contains IST in bits 2:0 */
-            new_lo = (new_lo & ~(0x7ULL << 32)) | (1ULL << 32);  /* IST = 1 */
+            new_lo = (new_lo & ~(0x7ULL << 32)) | ((uint64_t)OUR_IST_NUM << 32);  /* IST = OUR_IST_NUM */
         } else {
             /* FULL change: set handler to pop_all_iret, IST = 1 */
             uint64_t pop_all_iret = kdata_base + OFF_POP_ALL_IRET;
@@ -241,7 +247,7 @@ int module_start(kproc_args* args)
 
         for (int cpu = 0; cpu < NCPUS; cpu++) {
             uint64_t tss_cpu = tss_base + TSS_STRIDE * cpu;
-            uint64_t ist1_addr = tss_cpu + TSS_IST1_OFF;
+            uint64_t ist1_addr = tss_cpu + TSS_IST_OFF(OUR_IST_NUM);
             /* Only patch if TSS entry looks valid (non-zero RSP0 at TSS+4) */
             uint64_t rsp0 = read8(tss_cpu + 4);
             if (rsp0 != 0 && rsp0 > 0xFFFF800000000000ULL) {
@@ -295,7 +301,7 @@ int module_start(kproc_args* args)
         out[9] = (cur_lo != saved_lo || cur_hi != saved_hi) ? 1 : 0;
 
         /* Read current TSS[0] IST1 */
-        uint64_t cur_ist1 = read8(tss_base + TSS_IST1_OFF);
+        uint64_t cur_ist1 = read8(tss_base + TSS_IST_OFF(OUR_IST_NUM));
         out[10] = cur_ist1;
         uint64_t expected_ist1 = kdata_base + 0x300;
         out[11] = (cur_ist1 == expected_ist1) ? 1 : 0;
@@ -309,7 +315,7 @@ int module_start(kproc_args* args)
         uint64_t orig_ist1 = save[2];
         for (int cpu = 0; cpu < NCPUS; cpu++) {
             uint64_t tss_cpu = tss_base + TSS_STRIDE * cpu;
-            uint64_t ist1_addr = tss_cpu + TSS_IST1_OFF;
+            uint64_t ist1_addr = tss_cpu + TSS_IST_OFF(OUR_IST_NUM);
             uint64_t rsp0 = read8(tss_cpu + 4);
             if (rsp0 != 0 && rsp0 > 0xFFFF800000000000ULL) {
                 write8(ist1_addr, orig_ist1);
