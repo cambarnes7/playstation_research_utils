@@ -411,21 +411,18 @@ int module_start(kproc_args* args)
         uint64_t kdata_test = 0;
         int kdata_ok = safe_read8(dmap_base + kdata_pa, &kdata_test);
 
-        /* Pack XOM diagnostics into visible slots [5] and [7]:
-         * [5] = first_ktext_pa (physical address of ktext page)
-         * [6] = phase (stays 3)
-         * [7] = DMAP PTE for ktext page (check bit 58 = XOTEXT, bit 63 = NX)
-         *
-         * Also store in invisible slots for completeness:
-         * [8]  = kdata_pa
-         * [9]  = kdata_test (should be non-zero if DMAP works)
-         * [10] = kdata_ok (1=success)
+        /* Pack diagnostics into visible slots:
+         * [1] = first_ktext_pa
+         * [2] = DMAP PML4 entry for ktext region
+         * [3] = DMAP PDPT entry (often 1GB page = leaf)
+         * [5] = DMAP PDE or PTE (deeper walk level)
+         * [7] = kdata DMAP test: (kdata_ok << 56) | kdata_pa
          */
-        out[5] = first_ktext_pa;
-        out[7] = dmap_pte;
-        out[8] = kdata_pa;
-        out[9] = kdata_test;
-        out[10] = kdata_ok;
+        out[1] = first_ktext_pa;
+        out[2] = pml4e;
+        out[3] = pdpte;
+        out[5] = pde ? pde : pte;
+        out[7] = ((uint64_t)kdata_ok << 56) | (kdata_pa & 0x00FFFFFFFFFFFFFFULL);
 
         out32[1] = 0x0003;  /* partial: DMAP works but ktext XOM enforced */
         out[63] = 0xdeadbeefcafe0025ULL;
