@@ -1979,7 +1979,42 @@ static void _kldload(void* data, size_t data_size)
         uint32_t status = (uint32_t)(readback[0] >> 32);
         printf("[debug] kthread_args readback (status=0x%x):\n", status);
 
-        if (status == 0x008C) {
+        if (status == 0x008D || status == 0x018D) {
+            /* v8d: ktext readability diagnostic */
+            printf("\n=== v8d KTEXT READABILITY DIAGNOSTIC ===\n");
+            printf("  kdata_base:     %#lx\n", readback[1]);
+            printf("  ktext_base:     %#lx\n", readback[2]);
+            printf("  td_pcb:         %#lx\n", readback[3]);
+            printf("  step_progress:  %lu\n", readback[32]);
+            printf("  kdata_byte:     0x%02lx%s\n", readback[33],
+                   readback[33] == 0xFA ? " (FAULTED!)" : " (OK)");
+            printf("  ktext_byte:     0x%02lx%s\n", readback[34],
+                   readback[34] == 0xFA ? " (FAULTED — ktext may be XOM)" :
+                   readback[34] == 0xFB ? " (skipped)" : " (OK — ktext is readable!)");
+            printf("  ktext_readable: %s\n", readback[35] ? "YES" : "NO");
+            printf("  test_kdata_addr: %#lx\n", readback[36]);
+            printf("  test_ktext_addr: %#lx\n", readback[37]);
+            printf("  status:         0x%x (%s)\n", status,
+                   status == 0x018D ? "COMPLETE" : "CRASHED MID-RUN");
+
+            if (readback[32] == 0x04 && status == 0x008D) {
+                printf("\n  >>> CRASHED AT STEP 4: ktext byte read <<<\n");
+                printf("  >>> CONFIRMS: ktext is EXECUTE-ONLY (NPT/XOM) <<<\n");
+                printf("  >>> pcb_onfault cannot catch NPT violations <<<\n");
+                printf("  >>> Solution: read ktext bytes via DMAP <<<\n");
+            } else if (readback[32] >= 0x05) {
+                printf("\n  >>> ktext IS readable — crash was from something else <<<\n");
+            }
+
+            /* Also show fn ptrs */
+            printf("\n  apic_ops fn ptrs:\n");
+            for (int i = 0; i < 28; i++) {
+                if (readback[4 + i])
+                    printf("  [%2d] %#lx (ktext+%#lx)\n",
+                           i, readback[4 + i], readback[4 + i] - readback[2]);
+            }
+            printf("  end_marker: %#lx\n", readback[63]);
+        } else if (status == 0x008C) {
             /* v8c: apic_ops byte probe results */
             uint64_t ktext = readback[2];
             printf("\n=== v8c APIC_OPS BYTE PROBE ===\n");

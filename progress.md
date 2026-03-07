@@ -992,5 +992,21 @@ Built v8c canary using the proven pcb_onfault pattern from `pivot_scan_safe`. Fo
 
 **v8c2 fix**: Eliminated ALL global variables. `onfault_addr` passed as a function parameter (register). Recovery label uses only the kernel-preserved stack frame (no need for saved_rsp — confirmed by pcb_onfault_test which also doesn't save RSP). Fault result returned directly in a register via inline asm output operand. Binary: 656 bytes, zero .bss symbols.
 
-**Status**: v8c2 built, awaiting deployment.
+**v8c2 Result**: Kernel panic. No globals in binary (confirmed via objdump — zero .bss symbols), so the crash isn't from unmapped .bss. The disassembly looks correct. v8b (fn ptr reads only, from kdata) works. v8c/v8c2 (byte reads from ktext) crash.
+
+**Hypothesis**: PS5 HV maps ktext as **execute-only via NPT** (nested page tables). Reading ktext bytes causes an NPT violation handled by the hypervisor (not a kernel #PF), so pcb_onfault never fires. Evidence:
+- All successful reads are from kdata or kernel heap (never ktext)
+- v7b EXECUTED xapic_mode-1 successfully (execute permission OK)
+- v8a/v8c/v8c2 all crash when trying to READ ktext bytes
+- pcb_onfault works for regular #PF (confirmed) but can't catch NPT violations
+
+### Phase 9d: v8d — ktext Readability Diagnostic
+
+Step-by-step diagnostic with progress markers and magic written EARLY (so kldload reads back even on crash):
+1. Read fn ptrs from kdata (proven safe)
+2. Read 1 byte from kdata with pcb_onfault (control test)
+3. Read 1 byte from ktext with pcb_onfault (the dangerous test)
+Progress marker at out[32] shows how far we got. If step marker = 0x04 and status = in-progress, confirms ktext read crashed (XOM).
+
+**Status**: Built (680 bytes), awaiting deployment.
 
