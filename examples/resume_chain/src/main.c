@@ -55,6 +55,7 @@
 #define SENTINEL_RAX     0xBAD0BAD0BAD0BAD0ULL
 #define FAULT_MARKER     0xFAFAFAFAFAFAFAFAULL
 #define SKIP_MARKER      0x534B4950534B4950ULL  /* "SKIPSKIP" */
+#define UNSAFE_MARKER    0x554E534146450000ULL  /* "UNSAFE\0\0" — byte not CC/C3 */
 
 /* Number of apic_ops entries */
 #define APIC_OPS_COUNT   28
@@ -292,6 +293,17 @@ int module_start(kproc_args *args)
         }
 
         uint64_t target = fn_addr - 1;
+
+        /* Read the actual byte FIRST — only call if CC or C3.
+         * Other bytes decode as misaligned instructions that can
+         * loop forever, freezing the system. */
+        uint8_t byte_val = read1(target);
+        if (byte_val != 0xCC && byte_val != 0xC3) {
+            out[8 + i] = UNSAFE_MARKER | byte_val;
+            tested++;
+            continue;
+        }
+
         uint64_t rv = test_cc_byte(target, onfault_ptr);
 
         /* Write result immediately (survives partial crash) */
@@ -320,6 +332,11 @@ int module_start(kproc_args *args)
     for (int i = 0; i < N_EXTRAS; i++) {
         uint64_t fn_addr = kdata_base + extra_offsets[i];
         uint64_t target = fn_addr - 1;
+        uint8_t byte_val = read1(target);
+        if (byte_val != 0xCC && byte_val != 0xC3) {
+            out[36 + i] = UNSAFE_MARKER | byte_val;
+            continue;
+        }
         uint64_t rv = test_cc_byte(target, onfault_ptr);
         out[36 + i] = rv;
     }
