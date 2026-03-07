@@ -1976,8 +1976,9 @@ static void _kldload(void* data, size_t data_size)
 
         /* Dump raw readback */
         printf("[debug] kthread_args readback:\n");
-        for (int i = 0; i < 8; i++) {
-            printf("  [%#04x] %#018lx\n", i * 8, readback[i]);
+        for (int i = 0; i < 36; i++) {
+            if (readback[i] != 0 || i < 4)
+                printf("  [%#04x] %#018lx\n", i * 8, readback[i]);
         }
     }
 }
