@@ -1085,7 +1085,45 @@ python3 ../lib/frankenelf.py payload.bin
 
 ---
 
-### 3. kldload — Produces `kldload.elf`
+### 3. kstuff.elf (ps5-kstuff-ldr) — Produces `kstuff.elf`
+
+This is the **loader wrapper** that embeds `payload.bin` (from ps5-kstuff above) and runs it on the PS5. Located at `ps5_kernel_research/kstuff-no-fpkg/ps5-kstuff-ldr/`.
+
+**Toolchain**: PS5 Payload SDK (`prospero-clang`) — same as kldload.
+
+**How it works**: It first builds ps5-kstuff's `payload.bin`, converts it to a C byte array with `xxd -i`, then compiles a PS5 userland ELF that embeds and loads that payload.
+
+**Exact build commands**:
+
+```bash
+cd ps5_kernel_research/kstuff-no-fpkg/ps5-kstuff-ldr
+
+# Step 1: Build the kernel payload (triggers ps5-kstuff Makefile)
+make -C ../ps5-kstuff/
+
+# Step 2: Convert payload.bin to C header (byte array)
+xxd -i ../ps5-kstuff/payload.bin > payload_bin.c
+# This produces: unsigned char ____ps5_kstuff_payload_bin[] = { 0xeb, 0x0b, ... };
+
+# Step 3: Compile the loader ELF
+/opt/ps5-payload-sdk/bin/prospero-clang -Wall -Werror \
+    -o kstuff.elf main.c sqlite_triggers.c -lsqlite3
+
+# Step 4: Strip debug symbols
+strip kstuff.elf
+```
+
+**Or simply**: `PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk make` in the `ps5-kstuff-ldr/` directory.
+
+**Key points**:
+- `xxd -i` converts the binary payload to a C byte array — this embeds the kernel payload directly into the userland ELF
+- Links against `-lsqlite3` for SQLite trigger-based exploit delivery
+- `main.c` handles loading the embedded payload into kernel memory via kekcalls
+- The final `kstuff.elf` is a PS5 userland binary that contains everything needed
+
+---
+
+### 4. kldload — Produces `kldload.elf`
 
 This is a PS5 userland payload that loads kernel modules. Located at `ps5_kernel_research/kstuff-no-fpkg/kldload/`.
 
@@ -1134,6 +1172,7 @@ strip kldload.elf
 |----------|-----------|-----------|----------|-----------|------------|
 | Research payloads | `examples/*` | Host | `gcc` | N/A | `.bin` (flat binary) |
 | ps5-kstuff | `kstuff-no-fpkg/ps5-kstuff` | Host | `gcc` | `yasm` | `payload.bin` (frankenelf) |
+| kstuff.elf | `kstuff-no-fpkg/ps5-kstuff-ldr` | PS5 SDK | `prospero-clang` | N/A | `kstuff.elf` (embeds payload.bin) |
 | kldload | `kstuff-no-fpkg/kldload` | PS5 SDK | `prospero-clang` | `prospero-as` | `kldload.elf` (PS5 ELF) |
 
 ### Prerequisites
@@ -1143,6 +1182,7 @@ To build everything from scratch you need:
 - `objcopy` (GNU Binutils, tested with 2.42)
 - `yasm` assembler (for kstuff assembly files — kelf.asm, crt.asm, etc.)
 - `python3` (for syscall generation scripts and frankenelf.py)
-- PS5 Payload SDK at `/opt/ps5-payload-sdk/` (only needed for kldload.elf)
+- `xxd` (for converting payload.bin to C byte array — needed for kstuff.elf)
+- PS5 Payload SDK at `/opt/ps5-payload-sdk/` (only needed for kstuff.elf and kldload.elf)
 - `make`
 
