@@ -110,13 +110,10 @@ static void _kldload(void* data, size_t data_size)
         return;
     }
 
-    /* Clear NX bit on exec_code pages */
-    printf("[debug] clearing NX bit on exec_code pages...\n");
-    uint64_t pte = kekcall_make_exec(exec_code, 1);
+    /* Clear NX bit on exec_code pages + flush TLB (mode=2 reloads CR3) */
+    printf("[debug] clearing NX bit on exec_code pages (mode=2, TLB flush)...\n");
+    uint64_t pte = kekcall_make_exec(exec_code, 2);
     printf("[debug] kekcall_make_exec returned %#lx (original PTE)\n", pte);
-
-    /* Sleep briefly to let NX clearing take effect */
-    usleep(10000);
 
     /* Launch the kernel thread */
     printf("[debug] calling kproc_create via kekcall...\n");
