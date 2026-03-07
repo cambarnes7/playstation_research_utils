@@ -26,11 +26,8 @@
  *   [4]   dmap_base (confirmed, or default if not found)
  *   [5]   td_pcb
  *   [6]   phase (1=dmap_test, 2=pagewalk, 3=ktext_read, 4=done)
- *   -- Phase 0+1: diagnostics + DMAP discovery --
- *   [7]   safe_read8 diag (0xAAAA0001=ok, 0xDEAD0000=fault)
- *   [8]   0xD0000000 | (num_candidates<<16) | found_idx  (0=not found, 1-5=which)
- *   [9]   first_success_val (first readable PML4 entry value)
- *   [10]  error code if DMAP not found (0xDEAD0001)
+ *   -- Phase 1: DMAP discovery via pmap --
+ *   [7]   pm_pml4 (VA of PML4, or 0xDEAD000X on error)
  *   -- Phase 2-3: ktext access --
  *   [15]  pml4_ktext_entry
  *   [16]  first_ktext_page_pa
@@ -54,6 +51,12 @@
 #define OFF_NOP_RET        (-0x9d20ca)
 #define APIC_OPS_OFF_KTEXT  0x1934AC8
 #define NUM_APIC_OPS        28
+
+/* Struct offsets for DMAP discovery via pmap (from etaHEN + kstuff) */
+#define TD_PROC            0x008
+#define PROC_P_VMSPACE     0x200
+#define VMSPACE_PMAP_PTR   0x1D0
+#define PMAP_PM_PML4       0x020
 
 /* Standard FreeBSD amd64 DMAP base */
 #define DMAP_BASE_DEFAULT   0xFFFFF80000000000ULL
@@ -295,85 +298,58 @@ int module_start(kproc_args* args)
     out[5] = td_pcb;
     out[6] = 1;  /* phase 1: DMAP test */
 
-    /* ========== Phase 0: Verify safe_read8 works ========== */
-
-    /* Test with kdata_base — we know this is readable (we read td_pcb from it) */
-    uint64_t diag_val = 0;
-    int diag_ok = safe_read8(kdata_base, &diag_val);
-    out[7] = diag_ok ? 0xAAAA0001 : 0xDEAD0000;  /* safe_read8 diagnostic */
-
-    if (!diag_ok) {
-        out[8] = 0xDEAD0000;
-        out32[1] = 0x0003;
-        out[63] = 0xdeadbeefcafe0025ULL;
-        return 0;
-    }
-
-    /* ========== Phase 1: Find DMAP base ========== */
+    /* ========== Phase 1: Discover DMAP base via pmap ========== */
+    /*
+     * etaHEN method: DMAP_BASE = pm_pml4 (VA of PML4) - CR3 (PA of PML4)
+     * Navigate: curthread -> td_proc -> p_vmspace -> vm_pmap -> pm_pml4
+     *
+     * All reads use read8() (direct kernel memory access, no DMAP needed).
+     * These are kernel structures in kdata/heap — always readable.
+     */
 
     uint64_t pml4_pa = cr3 & PAGE_MASK;
     int dmap_accessible = 0;
 
-    /*
-     * DMAP base = (DMPML4I << 39) | (DMPDPI << 30) | 0xFFFF800000000000
-     * Try known candidates from etaHEN (includes non-512GB-aligned bases).
-     * Validate by reading kdata_base's VA through candidate DMAP:
-     *   1. Walk kdata_base's page tables via candidate to get its PA
-     *   2. If walk succeeds, read PA via candidate and compare to direct read
-     *
-     * Simpler validation: just try reading the PML4 table (at CR3 PA)
-     * through each candidate. If the read succeeds and returns a present
-     * entry for the ktext PML4 slot, it's likely correct.
-     */
-    uint64_t ktext_pml4_idx = (ktext_base >> PML4_SHIFT) & PT_INDEX_MASK;
+    /* Navigate to pm_pml4 */
+    uint64_t proc = read8(curthread + TD_PROC);
+    out[7] = proc;  /* show in visible slot for diagnostics */
 
-    /* Candidates from etaHEN + standard FreeBSD, ordered by likelihood */
-    static const uint64_t dmap_candidates[] = {
-        0xFFFFFF0000000000ULL,  /* DMPML4I=0xFE, DMPDPI=0 (PS5 most likely) */
-        0xFFFFFE8000000000ULL,  /* DMPML4I=0xFD, DMPDPI=2 */
-        0xFFFFF80000000000ULL,  /* DMPML4I=0xF0, DMPDPI=0 (standard FreeBSD) */
-        0xFFFF808000000000ULL,  /* DMPML4I=0x01, DMPDPI=2 */
-        0xFFFF800000000000ULL,  /* DMPML4I=0x00, DMPDPI=0 */
-    };
-    #define NUM_DMAP_CANDIDATES 5
+    if (proc) {
+        uint64_t vmspace = read8(proc + PROC_P_VMSPACE);
+        if (vmspace) {
+            /* On PS5, vm_pmap is a pointer at vmspace+0x1D0 */
+            uint64_t pmap = read8(vmspace + VMSPACE_PMAP_PTR);
+            if (pmap) {
+                uint64_t pm_pml4 = read8(pmap + PMAP_PM_PML4);
 
-    uint32_t found_idx = 0;
-    uint64_t first_success_val = 0;
+                if (pm_pml4 && pm_pml4 > 0xFFFF800000000000ULL) {
+                    dmap_base = pm_pml4 - pml4_pa;
+                    dmap_accessible = 1;
+                }
 
-    for (uint32_t i = 0; i < NUM_DMAP_CANDIDATES; i++) {
-        uint64_t candidate = dmap_candidates[i];
-
-        /* Write progress to slot 8 BEFORE each attempt (crash diagnostic) */
-        out[8] = 0xD0000000ULL | (i + 1);
-
-        /* Try reading PML4 entry for ktext through this candidate */
-        uint64_t test_addr = candidate + pml4_pa + ktext_pml4_idx * 8;
-        uint64_t entry = 0;
-
-        if (safe_read8(test_addr, &entry)) {
-            if (!first_success_val) first_success_val = entry;
-
-            if (entry & PTE_PRESENT) {
-                dmap_base = candidate;
-                found_idx = i + 1;
-                dmap_accessible = 1;
-                break;
+                /* Pack pmap diagnostic into slot 7:
+                 * Show pm_pml4 (the key value) — it's always non-zero */
+                out[7] = pm_pml4;
+            } else {
+                out[7] = 0xDEAD0003;  /* pmap null */
             }
+        } else {
+            out[7] = 0xDEAD0002;  /* vmspace null */
         }
+    } else {
+        out[7] = 0xDEAD0001;  /* proc null */
     }
 
-    out[4]  = dmap_base;
-    out[8]  = 0xD0000000ULL | ((uint64_t)NUM_DMAP_CANDIDATES << 16) | found_idx;
-    out[9]  = first_success_val;
+    out[4] = dmap_base;
 
     if (!dmap_accessible) {
-        out[10] = 0xDEAD0001;
         out32[1] = 0x0003;  /* partial result */
         out[63] = 0xdeadbeefcafe0025ULL;
         return 0;
     }
 
     /* Read PML4 entry for ktext region (now using confirmed DMAP) */
+    uint64_t ktext_pml4_idx = (ktext_base >> PML4_SHIFT) & PT_INDEX_MASK;
     uint64_t pml4_ktext_addr = dmap_base + pml4_pa + ktext_pml4_idx * 8;
     uint64_t pml4_ktext_entry = 0;
     safe_read8(pml4_ktext_addr, &pml4_ktext_entry);
