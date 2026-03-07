@@ -1976,10 +1976,74 @@ static void _kldload(void* data, size_t data_size)
         }
 
         /* Dump raw readback */
-        printf("[debug] kthread_args readback:\n");
-        for (int i = 0; i < 36; i++) {
-            if (readback[i] != 0 || i < 4)
-                printf("  [%#04x] %#018lx\n", i * 8, readback[i]);
+        uint32_t status = (uint32_t)(readback[0] >> 32);
+        printf("[debug] kthread_args readback (status=0x%x):\n", status);
+
+        if (status == 0x008C) {
+            /* v8c: apic_ops byte probe results */
+            uint64_t ktext = readback[2];
+            printf("\n=== v8c APIC_OPS BYTE PROBE ===\n");
+            printf("  kdata_base:  %#lx\n", readback[1]);
+            printf("  ktext_base:  %#lx\n", ktext);
+            printf("  td_pcb:      %#lx\n", readback[3]);
+
+            static const char* slot_names[] = {
+                "create", "init", "xapic_mode", "is_x2apic",
+                "setup", "dump", "disable", "set_id",
+                "ipi_raw", "ipi_vectored", "ipi_wait", "ipi_alloc",
+                "ipi_free", "set_lvt_mask", "set_lvt_mode", "set_lvt_polarity",
+                "set_lvt_triggermode", "lvt_eoi_clear", "set_tpr", "get_timer_freq",
+                "timer_enable_intr", "timer_disable_intr", "timer_set_divisor",
+                "timer_initial_count", "timer_current_count", "self_ipi",
+                "unknown_26", "unknown_27"
+            };
+
+            printf("\n  %-4s %-24s %-18s %s\n", "Slot", "Name", "ktext offset", "byte@fn-1");
+            printf("  %-4s %-24s %-18s %s\n", "----", "----", "------------", "---------");
+            for (int i = 0; i < 28; i++) {
+                uint64_t fn = readback[4 + i];
+                uint64_t byte_result = readback[32 + i];
+                const char* name = slot_names[i];
+
+                if (fn == 0) {
+                    printf("  [%2d] %-24s (null)\n", i, name);
+                } else {
+                    const char* tag = "";
+                    if (byte_result == 0xFA) tag = " FAULT";
+                    else if (byte_result == 0xCC) tag = " <<< CC (INT3)";
+                    else if (byte_result == 0xC3) tag = " (ret)";
+                    else if (byte_result == 0x90) tag = " (nop)";
+                    printf("  [%2d] %-24s ktext+%-12lx 0x%02lx%s\n",
+                           i, name, fn - ktext, byte_result, tag);
+                }
+            }
+
+            uint64_t cc_bitmap = readback[60];
+            uint64_t fault_bitmap = readback[61];
+            uint64_t probe_count = readback[62];
+            printf("\n  cc_bitmap:    0x%08lx\n", cc_bitmap);
+            printf("  fault_bitmap: 0x%08lx\n", fault_bitmap);
+            printf("  probes done:  %lu / 28\n", probe_count);
+
+            if (cc_bitmap) {
+                printf("\n  >>> CC-PADDED ENTRIES (safe doreti_iret bounce targets): <<<\n");
+                for (int i = 0; i < 28; i++) {
+                    if (cc_bitmap & (1ULL << i)) {
+                        printf("  >>> [%2d] %s at ktext+%#lx <<<\n",
+                               i, slot_names[i], readback[4 + i] - ktext);
+                    }
+                }
+            } else {
+                printf("\n  No CC-padded entries found.\n");
+            }
+
+            printf("  end_marker:   %#lx\n", readback[63]);
+        } else {
+            /* Generic dump for other payloads */
+            for (int i = 0; i < 64; i++) {
+                if (readback[i] != 0 || i < 4)
+                    printf("  [%#04x] %#018lx\n", i * 8, readback[i]);
+            }
         }
     }
 }

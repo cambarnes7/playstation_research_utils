@@ -984,5 +984,18 @@ idx  ktext offset  PS5 name (kldload)       FreeBSD header name
 
 **Cross-boot verification**: Second boot (ktext=0xffffffffc4ae0000) confirmed all 28 offsets identical. Entry [25] offset corrected from +0x4F69F0 to +0x5569F0 (arithmetic error in first analysis).
 
-**Next**: Need pcb_onfault-protected byte probing to determine CC padding for each entry.
+### Phase 9c: v8c — Safe Byte Probing with pcb_onfault
+
+Built v8c canary using the proven pcb_onfault pattern from `pivot_scan_safe`. For each of the 28 apic_ops entries, arms pcb_onfault before reading fn-1, with fault recovery via saved_rsp restoration. Magic written last with mfence.
+
+Safety measures:
+- pcb_onfault armed before every read, cleared after every read
+- RSP saved/restored on fault path
+- Only reads 1 byte per probe (no writes, no execution)
+- NULL check before probing
+- td_pcb validated non-NULL before any probing begins
+
+Reports: cc_bitmap (which entries have CC/INT3 at fn-1), fault_bitmap (which faulted), per-entry byte values. Kldload updated with formatted v8c display.
+
+**Status**: Built (736 bytes), awaiting deployment.
 
