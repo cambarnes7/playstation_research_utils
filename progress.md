@@ -379,11 +379,58 @@ Shifted focus from gadget scanning to exploiting the suspend/resume path. The hy
 - Guest PTE modifications persist (NX clearing survives)
 - PCB hijack CAN execute code on resume (v2 proven) but unreliable and too late for HV probing
 
-## Next Steps
+## Phase 4: ktext Gadget Discovery (via FreeBSD Source + Known Offsets)
 
-The path forward requires finding useful **ktext gadgets** to point apic_ops[2] at during resume. Since we can't inject custom code (NPT NX blocks it) and can't read ktext (XOM), we need:
+**Status: IN PROGRESS**
 
-1. **Identify ktext gadgets** that do something useful when called as apic_ops[2] during LAPIC resume
-2. **Register state mapping** — determine exact register values at the apic_ops[2] call site during resume (reg_probe captured normal-ops state; resume state may differ)
-3. **ROP via cpu_switch**: If we can find a gadget that loads a PCB pointer from a register we control, we can pivot to cpu_switch's restore half → stack pivot → ROP chain in kdata
-4. **Alternative: explore other resume-time hooks** — are there other function pointers in kdata called during resume besides apic_ops?
+### Key Breakthrough: We Don't Need to Read ktext
+
+FreeBSD source code reveals the exact behavior of functions at known ktext offsets. Two critical functions from `cpu_switch.S`:
+
+- **`savectx(pcb)`** — takes PCB pointer in **RDI**, saves ALL CPU state (GPRs, CRs, DRs, MSRs, GDT/IDT/LDT/TR) to it, returns 1
+- **`resumectx(pcb)`** — takes PCB pointer in **RDI**, restores EVERYTHING from it (including RSP and RIP), effectively "returns" to saved context
+
+Both are in ktext (same compilation unit as cpu_switch), so they survive NPT NX enforcement.
+
+**If RDI points to writable memory we control when apic_ops[2] is called → `resumectx` gives total CPU state control from a fake PCB in kdata.**
+
+### FreeBSD apic_ops Struct Layout (confirmed from source)
+
+```
+apic_ops[0]  = create(u_int, int)
+apic_ops[1]  = init(vm_paddr_t)
+apic_ops[2]  = xapic_mode(void)     ← our hijack target
+apic_ops[3]  = is_x2apic(void)
+apic_ops[4]  = setup(int)
+apic_ops[5]  = dump(const char *)
+apic_ops[6]  = disable(void)
+apic_ops[7]  = eoi(void)
+...28 total entries
+```
+
+Sony modified `xapic_mode` to return `int` (1 for XAPIC mode) instead of FreeBSD's `void`. It takes NO arguments — RDI is whatever the caller happened to have.
+
+### ACPI Suspend/Resume Path (from FreeBSD source)
+
+```
+SUSPEND: acpi_sleep_machdep() → savectx(susppcbs[0]) → enters S3
+RESUME:  ACPI wakeup code → resumectx(susppcbs[0]) → kernel continues
+```
+
+`susppcbs` is a globally allocated array of PCBs. The pointer is patched into low-memory ACPI wakeup code via `WAKECODE_FIXUP`. `resumectx` is called very early in resume with RDI = susppcbs[0].
+
+### New Payloads Built
+
+#### register_capture (`examples/register_capture/`)
+Installs a trampoline at kdata+0x400 that captures ALL 16 GPRs + RSP + RFLAGS + return address when the kernel calls apic_ops[2] during normal LAPIC operations. Writes to kdata+0x200 capture buffer. Restores original apic_ops[2] after capture.
+
+**Critical output**: RDI value at call site determines which gadget approach works.
+
+#### savectx_finder (`examples/savectx_finder/`)
+Scans kdata for pointers in range [cpu_switch, cpu_switch+0x2000] to locate savectx/resumectx addresses. Also scans ACPI low-memory wakeup region for suspend PCB references.
+
+### Next Steps
+
+1. **Deploy register_capture** → learn RDI and all register values at apic_ops[2] call site
+2. **Deploy savectx_finder** → find exact savectx/resumectx ktext addresses
+3. **Based on results**: if RDI → controllable memory, point apic_ops[2] at `resumectx` with fake PCB for full CPU state control via ROP chain in kdata
