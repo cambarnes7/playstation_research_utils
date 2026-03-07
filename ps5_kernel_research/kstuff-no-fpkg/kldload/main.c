@@ -146,8 +146,46 @@ static void _kldload(void* data, size_t data_size)
                 if (poll % 4 == 3)
                     printf("[debug] SRCP still capturing... (%d.%ds elapsed)\n",
                            (poll + 1) / 2, ((poll + 1) % 2) * 5);
+            } else if (magic_chk == 0x5043424F) { /* PCBO — fast-track */
+                /* PCBO kernel thread is running a persistence loop that may
+                 * trigger a watchdog after ~3-5 seconds. Read only what we
+                 * need (phase + kdata_base) and if phase==1, immediately
+                 * set gate=1 and enter standby — no readback, no printing. */
+                uint64_t phase_word = kekcall_read_kmem(5, kthread_args + 3 * 8);
+                uint64_t pcbo_phase = phase_word;
+
+                printf("[PCBO] detected after %d.%ds, phase=%lu\n",
+                       (poll + 1) / 2, ((poll + 1) % 2) * 5, pcbo_phase);
+                fflush(stdout);
+
+                if (pcbo_phase == 1) {
+                    /* Armed — race the watchdog! */
+                    uint64_t kdata_base_val = kekcall_read_kmem(5, kthread_args + 1 * 8);
+                    uint64_t gate_addr = kdata_base_val + 0x460;
+
+                    printf("[PCBO] FAST-TRACK: gate=1 + standby NOW (kdata=%#lx)\n",
+                           kdata_base_val);
+                    fflush(stdout);
+
+                    uint64_t gate_val = 1;
+                    kekcall_copyin(&gate_val, gate_addr, 8);
+
+                    int sret = sceSystemStateMgrEnterStandby();
+                    printf("[PCBO] sceSystemStateMgrEnterStandby() returned %d\n", sret);
+                    if (sret != 0) {
+                        printf("[PCBO] AUTO-STANDBY FAILED (ret=%d). Enter rest mode MANUALLY!\n", sret);
+                    }
+                    fflush(stdout);
+                    /* Don't bother with readback — console is going to sleep */
+                    return;
+                }
+                /* phase != 1 (dry run or phase 2) — fall through to normal readback */
+                usleep(500000); /* brief settle */
+                printf("[debug] PCBO non-armed phase, doing full readback\n");
+                completed = 1;
+                break;
             } else if (magic_chk != 0) {
-                /* Non-SRCP payload wrote its magic — give it 1 more second */
+                /* Non-SRCP/non-PCBO payload wrote its magic — give it 1 more second */
                 usleep(1000000);
                 printf("[debug] payload completed (magic=%#x) after %d.%ds\n",
                        magic_chk, (poll + 1) / 2 + 1, ((poll + 1) % 2) * 5);
