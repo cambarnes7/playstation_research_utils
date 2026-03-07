@@ -102,7 +102,7 @@ int module_start(kproc_args* args)
      * - r15 = td_pcb base address
      * - r14 = test_offset
      * - Write recovery address to pcb+offset
-     * - Attempt faulting read from 0xDEAD000000000000
+     * - Attempt faulting read from 0xFFFFDEAD00000000 (canonical unmapped → #PF)
      * - Recovery label sets 0xCAFE0001 marker
      */
     __asm__ volatile(
@@ -116,7 +116,7 @@ int module_start(kproc_args* args)
         "movq %%rax, (%%r14)\n\t"       /* pcb[offset] = recovery */
 
         /* Attempt faulting read */
-        "movabsq $0xDEAD000000000000, %%rax\n\t"
+        "movabsq $0xFFFFDEAD00000000, %%rax\n\t"
         "movq (%%rax), %%rbx\n\t"       /* SHOULD FAULT */
 
         /* No fault path */
