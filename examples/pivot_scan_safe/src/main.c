@@ -26,16 +26,12 @@
  *   [4]   dmap_base (confirmed, or default if not found)
  *   [5]   td_pcb
  *   [6]   phase (1=dmap_test, 2=pagewalk, 3=ktext_read, 4=done)
- *   -- Phase 0 diagnostics --
+ *   -- Phase 0+1: diagnostics + DMAP discovery --
  *   [7]   safe_read8 diag (0xAAAA0001=ok, 0xDEAD0000=fault)
- *   [8]   kdata first 8 bytes
- *   [9]   PCB first 8 bytes
- *   -- Phase 1: DMAP discovery --
- *   [10]  indices_tried
- *   [11]  found_idx (PML4 index)
- *   [12]  pml4_dmap_entry (DMAP's own PML4 entry)
- *   [13]  first_success_val (first readable PML4 entry)
- *   [14]  error code if DMAP not found (0xDEAD0001)
+ *   [8]   (indices_tried<<32) | 0xD0000000 | found_idx  [packed, always non-zero]
+ *   [9]   pml4_dmap_entry (DMAP's own PML4 entry, 0 if not found)
+ *   [10]  first_success_val (first readable PML4 value)
+ *   [11]  error code if DMAP not found (0xDEAD0001)
  *   -- Phase 2-3: ktext access --
  *   [15]  pml4_ktext_entry
  *   [16]  first_ktext_page_pa
@@ -306,16 +302,9 @@ int module_start(kproc_args* args)
     uint64_t diag_val = 0;
     int diag_ok = safe_read8(kdata_base, &diag_val);
     out[7] = diag_ok ? 0xAAAA0001 : 0xDEAD0000;  /* safe_read8 diagnostic */
-    out[8] = diag_val;  /* first 8 bytes of kdata */
-
-    /* Also test td_pcb itself */
-    uint64_t diag_pcb = 0;
-    safe_read8(td_pcb, &diag_pcb);
-    out[9] = diag_pcb;  /* first 8 bytes of PCB */
 
     if (!diag_ok) {
-        /* safe_read8 itself is broken — no point continuing */
-        out[10] = 0xDEAD0000;
+        out[8] = 0xDEAD0000;
         out32[1] = 0x0003;
         out[63] = 0xdeadbeefcafe0025ULL;
         return 0;
@@ -327,46 +316,31 @@ int module_start(kproc_args* args)
     int dmap_accessible = 0;
 
     /*
-     * DMAP maps all physical RAM at a fixed VA base aligned to 512GB (1 PML4 slot).
-     * The base is kernel-half: PML4 indices 256..511.
-     *
-     * Strategy: For each candidate PML4 index, compute candidate_base and try
-     * reading candidate_base + pml4_pa (the PML4 table itself via DMAP).
-     * If the read succeeds and the value looks like a present page table entry,
-     * we found the DMAP base.
-     *
-     * We read PML4 entry 0 (kernel entry) through each candidate — if candidate
-     * is DMAP, then reading the PML4 via DMAP should give us a valid entry.
-     * PML4[0] is typically not present (NULL guard), but PML4[256+] should be.
-     * So we read PML4 entry 511 (ktext region) which must be present.
+     * DMAP maps all physical RAM at a fixed VA base aligned to 512GB.
+     * Scan kernel-half PML4 indices 256..509.
+     * For each candidate, try reading the ktext PML4 entry (known-present)
+     * through that candidate DMAP mapping. If read succeeds + entry present,
+     * cross-validate by reading the candidate's own PML4 entry.
      */
     uint64_t pml4_dmap_entry = 0;
     uint32_t found_idx = 0;
     uint32_t indices_tried = 0;
-    uint64_t first_success_val = 0;  /* diagnostic: first readable value */
+    uint64_t first_success_val = 0;
 
-    /* ktext PML4 index — this MUST be present in any valid kernel page table */
     uint64_t ktext_pml4_idx = (ktext_base >> PML4_SHIFT) & PT_INDEX_MASK;
 
     for (uint32_t idx = 256; idx < 510; idx++) {
         uint64_t candidate = 0xFFFF000000000000ULL | ((uint64_t)idx << PML4_SHIFT);
-
-        /*
-         * Try reading a KNOWN-PRESENT PML4 entry (ktext's) through this
-         * candidate DMAP base. This avoids the chicken-and-egg problem:
-         * we don't need the DMAP PML4 entry to be at index `idx`.
-         */
         uint64_t test_addr = candidate + pml4_pa + ktext_pml4_idx * 8;
         uint64_t entry = 0;
 
         indices_tried++;
 
         if (safe_read8(test_addr, &entry)) {
-            /* Read succeeded through this candidate */
             if (!first_success_val) first_success_val = entry;
 
             if (entry & PTE_PRESENT) {
-                /* Cross-validate: also read pml4[idx] (DMAP's own entry) */
+                /* Cross-validate: read pml4[idx] (DMAP's own entry) */
                 uint64_t self_addr = candidate + pml4_pa + idx * 8;
                 uint64_t self_entry = 0;
                 if (safe_read8(self_addr, &self_entry) && (self_entry & PTE_PRESENT)) {
@@ -380,14 +354,15 @@ int module_start(kproc_args* args)
         }
     }
 
-    out[4] = dmap_base;
-    out[10] = indices_tried;
-    out[11] = found_idx;
-    out[12] = pml4_dmap_entry;
-    out[13] = first_success_val;
+    /* Pack DMAP discovery results densely right after safe_read8 diag.
+     * Slot 8 is guaranteed non-zero (indices_tried >= 1 + marker bit). */
+    out[4]  = dmap_base;
+    out[8]  = ((uint64_t)indices_tried << 32) | 0xD0000000ULL | found_idx;
+    out[9]  = pml4_dmap_entry;       /* DMAP's own PML4 entry (0 if not found) */
+    out[10] = first_success_val;     /* first readable PML4 value */
 
     if (!dmap_accessible) {
-        out[14] = 0xDEAD0001;
+        out[11] = 0xDEAD0001;
         out32[1] = 0x0003;  /* partial result */
         out[63] = 0xdeadbeefcafe0025ULL;
         return 0;
