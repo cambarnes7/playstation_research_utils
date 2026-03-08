@@ -12,8 +12,11 @@
  * proximity — without executing a single unknown address.
  *
  * Mode (via fw_ver):
- *   0x403:  FULL SCAN — scan kdata regions for all ktext pointers
- *           Reports sorted unique ktext pointers with gap analysis
+ *   0x403:  FULL SCAN page 0 — sorted unique ktext pointers (entries 0-56)
+ *   0x405:  FULL SCAN page 1 — entries 57-113
+ *   0x406:  FULL SCAN page 2 — entries 114-170
+ *   0x407:  FULL SCAN page 3 — entries 171-227
+ *   0x408:  FULL SCAN page 4 — entries 228-269
  *
  *   0x404:  TARGETED SCAN — scan for pointers near cpu_switch
  *           Shows kdata locations that reference cpu_switch vicinity
@@ -24,11 +27,11 @@
  *   [1]   kdata_base
  *   [2]   ktext_base
  *   [3]   cpu_switch_addr
- *   [4]   total_unique_ptrs (mode 0x403) or total_hits (mode 0x404)
- *   [5]   scan_bytes_total
+ *   [4]   total_unique_ptrs (all modes) or total_hits (0x404)
+ *   [5]   scan_bytes_total | page(8) << 56 | entries_this_page(16) << 40
  *
- *   Mode 0x403:
- *     [6 + i]  sorted unique ktext pointers (up to 270)
+ *   Mode 0x403/0x405-0x408 (paged full scan):
+ *     [6 + i]  sorted unique ktext pointers (up to 57 per page)
  *
  *   Mode 0x404:
  *     [6 + i*3 + 0]  kdata address where pointer was found
@@ -54,6 +57,7 @@
 #define MAX_UNIQUE       270
 #define MAX_TARGETED     80
 #define OUT_SLOTS        280
+#define PAGE_ENTRIES     57   /* entries 6..62 visible in 0x1f8 readback */
 
 typedef struct {
     uint64_t kdata_base;
@@ -149,12 +153,23 @@ int module_start(kproc_args* args)
     uint64_t ktext_end = ktext_base + KTEXT_SIZE;
     uint64_t cpu_switch = kdata_base + CPU_SWITCH_OFF;
 
+    /* Determine if this is a paged full-scan mode */
+    int page = -1;
+    uint32_t scan_mode = mode;
+    if (mode == 0x403) {
+        page = 0;
+        scan_mode = 0x403;
+    } else if (mode >= 0x405 && mode <= 0x408) {
+        page = (int)(mode - 0x404);  /* 0x405=1, 0x406=2, 0x407=3, 0x408=4 */
+        scan_mode = 0x403;
+    }
+
     out32[0] = MAGIC_KSCN;
     out[1] = kdata_base;
     out[2] = ktext_base;
     out[3] = cpu_switch;
 
-    int max_count = (mode == 0x403) ? MAX_UNIQUE : MAX_TARGETED;
+    int max_count = (scan_mode == 0x403) ? MAX_UNIQUE : MAX_TARGETED;
     int count = 0;
     uint64_t bytes_scanned = 0;
 
@@ -176,35 +191,62 @@ int module_start(kproc_args* args)
 
     /* Region 1: main kdata structures */
     count = scan_region(kdata_base, kdata_base + 0x200000,
-                        ktext_base, ktext_end, mode, cpu_switch,
+                        ktext_base, ktext_end, scan_mode, cpu_switch,
                         out, count, max_count);
     bytes_scanned += 0x200000;
 
     /* Region 2: pcpu/IDT area */
     count = scan_region(kdata_base + 0x6400000, kdata_base + 0x6600000,
-                        ktext_base, ktext_end, mode, cpu_switch,
+                        ktext_base, ktext_end, scan_mode, cpu_switch,
                         out, count, max_count);
     bytes_scanned += 0x200000;
 
     /* Region 3: extended sysent */
     count = scan_region(kdata_base + 0xD00000, kdata_base + 0xD20000,
-                        ktext_base, ktext_end, mode, cpu_switch,
+                        ktext_base, ktext_end, scan_mode, cpu_switch,
                         out, count, max_count);
     bytes_scanned += 0x20000;
 
     /* Region 4: driver vtable area (apic_ops etc.) */
     count = scan_region(kdata_base + 0x150000, kdata_base + 0x1A0000,
-                        ktext_base, ktext_end, mode, cpu_switch,
+                        ktext_base, ktext_end, scan_mode, cpu_switch,
                         out, count, max_count);
     bytes_scanned += 0x50000;
 
-    /* Sort unique pointers for mode 0x403 */
-    if (mode == 0x403 && count > 0) {
+    /* Sort unique pointers for full-scan modes */
+    if (scan_mode == 0x403 && count > 0) {
         sort_u64((uint64_t*)&out[6], count);
     }
 
+    /*
+     * For paged full-scan: move the requested page slice to out[6..62].
+     * The full sorted array is in out[6..6+count-1].
+     * Page N shows entries [N*57 .. (N+1)*57-1].
+     */
+    int entries_this_page = 0;
+    if (page >= 0 && count > 0) {
+        int start_idx = page * PAGE_ENTRIES;
+        int end_idx = start_idx + PAGE_ENTRIES;
+        if (end_idx > count) end_idx = count;
+
+        if (start_idx < count) {
+            entries_this_page = end_idx - start_idx;
+            /* If page > 0, shift entries down to out[6] */
+            if (page > 0) {
+                for (int i = 0; i < entries_this_page; i++)
+                    out[6 + i] = out[6 + start_idx + i];
+                /* Clear remaining slots */
+                for (int i = entries_this_page; i < PAGE_ENTRIES; i++)
+                    out[6 + i] = 0;
+            }
+        }
+    }
+
     out[4] = (uint64_t)count;
-    out[5] = bytes_scanned;
+    /* Pack: bytes_scanned(40) | page(8) << 56 | entries_this_page(16) << 40 */
+    out[5] = (bytes_scanned & 0xFFFFFFFFFFULL)
+           | ((uint64_t)(page >= 0 ? page : 0) << 56)
+           | ((uint64_t)entries_this_page << 40);
     out32[1] = 0x0001; /* status = completed */
     out[279] = SENTINEL;
 
