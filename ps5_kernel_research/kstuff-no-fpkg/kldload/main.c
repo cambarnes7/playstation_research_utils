@@ -1979,7 +1979,69 @@ static void _kldload(void* data, size_t data_size)
         uint32_t status = (uint32_t)(readback[0] >> 32);
         printf("[debug] kthread_args readback (status=0x%x):\n", status);
 
-        if (status == 0x0191) {
+        if (status == 0x110A || status == 0x010A) {
+            /* v10a: fn-2 / fn-1 byte probe */
+            uint64_t ktext = readback[2];
+            int target_idx = (int)readback[33];
+            uint64_t target_fn = readback[34];
+            uint64_t probe_addr = readback[35];
+            uint64_t call_result = readback[36];
+            uint64_t verdict_code = readback[37];
+            uint64_t probe_type = readback[38];
+
+            static const char* names10[] = {
+                "create", "init", "xapic_mode", "is_x2apic",
+                "setup", "dump", "disable", "set_id",
+                "ipi_raw", "ipi_vectored", "ipi_wait", "ipi_alloc",
+                "ipi_free", "set_lvt_mask", "set_lvt_mode", "set_lvt_polarity",
+                "set_lvt_triggermode", "lvt_eoi_clear", "set_tpr", "get_timer_freq",
+                "timer_enable_intr", "timer_disable_intr", "timer_set_divisor",
+                "timer_initial_count", "timer_current_count", "self_ipi",
+                "unknown_26", "unknown_27"
+            };
+            const char* entry_name = (target_idx < 28) ? names10[target_idx] : "???";
+
+            printf("\n=== v10a BYTE PROBE (fn-%lu) %s ===\n",
+                   probe_type, status == 0x110A ? "COMPLETE" : "CRASHED");
+            printf("  kdata_base:  %#lx\n", readback[1]);
+            printf("  ktext_base:  %#lx\n", ktext);
+            printf("  step:        %#lx\n", readback[32]);
+            printf("  TARGET: [%d] %s\n", target_idx, entry_name);
+            if (target_fn)
+                printf("  fn ptr:      %#lx (ktext+%#lx)\n", target_fn, target_fn - ktext);
+            printf("  probe addr:  %#lx (fn-%lu)\n", probe_addr, probe_type);
+
+            if (status == 0x110A) {
+                printf("  RAX result:  %#lx\n", call_result);
+
+                if (verdict_code == 1) {
+                    printf("\n  RESULT: RAX CHANGED (function executed)\n");
+                    printf("  fn-%lu byte led to function execution, RAX=%#lx\n",
+                           probe_type, call_result);
+                } else if (verdict_code == 2) {
+                    printf("\n  RESULT: SENTINEL UNCHANGED (ret/NOP+ret/REX+ret)\n");
+                    printf("  fn-%lu is likely: 48(REX.W), 90(NOP), 66(data16), or similar prefix\n",
+                           probe_type);
+                } else if (verdict_code == 3) {
+                    printf("\n  RESULT: FAULTED (#PF caught by pcb_onfault)\n");
+                } else {
+                    printf("\n  RESULT: UNKNOWN (verdict=%lu)\n", verdict_code);
+                }
+            } else {
+                printf("\n  >>> CRASHED before completing <<<\n");
+                printf("  Step %#lx: %s\n", readback[32],
+                       readback[32] >= 0x100 ? "crashed DURING probe call" :
+                       readback[32] == 0x03 ? "crashed after IDT armed" :
+                       "crashed early");
+                if (readback[32] >= 0x100) {
+                    printf("  >>> fn-%lu likely caused stack pivot (leave;ret = C9 C3?) <<<\n",
+                           probe_type);
+                    printf("  >>> or #UD/#GP from invalid opcode <<<\n");
+                }
+            }
+
+            printf("  end_marker: %#lx\n", readback[63]);
+        } else if (status == 0x0191) {
             /* v9a: CC bounce ARM */
             printf("\n=== v9a CC BOUNCE — ARM ===\n");
             printf("  kdata_base:        %#lx\n", readback[1]);

