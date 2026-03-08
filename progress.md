@@ -1816,24 +1816,53 @@ Mode 0x4 calls rdmsr_start with a clean buffer to discover which PCB offsets rec
 Mode 0x2 arms apic_ops[2] with rdmsr_start for ACPI resume capture.
 Mode 0x3 scans kdata for LSTAR value to find the MSR dump after resume.
 
-**Status**: state_capture v4 built. Binary: `examples/state_capture/state_capture.bin`.
+**Status**: v4 crashed (kernel panic on Mode 0x4).
 
-### Deployment Plan (v4)
+### Phase 15: Root Cause — ALL Crashes Due to kdata Corruption (v5 Fix)
+
+**Root cause identified**: Every version (v1-v4) wrote zeros to `kdata_base + 0x400` to clear the
+PCB buffer. This offset falls in the kernel's live data segment, corrupting global variables,
+lock structures, or list heads. The crash was never caused by the function calls themselves —
+it was the buffer clear that destroyed kernel state.
+
+Evidence:
+- v3 original: 30-second delayed crash (corrupted a non-critical variable; probing then hit a destructive function)
+- v3 fixed (correct probe range): instant crash (kdata corruption + possibly #UD from non-aligned entry)
+- v4 (direct rdmsr_start call): instant crash (rdmsr_start is safe, but kdata+0x400 was zeroed before the call)
+
+**Fix (v5)**: PCB buffer moved from `kdata_base + 0x400` to `kthread_args + 0x800`.
+kthread_args is our own 4KB heap allocation (`kekcall_malloc(0x1000)`). Output slots use
+offsets 0x000-0x3FF, PCB buffer uses 0x800-0x9FF. No overlap, no kdata writes.
+
+**New Mode 0x5 — Pure Read-Only PCB Scanner**:
+- Scans kdata for existing PCBs created by kernel's own `savectx`/`cpu_switch` calls
+- Match criteria: CR3 at PCB offset 0x68 matches our kernel CR3, CR0 at offset 0x58 has PG+PE bits
+- Zero function calls, zero writes to kdata — safest possible approach
+- After ACPI suspend/resume, kernel's `savectx(susppcbs[0])` stores full CPU state including MSRs
+- Mode 0x5 re-scan after resume finds the suspend PCB with complete state
+
+**Status**: state_capture v5 built. Binary: `examples/state_capture/state_capture.bin`.
+
+### Deployment Plan (v5)
 
 ```bash
-# Mode 0x4: Call rdmsr_start, discover PCB MSR layout
+# Step 1: Mode 0x5 first (SAFEST — zero calls, zero kdata writes)
+# Scan for existing thread PCBs on fresh boot
+printf '\x05\x00\x00\x00' | nc PS5_IP 9022
+cat state_capture.bin | nc PS5_IP 9022
+# Expected: finds thread PCBs with CR3/CR0 matches, dumps up to 4
+
+# Step 2: Mode 0x4 (rdmsr_start call with FIXED heap buffer)
 printf '\x04\x00\x00\x00' | nc PS5_IP 9022
 cat state_capture.bin | nc PS5_IP 9022
-# Expected: returns 1, LSTAR offset found, MSR fields mapped
+# Expected: returns 1, MSR fields mapped, NO crash
 
-# Mode 0x2: ARM apic_ops[2] = rdmsr_start
-printf '\x02\x00\x00\x00' | nc PS5_IP 9022
+# Step 3: Put PS5 in rest mode via UI (kernel calls savectx → susppcbs[0])
+# Step 4: Resume PS5
+
+# Step 5: Mode 0x5 again — find suspend PCB with full CPU state
+printf '\x05\x00\x00\x00' | nc PS5_IP 9022
 cat state_capture.bin | nc PS5_IP 9022
-
-# Enter rest mode via PS5 UI, then resume
-
-# Mode 0x3: READBACK — scan for LSTAR to find MSR dump
-printf '\x03\x00\x00\x00' | nc PS5_IP 9022
-cat state_capture.bin | nc PS5_IP 9022
+# Expected: additional PCB(s) with LSTAR and full MSR state
 ```
 
