@@ -250,163 +250,137 @@ to/from physical addresses that the CPU can't access due to NPT/XOM.
 
 ## GPU DMA Strategy
 
+### Intelligence from psdevwiki.com/ps5/Vulnerabilities
+
+Key facts that shape the approach:
+
+1. **GPU DMA to kernel .data is a proven technique** (flatz, FW 6.00+)
+   - Uses `sceGnmSubmitCommandBuffers` + `sceGnmSubmitDone`
+   - Specifically from `libSceGnmDriverForNeoMode.sprx` (PS4 compat GNM driver)
+   - BD-J alternative: `Java.sun.awt.GnmUtils.copyPlanesBackgroundToPrimary`
+
+2. **Byepervisor bug #2**: "System-level debug flag in kernel .data, not wiped after rest mode"
+   - Can be SET via GPU DMA write to kdata
+   - Enables hypervisor exploitation
+   - Directly relevant to our rest mode persistence work
+
+3. **Hypervisor bypass vulnerability exists for ≤FW 4.51** — we're on 4.03, IN RANGE
+   - "Without a Hypervisor bypass/compromise, limited to data-only attacks"
+   - With HV bypass: can potentially disable NPT, XOM, NX — everything
+
+4. **CR0.WP/XOM bypass** — possibly unpatched until FW 5.00
+   - If this works on 4.03, we can read/write ktext without GPU DMA
+
+5. **CRITICAL SAFETY**: Reading ktext via DMAP/kernel_copyout WILL PANIC
+   - XOM is enforced by HV's NPT (nested page tables)
+   - Any CPU access (including DMAP physical read) goes through NPT
+   - Only GPU DMA bypasses NPT because GPU uses IOMMU instead
+   - NEVER attempt `kernel_copyout(PADDR_TO_DMAP(ktext_phys))`
+
 ### Why GPU DMA
 
-The core blocker is: **ktext is XOM (can't read or write) and NPT enforces NX on kdata during suspend**. Every approach so far has tried to work around this with blind gadget gambling and indirect techniques. All have failed or stalled.
+The core blocker is: **ktext is XOM (can't read or write) and NPT enforces NX on kdata during suspend**. CPU-based approaches cannot bypass this — the HV's NPT intercepts ALL CPU memory accesses.
 
-GPU DMA operates through the **IOMMU**, which is a completely separate protection domain from the CPU's NPT. The GPU's page tables are NOT the same as the hypervisor's nested page tables. This means:
+GPU DMA operates through the **IOMMU**, a completely separate protection domain. The GPU's I/O page tables are NOT the CPU's nested page tables. This means:
 
-- GPU may be able to **read ktext physical pages** → bypass XOM → find every gadget we need
-- GPU may be able to **write ktext physical pages** → inject code directly → persistence solved
-- GPU may be able to **read/write HV memory** → modify VMCB/NPT → disable protections entirely
+- GPU may read ktext physical pages → bypass XOM → find every gadget
+- GPU may write ktext physical pages → inject code → persistence solved
+- GPU may access VMCB/NPT structures → disable protections entirely
+- GPU DMA can SET the Byepervisor debug flag → enable HV exploitation
 
-**Proven on PS5**: flatz demonstrated GPU DMA to kernel .data on FW 6.00+ (bypasses HV write protection). On FW 4.03, the HV is less mature — IOMMU may be even more permissive.
+### What We Have
 
-### What We Already Have
-
-- `vaddr_to_paddr()` — working virtual-to-physical address translation (`usermode_phys_mem/include/dmem.h`)
-- `PADDR_TO_DMAP()` — DMAP-based physical memory access
-- `kernel_copyin/kernel_copyout` — kernel R/W primitives via PS5 Payload SDK
-- Known kernel offsets (ktext_base, kdata_base, DMAP base, CR3, etc.)
+- `vaddr_to_paddr()` — VA→PA translation via guest page table walk (SAFE — reads PTEs in kdata, not ktext content)
+- `kernel_copyin/kernel_copyout` — kernel R/W via PS5 Payload SDK
+- Known kernel offsets (ktext_base, kdata_base, DMAP, CR3, apic_ops, etc.)
 - etaHEN jailbreak on FW 4.03 with full kernel R/W
+- HV bypass vulnerability coverage (≤4.51)
 
-### What We Don't Know (Honest Assessment)
+### What We Don't Know
 
 | Question | Status | Risk |
 |----------|--------|------|
-| Can we call sceGnmSubmitCommandBuffers from a payload ELF? | Unknown | Medium — may need game context |
-| Does the IOMMU allow GPU reads of ktext physical pages? | Unknown | HIGH — this is the key bet |
-| Does the IOMMU allow GPU writes to ktext physical pages? | Unknown | HIGH — would be the ultimate win |
-| Can we fall back to direct SDMA MMIO programming? | Probable | Low — we have kernel R/W, can access any register |
-| What physical address ranges does the IOMMU permit? | Unknown | Need to probe empirically |
-
-### The Approach: Incremental, Each Phase Gives Data
+| Can we load libSceGnmDriverForNeoMode.sprx from etaHEN? | Unknown | Medium — may need game context |
+| Does the IOMMU allow GPU access to ktext physical pages? | Unknown | HIGH — the key bet |
+| Where is the Byepervisor debug flag in kdata? | Unknown | Medium — needs scanning |
+| Does CR0.WP bypass work on 4.03? | Unknown | Low risk to test |
+| What PM4 packet format does sceGnmSubmitCommandBuffers expect? | Partially known | Medium |
 
 ---
 
-### Phase 0: GNM API Accessibility Probe
+### Phase 0: GNM API Probe
 
-**Goal**: Determine if we can use the GNM (GPU) APIs from an etaHEN payload context.
+**Goal**: Load `libSceGnmDriverForNeoMode.sprx` and resolve `sceGnmSubmitCommandBuffers` + `sceGnmSubmitDone`.
 
-**Method**: PS5 Payload SDK ELF that attempts to:
-1. `sceKernelLoadStartModule("libSceGnmDriver.sprx")` — try loading the GNM driver
-2. If that fails, try `libSceGnmDriverForNeoMode.sprx`
-3. If loaded, resolve `sceGnmSubmitCommandBuffers` and `sceGnmSubmitDone` via dlsym
-4. Report addresses (or errors) back to host
+This is THE library used in confirmed GPU DMA exploits (psdevwiki). Priority target.
 
-**Outcome A (GNM accessible)**: Use high-level API path. Much easier.
-**Outcome B (GNM not accessible)**: Fall back to direct GPU MMIO programming (Phase 0b).
+**Outcome A**: GNM accessible → proceed to GPU DMA pipeline.
+**Outcome B**: GNM not accessible from etaHEN → options:
+  - Phase 5: Direct SDMA via PCI MMIO (find GPU BAR0, program SDMA ring)
+  - Try from game process context
+  - BD-J path (if disc available)
 
-**Phase 0b (fallback): Direct SDMA Engine Access**
+### Phase 1: PA Translation Self-Test
 
-If GNM APIs aren't available, we program the GPU's SDMA (System DMA) engine directly:
-1. Scan PCI config space to find GPU device (vendor 0x1002 = AMD)
-2. Read GPU MMIO BAR address from PCI config
-3. Map MMIO region via kernel R/W (we can read/write any physical address via DMAP)
-4. Locate SDMA ring buffer registers (SDMA0_GFX_RB_BASE, SDMA0_GFX_RB_RPTR, SDMA0_GFX_RB_WPTR)
-5. Submit SDMA_OP_COPY packets to the ring
-6. Ring doorbell to trigger processing
+Verify `vaddr_to_paddr()` works correctly by DMAP round-trip on userspace buffers.
+No kernel memory touched, no risk.
 
-The SDMA engine is simple: it copies data between physical addresses. No shaders, no GFX pipeline, no compute queues. AMD's open-source amdgpu driver documents all register offsets.
+### Phase 2: Kernel Address Mapping (SAFE)
 
----
+Walk guest page tables to translate ktext/kdata VAs to physical addresses.
+Report PTE flags (RW, NX, present) for each mapping.
 
-### Phase 1: GPU DMA Self-Test
+**SAFETY**: Only reads page table entries (stored in kdata). NEVER reads ktext content.
 
-**Goal**: Confirm GPU DMA works at all from our context.
+The physical addresses gathered here become GPU DMA targets in Phase 3/4.
 
-**Method**:
-1. Allocate two userspace buffers: `src` (fill with pattern 0xDEADBEEF) and `dst` (zeroed)
-2. Translate both to physical addresses via `vaddr_to_paddr()`
-3. Submit a GPU DMA copy: `src_phys → dst_phys`, 4096 bytes
-4. Verify `dst` now contains 0xDEADBEEF pattern
-5. Report success/failure
+Also reports the distinction: guest PTE flags are NOT what enforces XOM.
+XOM is enforced by the HV's NPT layer, which the guest page tables don't see.
 
-**If this fails**: GPU DMA pipeline is broken in our context. Need to debug (wrong ring buffer? IOMMU blocking userspace pages? Command format wrong?).
+### Phase 3: GPU DMA kdata Test
 
-**If this works**: We have a working GPU DMA primitive. Proceed to Phase 2.
+First actual GPU DMA operation — target kdata (CPU-readable, so we can verify).
+- GPU DMA copy: kdata_phys → userspace recv buffer
+- Compare GPU-read data with CPU-read data (kernel_copyout)
+- If they match → GPU DMA pipeline works, GPU can access kernel physical memory
 
----
+### Phase 4: GPU DMA ktext Read (XOM Bypass) — THE KEY EXPERIMENT
 
-### Phase 2: IOMMU Boundary Probe — THE KEY EXPERIMENT
+**If Phase 3 succeeds**: Attempt GPU DMA read of ktext physical pages.
+- GPU DMA copy: ktext_phys → userspace recv buffer
+- If recv buffer contains real instructions → **XOM IS BYPASSED**
+- If recv buffer is zeros/garbage or GPU faults → IOMMU blocks ktext, need Plan B
 
-**Goal**: Map what physical address ranges the GPU can access through the IOMMU.
+**If ktext readable**: Dump entire kernel .text (~12MB), disassemble offline, find every gadget.
 
-**Method**:
-1. Translate known kernel addresses to physical:
-   - `kdata_base` → `kdata_phys` (should work — proven on 6.00+)
-   - `ktext_base` → `ktext_phys` (the big question)
-   - DMAP region addresses → their backing physical pages
-2. For each physical address range, attempt a GPU DMA **read** (copy phys → userspace buffer):
-   - Read 64 bytes from kdata physical → compare with `kernel_copyout` of same address
-   - Read 64 bytes from ktext physical → if we get data, XOM is BYPASSED
-3. Log results: which ranges succeed, which cause errors/hangs
+**If ktext writable**: Inject handler directly into ktext padding. Game over for persistence.
 
-**Success criteria**:
-- kdata readable via GPU → confirms GPU DMA works for kernel memory (matches 6.00+ results)
-- ktext readable via GPU → **XOM bypass achieved** → can dump entire kernel .text
-- ktext writable via GPU → **game over** → write our handler directly into ktext
+### Phase 5: PCI/MMIO Probe (Fallback)
 
-**Failure modes**:
-- IOMMU blocks ktext physical pages → GPU DMA can't bypass XOM. Still useful for other things.
-- IOMMU blocks all kernel physical pages → GPU DMA only works for userspace memory. Dead end.
-- GPU hangs/panics → command format issue or IOMMU violation triggers system fault.
+If GNM APIs unavailable: scan PCI config space for AMD GPU (vendor 0x1002),
+read BAR0, probe SDMA engine registers. Direct SDMA ring programming as fallback.
 
----
+### Byepervisor Path (If GPU DMA to kdata works)
 
-### Phase 3: Exploit GPU DMA Capabilities
+Even if GPU DMA can't read ktext, it can WRITE to kdata. This enables:
 
-Depends entirely on Phase 2 results:
+1. Find the "system-level debug flag" in kdata (Byepervisor bug #2)
+2. Set it via GPU DMA write
+3. Flag survives rest mode (confirmed by psdevwiki)
+4. On resume, debug flag enables HV exploitation
+5. HV compromise → disable NPT → kdata becomes executable → persistence solved
 
-**If ktext is readable (XOM bypass)**:
-1. Dump entire ktext (~12MB) via GPU DMA reads
-2. Disassemble offline — find EVERY gadget, not just the handful we've been guessing at
-3. Find the perfect apic_ops[2] target: a function or gadget sequence that does exactly what we need
-4. Build the persistence hook with complete knowledge of available gadgets
-
-**If ktext is writable (ultimate win)**:
-1. Write a small handler (< 64 bytes) directly into ktext at an unused/padding location
-2. Handler: save regs, execute our logic (from kdata), restore regs, return 1
-3. Point apic_ops[2] at our injected ktext handler
-4. Survives suspend/resume because it IS ktext — NPT NX doesn't apply
-
-**If HV/VMCB is accessible**:
-1. Find VMCB physical address (scan for known patterns or derive from HV code analysis)
-2. Read NPT CR3 from VMCB → walk NPT page tables
-3. Modify NPT entries: clear NX bit on kdata pages
-4. Now kdata is executable during suspend → original apic_ops[2] → kdata handler approach works
-
----
-
-### Implementation Plan — Files to Create
-
-```
-gpu_dma/
-├── Makefile                    # PS5 Payload SDK build (userspace ELF)
-├── include/
-│   ├── dmem.h                  # Copy from usermode_phys_mem (vaddr_to_paddr)
-│   ├── gpu_dma.h               # GPU DMA abstraction (GNM or SDMA backend)
-│   └── pm4_packets.h           # AMD PM4/SDMA packet definitions
-├── src/
-│   ├── main.c                  # Phase selector (fw_ver-based, like other payloads)
-│   ├── gnm_probe.c             # Phase 0: GNM API resolution
-│   ├── sdma_direct.c           # Phase 0b: Direct SDMA MMIO programming
-│   ├── gpu_dma_selftest.c      # Phase 1: Self-test
-│   ├── iommu_probe.c           # Phase 2: IOMMU boundary mapping
-│   └── ktext_ops.c             # Phase 3: Read/write ktext
-└── freebsd-headers/            # Symlink to shared headers
-```
+This is a viable path even if IOMMU blocks ktext access.
 
 ### Risk Assessment
 
-| Phase | Risk of Failure | Impact of Failure | Recovery |
-|-------|----------------|-------------------|----------|
-| Phase 0 (GNM probe) | Medium | Low — fall back to SDMA | Phase 0b |
-| Phase 0b (SDMA direct) | Low | Medium — need kernel R/W for MMIO | Debug register offsets |
-| Phase 1 (self-test) | Low | High — means GPU DMA doesn't work at all | Debug command format |
-| Phase 2 (IOMMU probe) | **HIGH** | **HIGH** — if ktext not accessible, major goal blocked | Still useful for kdata ops |
-| Phase 3 (exploit) | Low (if Phase 2 works) | N/A | Depends on Phase 2 results |
-
-**The honest truth**: Phase 2 is the make-or-break. If the IOMMU blocks GPU access to ktext physical pages, GPU DMA can't bypass XOM. But the experiment is cheap — we either learn it works (huge win) or learn it doesn't (eliminate a hypothesis, move on). Either way, it's worth trying.
+| Phase | Risk | Impact | Recovery |
+|-------|------|--------|----------|
+| Phase 0 (GNM probe) | Medium | Low | Phase 5 / game context |
+| Phase 1 (PA self-test) | Very Low | Low | Debug translation code |
+| Phase 2 (address map) | Very Low | None | Safe, information only |
+| Phase 3 (GPU kdata) | Medium | Medium | Debug PM4 format |
+| Phase 4 (GPU ktext) | **HIGH** | **HIGH** | Byepervisor path |
+| Phase 5 (PCI/MMIO) | Low | Medium | Known AMD register map |
 
 ---
