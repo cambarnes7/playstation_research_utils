@@ -1407,9 +1407,49 @@ The pcb_onfault READ-based scan is hitting XOM walls for all real syscall handle
 
 But for finding `leave;ret` (C9 C3) gadgets, we need to **switch to execution-based probing** (v8f sentinel technique) for unique sysent fn ptrs. This bypasses XOM entirely since we CALL fn-1 rather than READ fn-1. Trade-off: one probe per boot for dangerous bytes (non-C3/non-CC), but it's the only way to probe execute-only pages.
 
-### Recommended Next Steps
+### Phase 12a: Sysent fn ptr Batch Dump (v10c)
 
-1. **Quick dedup scan**: Probe ~20 more entries via READ to map out nosys coverage. Focus on entries likely to be implemented (low-numbered POSIX syscalls with unique fn ptrs)
-2. **Execution-based v10b mode**: Add sentinel-in-RAX execution probing for sysent (like v8f for apic_ops). Probe fn-1 of unique, real syscall handlers
-3. **Priority targets**: Entries whose fn ptrs are at different ktext offsets from the main cluster — different compilation units may use `leave;ret`
+READ-based byte scanning hits XOM for all real syscall handlers. Before switching to execution-based probing, need to **deduplicate** the full 678-entry sysent table to identify the ~150 unique fn ptrs.
+
+**v10c adds dump mode** (`fw_ver = 0x9900 + batch`): pure kdata reads, no byte reads, no execution, completely safe. Dumps up to 284 fn ptrs per batch in 3 deployments.
+
+**fw_ver encoding:**
+```
+0x9900 → batch 0: sysent[0..283]   (284 entries)
+0x9901 → batch 1: sysent[284..567] (284 entries)
+0x9902 → batch 2: sysent[568..677] (110 entries)
+```
+
+**Output layout** (288 uint64_t slots, 2304 bytes):
+```
+out[0]     = MAGIC (lo32) + status (hi32): 0x110C = complete
+out[1]     = kdata_base
+out[2]     = ktext_base
+out[3]     = batch | (start_idx << 16) | (count << 32)
+out[4..4+count-1] = fn ptrs for sysent[start_idx..start_idx+count-1]
+```
+
+**Deployment** (3 sends, all safe — no reboots needed):
+```
+printf '\x00\x99\x00\x00' | nc 192.168.0.88 9022   # set fw_ver=0x9900
+cat resume_chain.bin | nc 192.168.0.88 9022          # batch 0
+
+printf '\x01\x99\x00\x00' | nc 192.168.0.88 9022   # set fw_ver=0x9901
+cat resume_chain.bin | nc 192.168.0.88 9022          # batch 1
+
+printf '\x02\x99\x00\x00' | nc 192.168.0.88 9022   # set fw_ver=0x9902
+cat resume_chain.bin | nc 192.168.0.88 9022          # batch 2
+```
+
+**Binary**: 1432 bytes, no .bss. All existing v10b probe modes preserved (0xAA-0xBC, 0xCC-0xEE).
+
+**Status**: Built, awaiting deployment.
+
+### Next Steps After Dedup
+
+1. Identify all unique fn ptrs from the 678-entry dump
+2. Classify by ktext offset range — entries from different compilation units are higher-priority targets
+3. Use execution-based probing (v8f sentinel technique) on the ~150 unique fn ptrs, prioritizing:
+   - Entries at unusual ktext offsets (different source files may use `leave;ret`)
+   - Entries with fn ptrs far from the main syscall handler cluster
 
