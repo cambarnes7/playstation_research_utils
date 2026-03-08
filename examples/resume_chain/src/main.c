@@ -307,7 +307,7 @@ int module_start(kproc_args *args)
         out[1] = kdata_base;
         out[2] = ktext_base;
         out[3] = (uint64_t)batch | ((uint64_t)start << 16) | ((uint64_t)count << 32);
-        out[5] = 0;  /* probes_completed */
+        out[5] = 0xD001;  /* step: header written */
 
         /* Write magic EARLY for crash-safe readback */
         out32[1] = 0x010D;  /* v10d in-progress */
@@ -319,6 +319,8 @@ int module_start(kproc_args *args)
         __asm__ volatile("movq %%gs:0, %0" : "=r"(curthread));
         uint64_t td_pcb = read8(curthread + TD_PCB);
         out[4] = td_pcb;
+        out[5] = 0xD002;  /* step: curthread/td_pcb read */
+        __asm__ volatile("mfence" ::: "memory");
 
         if (!td_pcb) {
             out32[1] = 0x00FF;
@@ -332,15 +334,22 @@ int module_start(kproc_args *args)
         uint64_t idt3_addr = idt_base + 3 * IDT_ENTRY_SIZE;
         uint64_t idt3_orig_lo = read8(idt3_addr);
         uint64_t idt3_orig_hi = read8(idt3_addr + 8);
+        out[5] = 0xD003;  /* step: IDT[3] saved */
+        __asm__ volatile("mfence" ::: "memory");
 
         uint64_t doreti_iret = kdata_base + (int64_t)OFF_DORETI_IRET;
         idt_set_handler(idt3_addr, doreti_iret, 0);
+        out[5] = 0xD004;  /* step: IDT[3] armed */
+        __asm__ volatile("mfence" ::: "memory");
 
         /* Probe each unique fn ptr in this batch */
         for (int i = 0; i < count; i++) {
             uint32_t off = unique_offsets[start + i];
             uint64_t fn = ktext_base + off;
             uint64_t probe_addr = fn - 1;  /* fn-1 */
+
+            out[5] = 0xD100 + i;  /* step: about to probe entry i */
+            __asm__ volatile("mfence" ::: "memory");
 
             uint64_t result = probe_call(probe_addr, onfault_addr);
 

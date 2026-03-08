@@ -177,7 +177,16 @@ static void _kldload(void* data, size_t data_size)
                 completed = 1;
                 break;
             } else if (magic_chk != 0) {
-                /* Non-PCBO payload — break to normal slow-poll path */
+                /* Non-PCBO payload — immediate diagnostic readback before slow-poll.
+                 * If the kernel panics during slow-poll sleep, we still see this output. */
+                printf("[diag] non-PCBO magic=%#x detected at poll #%d\n", magic_chk, bpoll);
+                printf("[diag] word0=%#lx (magic=%#x status=%#x)\n",
+                       word0, magic_chk, (uint32_t)(word0 >> 32));
+                for (int d = 1; d <= 5; d++) {
+                    uint64_t wd = kekcall_read_kmem(5, kthread_args + d * 8);
+                    printf("[diag] out[%d] = %#lx\n", d, wd);
+                }
+                fflush(stdout);
                 break;
             }
         }
