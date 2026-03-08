@@ -20,6 +20,9 @@
  * Mode (via fw_ver):
  *   0x5: CPUSTATE — complete CPU register snapshot (64 qwords)
  *   0x6: DUMP — curthread struct + td_pcb dump
+ *   0x7: SCAN — kdata heap pointer scanner (find susppcbs)
+ *         bits 8-31 of fw_ver = scan page (each page = 4MB)
+ *         bit 7 = broaden filter (0xffff???? instead of 0xffffff80 only)
  *
  * Output layout (uint64_t indices, 64 qwords = 0x200 bytes readback limit):
  *
@@ -337,6 +340,89 @@ int module_start(kproc_args *args)
         out32[0] = MAGIC_SCAP;
         out32[1] = (curthread && td_pcb) ? 0x0006 : 0x00FD;
         out[287] = 0xdeadbeefcafe0060ULL;
+        return 0;
+    }
+
+    if ((mode & 0x7f) == 0x7) {
+        /* ============================================================
+         * MODE 0x7: kdata heap pointer scanner
+         *
+         * Scans kdata for qwords with upper 32 bits == 0xffffff80.
+         * These are kernel heap pointers (PCBs, stacks).
+         * susppcbs in FreeBSD BSS is a pointer to heap-allocated PCBs
+         * in this range.
+         *
+         * Previous kdata scan (v5.1) found ZERO hits — probable -Os
+         * compiler bug. This version uses volatile everywhere and
+         * explicit per-qword reads to prevent optimization.
+         *
+         * fw_ver encoding:
+         *   bits 0-6:  mode (0x07)
+         *   bit 7:     if set, broaden filter to any 0xffff???? upper
+         *              (catches heap thread ptrs in 0xffff????... too)
+         *   bits 8-31: scan page (each page = 4MB = 0x400000 bytes)
+         *              page 0 = kdata_base, page 1 = kdata_base+4MB...
+         *
+         * Self-test: set page to cover GSBASE area. pc_curpcb at
+         * GSBASE+0x20 is always 0xffffff80... — validates scanner.
+         *
+         * Output layout (288 qwords):
+         *   [0]   magic | status
+         *   [1]   kdata_base
+         *   [2]   ktext_base
+         *   [3]   scan_base (start of scanned range)
+         *   [4]   scan_end
+         *   [5]   hit_count
+         *   [6]   last_scan_addr (where scanner stopped)
+         *   [7]   total_scanned (qwords checked)
+         *   [8..287] hits: pairs of (address, value), up to 140 hits
+         *   [287] end marker (if not overwritten by hits)
+         * ============================================================ */
+        uint32_t raw_fwver = args->fw_ver;
+        uint32_t page = raw_fwver >> 8;
+        uint32_t broad = (raw_fwver >> 7) & 1;
+
+        uint64_t scan_base = kdata_base + (uint64_t)page * 0x400000ULL;
+        uint64_t scan_end  = scan_base + 0x400000ULL;
+
+        for (int i = 0; i < 288; i++) out[i] = 0;
+
+        out[1] = kdata_base;
+        out[2] = ktext_base;
+        out[3] = scan_base;
+        out[4] = scan_end;
+
+        volatile uint64_t hit_count = 0;
+        volatile uint64_t total_scanned = 0;
+        volatile uint64_t last_addr = scan_base;
+
+        uint64_t addr;
+        for (addr = scan_base; addr < scan_end; addr += 8) {
+            volatile uint64_t val = *(volatile uint64_t *)addr;
+            uint32_t upper = (uint32_t)(val >> 32);
+            total_scanned++;
+
+            int match;
+            if (broad)
+                match = (upper >> 16) == 0xffff && upper != 0xffffffff;
+            else
+                match = upper == 0xffffff80;
+
+            if (match && hit_count < 140) {
+                out[8 + hit_count * 2]     = addr;
+                out[8 + hit_count * 2 + 1] = val;
+                hit_count++;
+            }
+            last_addr = addr;
+        }
+
+        out[5] = hit_count;
+        out[6] = last_addr;
+        out[7] = total_scanned;
+
+        out32[0] = MAGIC_SCAP;
+        out32[1] = 0x0007;
+        out[287] = 0xdeadbeefcafe0070ULL;
         return 0;
     }
 

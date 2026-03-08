@@ -46,6 +46,16 @@ to understand hypervisor behavior and kernel state management.
 - Repacked layout: 8 header slots + 56 per-CPU data slots
 - Successfully mapped struct pcpu layout
 
+### v6: Complete CPU State Snapshot (Session 4)
+- Added inline reads for CR0, CR2, CR4, EFER, STAR, CSTAR, SFMASK, FSBASE,
+  KGSBASE, XCR0 (xgetbv), DR0-DR7, GDT base/limit, IDT base/limit
+- AMD MSRs (SYSCFG, TOP_MEM, TOP_MEM2, VM_CR, VM_HSAVE_PA) caused instant
+  kernel panic (#GP trapped by hypervisor) — disabled in second run
+- All standard registers captured successfully in second run
+- **Key finding**: SVME=1 in EFER — SVM/AMD-V is enabled, kernel runs under hypervisor
+- **Key finding**: No hardware breakpoints (DR0-3=0, DR7=default) — HV not using debug regs
+- **Key finding**: XCR0=7 — x87+SSE+AVX available, no AVX-512
+
 ## Confirmed Data
 
 ### Constants Across All Sessions
@@ -53,7 +63,7 @@ to understand hypervisor behavior and kernel state management.
 |-------|-------|-------|
 | LSTAR offset | ktext + 0x294218 | Syscall entry, identical across boots |
 | pcb_rip | ktext + 0x25E538 | Context switch return, consistent |
-| EFER | 0x11d01 | SCE\|LME\|LMA\|NXE\|FFXSR |
+| EFER | 0x11d01 | TCE\|SVME\|NXE\|LMA\|LME\|SCE |
 | STAR | 0x0033002000000000 | user CS=0x33, kernel CS=0x20 |
 | SFMASK | 0x4701 | RFLAGS mask on syscall |
 | CR0 | 0x8005003b | PG\|WP\|NE\|ET\|TS\|MP\|PE |
@@ -80,7 +90,7 @@ GSBASE     = 0xffffffffe6a72b80
 - curthread range: 0xffffdd17...
 - td_pcb range: 0xffffff80...
 
-### Boot Session 3 (Option E — current)
+### Boot Session 3 (Option E)
 ```
 ktext_base = 0xffffffff99960000
 kdata_base = 0xffffffff9a560000
@@ -90,6 +100,37 @@ GSBASE     = 0xffffffffa0a33480 (CPU 2)
 ```
 - curthread range: 0xfffff073...
 - td_pcb range: 0xffffff80...
+
+### Boot Session 4 (v6 — current)
+```
+ktext_base = 0xffffffff96dd0000
+kdata_base = 0xffffffff979d0000
+CR3        = 0x000000001e104000
+GSBASE     = 0xffffffff9dea2b80 (CPU 1)
+GDT_base   = 0xffffffff9de9ee98
+IDT_base   = 0xffffffff9de9dc80
+curthread  = 0xffff97294e380d00
+td_pcb     = 0xffffff80a3d37a40
+```
+
+#### v6 Full CPU State Decode
+```
+CR0  = 0x8005003b     PG|AM|WP|NE|ET|TS|MP|PE
+CR2  = 0x221960000    last page fault (userspace addr)
+CR4  = 0x340ee0       SMAP|SMEP|OSXSAVE|UMIP|OSXMMEXCPT|OSFXSR|PGE|MCE|PAE
+EFER = 0x11d01        TCE|SVME|NXE|LMA|LME|SCE  *** SVME=1 ***
+STAR = 0x33002000..   sysret CS=0x33, syscall CS=0x20
+CSTAR= ktext+0x294460 compat mode syscall handler
+SFMASK=0x4701         masks NT|DF|IF|TF|CF
+FSBASE=0x8ff834080    userspace TLS
+KGSBASE=0             always zero in kernel context
+XCR0 = 0x7            x87|SSE|AVX
+DR0-3= 0              no hardware breakpoints
+DR6  = 0xffff4ff0     default/reset
+DR7  = 0x400          default — no active watchpoints
+GDT  = 0x9de9ee98/0x67   13 entries
+IDT  = 0x9de9dc80/0xfff  256 entries
+```
 
 ### Suspend/Resume Delta (Session 2, confirmed)
 **Identical across rest mode**: kdata_base, ktext_base, LSTAR, EFER, STAR, CSTAR,
@@ -216,7 +257,7 @@ but td_pcb is always in 0xffffff80.
 ## What We've Achieved
 1. Stable kernel code execution — no panics since v5
 2. Direct MSR/CR/descriptor table reads from kproc context (inline asm)
-3. Full CPU state snapshot across 3 boot sessions
+3. Full CPU state snapshot across 4 boot sessions
 4. Confirmed state survives suspend/resume unchanged (no KASLR re-randomization)
 5. Mapped struct pcpu layout (per-CPU structure at GSBASE)
 6. Mapped struct pcb GPR layout
@@ -224,6 +265,11 @@ but td_pcb is always in 0xffffff80.
 8. Identified per-CPU stride (0x900), CPU ID extraction
 9. Identified kernel memory ranges and their purposes
 10. Confirmed debug readback limit: 64 qwords (0x200 bytes)
+11. Complete CPU state snapshot: CRs, standard MSRs, XCR0, DRs, GDT/IDT
+12. Confirmed SVME=1 in EFER — kernel runs under AMD-V hypervisor
+13. Confirmed AMD MSRs all #GP trapped — HV blocks SYSCFG/VM_CR/VM_HSAVE_PA
+14. Confirmed no hardware breakpoints active (DR0-3=0, DR7=default)
+15. XCR0=7: x87+SSE+AVX available, no AVX-512
 
 ## Open Questions
 1. **Where is `susppcbs`?** Not in kdata globals, not in per-CPU structure.
@@ -231,29 +277,26 @@ but td_pcb is always in 0xffffff80.
    The kdata scan should find it but reported zero (possible scan bug).
 2. **What's the pcb_cr3 offset?** Somewhere in +0x40..+0x1FF, but zero for
    running threads. Only populated by savectx.
-3. Can we read AMD-specific MSRs? (SYSCFG, TOP_MEM, VM_CR)
-4. Can we safely read debug registers (DR0-DR7)?
+3. ~~Can we read AMD-specific MSRs?~~ **ANSWERED**: All #GP — HV traps them.
+4. ~~Can we safely read debug registers?~~ **ANSWERED**: Yes, all default/empty.
 5. What's in the rest of struct pcpu (+0x1C0..+0x900)?
+6. **Why did kdata scan find zero heap pointers?** Probable -Os compiler bug
+   or filter logic optimized away. Needs bulletproof reimplementation.
+7. **Can we call savectx without panic?** savectx has no trapped instructions
+   (pure movq+ret), unlike rdmsr_start which hit sldt/str.
 
-## Next Steps — Options
+## Next Steps
 
-### ~~Option G: Read ktext instructions~~ — IMPOSSIBLE
-ktext is XOM (execute-only). Cannot read instruction bytes.
+### ~~Option B: Complete CPU state~~ — DONE (v6)
+### ~~Option G: Read ktext instructions~~ — IMPOSSIBLE (XOM)
 
-### Option B: Complete CPU state via inline asm (RECOMMENDED)
-Read ALL remaining CPU state directly — no memory scanning needed:
-- **AMD MSRs**: SYSCFG (0xC0010010), TOP_MEM (0xC001001A), TOP_MEM2 (0xC001001D),
-  VM_CR (0xC0010114), VM_HSAVE_PA (0xC0010117) — reveals HV config
-- **Debug registers**: DR0-DR7 via `movq %drN, %rax` — reveals HV watchpoints
-- **XCR0** via `xgetbv` — reveals XSAVE component mask
-- **CR2** — last page fault address
-**Risk**: MEDIUM for AMD MSRs (#GP if trapped), LOW for DR/XCR0.
-**Approach**: test one AMD MSR per run, starting with least-likely-to-trap.
-
-### Option A: Heap scan for CR3 after resume
-Scan heap for CR3 value — only susppcbs PCBs have non-zero CRs.
-**Risk**: HIGH — heap guard pages cause instant panic, no fault handler.
-**Status**: Not attempted due to crash risk.
+### Option K: Targeted kdata BSS scan for heap pointers (RECOMMENDED)
+Previous kdata scan found zero hits — probable -Os compiler bug.
+Rewrite with bulletproof scanner: volatile everywhere, self-test against
+GSBASE area (known heap pointers exist there as control).
+Filter: value starts with 0xffffff80 (kernel heap range where PCBs live).
+susppcbs is a `static struct pcb **` in BSS → should be a heap pointer.
+**Risk**: LOW — read-only scan within kdata range.
 
 ### Option H: Try calling savectx
 savectx is a simple register-save function (movq sequences + ret).
