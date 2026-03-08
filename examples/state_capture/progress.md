@@ -107,6 +107,10 @@ SFMASK, CR0, CR3, CR4, GDT limit, IDT base+limit, GSBASE
 | Range | Purpose | Example |
 |-------|---------|---------|
 | `0xffffffff8...`-`0xffffffffa...` | ktext + kdata (KASLR) | ktext_base, kdata_base, GSBASE, GDT, IDT |
+
+**CRITICAL CONSTRAINT**: ktext is **execute-only memory (XOM)**. We can execute
+code from ktext (inline asm, function calls) but CANNOT read ktext bytes. This
+means we cannot disassemble kernel functions or scan ktext for instruction patterns.
 | `0xfffff073...` / `0xffffdd17...` | Kernel malloc heap (threads) | curthread, pc_idlethread |
 | `0xffffff80...` | Kernel memory (PCBs, stacks) | td_pcb, pcb_rsp |
 | `0x00000008ff...` | User-space TLS (FSBASE) | Thread-local storage |
@@ -233,20 +237,23 @@ but td_pcb is always in 0xffffff80.
 
 ## Next Steps — Options
 
+### ~~Option G: Read ktext instructions~~ — IMPOSSIBLE
+ktext is XOM (execute-only). Cannot read instruction bytes.
+
+### Option B: Complete CPU state via inline asm (RECOMMENDED)
+Read ALL remaining CPU state directly — no memory scanning needed:
+- **AMD MSRs**: SYSCFG (0xC0010010), TOP_MEM (0xC001001A), TOP_MEM2 (0xC001001D),
+  VM_CR (0xC0010114), VM_HSAVE_PA (0xC0010117) — reveals HV config
+- **Debug registers**: DR0-DR7 via `movq %drN, %rax` — reveals HV watchpoints
+- **XCR0** via `xgetbv` — reveals XSAVE component mask
+- **CR2** — last page fault address
+**Risk**: MEDIUM for AMD MSRs (#GP if trapped), LOW for DR/XCR0.
+**Approach**: test one AMD MSR per run, starting with least-likely-to-trap.
+
 ### Option A: Heap scan for CR3 after resume
 Scan heap for CR3 value — only susppcbs PCBs have non-zero CRs.
 **Risk**: HIGH — heap guard pages cause instant panic, no fault handler.
 **Status**: Not attempted due to crash risk.
-
-### Option B: Read AMD-specific MSRs
-Try SYSCFG, TOP_MEM, etc. to reveal HV config.
-**Risk**: MEDIUM — #GP on trapped MSRs causes panic.
-
-### Option G: Read ktext instructions (ACPI suspend code)
-Read the ACPI suspend function from ktext to find the `susppcbs` address
-encoded in mov/lea instructions. We can read ktext safely (proven).
-**Risk**: LOW — read-only, same as any memory read.
-**Challenge**: Need to find the right function offset in ktext.
 
 ### Option H: Try calling savectx
 savectx is a simple register-save function (movq sequences + ret).
@@ -255,10 +262,9 @@ Unlike rdmsr_start, it has no trapped instructions.
 but savectx is simpler and might work.
 
 ### Option I: Dump other CPUs' pcpu structs
-Read GSBASE ± N*0x900 to see all CPU per-CPU data. Find CPU 0 which is
-the primary suspend target. Compare fields.
+Read GSBASE ± N*0x900 to see all CPU per-CPU data. Find CPU 0.
 **Risk**: LOW — all in kdata range, proven mapped.
 
 ### Option J: Expand pcpu dump (+0x1C0..+0x900)
-Per-CPU struct is 0x900 bytes, we only saw 0x1C0. More pointers may exist.
+Per-CPU struct is 0x900 bytes, we only saw 0x1C0.
 **Risk**: LOW — within kdata range.
