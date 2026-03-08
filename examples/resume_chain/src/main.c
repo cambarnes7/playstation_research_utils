@@ -145,6 +145,7 @@ static uint64_t probe_call(uint64_t target, uint64_t onfault_addr)
         "jmp 1f\n\t"
 
         "2:\n\t"
+        "addq $8, %%rsp\n\t"  /* fix RSP: callq pushed ret addr before fault */
         "movabsq $0xFAFAFAFAFAFAFAFA, %[result]\n\t"
 
         "1:\n\t"
