@@ -35,116 +35,189 @@ to understand hypervisor behavior and kernel state management.
   - GDT/IDT base + limit via sgdt/sidt
   - curthread + td_pcb dump (64 qwords = 0x200 bytes)
   - kdata scan for LSTAR/CR3 values (susppcbs discovery)
+  - Heap pointer scan (broadened to all canonical kernel pointers)
 - Mode 0x6: curthread struct dump (128 qwords) + td_pcb (64 qwords)
 - **Lesson**: td_pcb sits at top of kernel stack page; reading >0x200 bytes past
   it hits a guard page and panics. Deep dumps must use curthread struct instead.
 
-## Confirmed Data (Two successful Mode 0x5 runs: pre-suspend + post-resume)
+## Confirmed Data
 
-### KASLR Layout (this boot)
+### Boot Session 1 (earlier session)
+
+#### KASLR Layout
 ```
 ktext_base = 0xffffffff8a720000
 kdata_base = 0xffffffff8b320000
-ktext size = 0xC00000 (12 MB)
 ```
 
-### MSR Values
+#### Key Values
+- LSTAR = 0xffffffff8a9b4218 (ktext + 0x294218)
+- CR3 = 0x11a54000
+- td_pcb addresses observed: 0xffffff80a924fa40, 0xffffff809fe8ba40
+
+---
+
+### Boot Session 2 (current session — Option D + Option C runs)
+
+#### KASLR Layout
+```
+ktext_base = 0xffffffffdf9a0000
+kdata_base = 0xffffffffe05a0000
+KASLR offset from session 1: +0x55280000 (~1.3 GB)
+```
+
+#### MSR Values
 | MSR | Value | Notes |
 |-----|-------|-------|
-| LSTAR | 0xffffffff8a9b4218 | ktext + 0x294218 (syscall entry) |
+| LSTAR | 0xffffffffdfc34218 | ktext + 0x294218 (syscall entry, offset IDENTICAL) |
 | EFER | 0x11d01 | SCE\|LME\|LMA\|NXE\|FFXSR |
 | STAR | 0x0033002000000000 | user CS=0x33, kernel CS=0x20 |
-| CSTAR | 0xffffffff8a9b4460 | compat syscall entry |
+| CSTAR | 0xffffffffdfc34460 | compat syscall entry |
 | SFMASK | 0x4701 | RFLAGS mask on syscall |
-| FSBASE | 0x00000008ff800080 | thread-local (changes per kproc) |
-| GSBASE | 0xffffffff917f5880 | per-CPU data (changes per core) |
-| KGSBASE | 0 | kernel GS base (swapped on syscall) |
+| FSBASE | varies per thread | thread-local storage |
+| GSBASE | 0xffffffffe6a72b80 | per-CPU data (kdata-relative) |
+| KGSBASE | 0 | zero in kernel context |
 
-### Control Registers
+#### Control Registers
 | Register | Value | Notes |
 |----------|-------|-------|
 | CR0 | 0x8005003b | PG\|WP\|NE\|ET\|TS\|MP\|PE |
-| CR3 | 0x11a54000 | physical page table base |
+| CR3 | 0x26cd4000 | physical page table base (different from session 1) |
 | CR4 | 0x340ee0 | SMEP\|SMAP\|PCIDE\|FSGSBASE\|PGE\|PAE\|MCE\|DE |
 
-### Descriptor Tables
-| Register | Pre-suspend | Post-resume | Notes |
-|----------|-------------|-------------|-------|
-| GDT base | 0xffffffff917ef0a0 | 0xffffffff917ef448 | per-CPU (different core) |
-| GDT limit | 0x67 | 0x67 | 13 entries |
-| IDT base | 0xffffffff917edc80 | 0xffffffff917edc80 | shared across CPUs |
-| IDT limit | 0xfff | 0xfff | 256 entries |
+#### Descriptor Tables
+| Register | Value | Notes |
+|----------|-------|-------|
+| GDT base | 0xffffffffe6a6ee98 | per-CPU (in kdata range) |
+| GDT limit | 0x67 | 13 entries |
+| IDT base | 0xffffffffe6a6dc80 | shared across CPUs |
+| IDT limit | 0xfff | 256 entries |
 
-### Suspend/Resume Delta
-**Unchanged** (global state): LSTAR, EFER, STAR, CSTAR, SFMASK, CR0, CR3, CR4, IDT
-**Changed** (per-CPU/per-thread): FSBASE, GSBASE, GDT base, curthread, td_pcb
+#### Thread Observations
+| Run | curthread | td_pcb |
+|-----|-----------|--------|
+| Mode 0x5 pre-suspend | 0xffffdd172f195380 | 0xffffff809fcf3a40 |
+| Mode 0x6 pre-suspend | 0xffffdd1752366700 | 0xffffff80a0987a40 |
+| Mode 0x5 post-resume | 0xffffdd1752366d80 | 0xffffff80a133fa40 |
 
-Interpretation: All global CPU state is restored identically after resume. The
-per-CPU differences (GSBASE, GDT) indicate the kproc ran on a different core
-post-resume. The per-thread differences (FSBASE, curthread) are because each
-run creates a new kproc instance.
+**Key observation**: curthread lives in 0xffffdd17... range (kernel malloc heap).
+td_pcb lives in 0xffffff80... range (a different kernel memory region). Each kproc
+invocation gets a fresh thread + PCB.
 
-### td_pcb Layout (confirmed standard FreeBSD)
+### Suspend/Resume Delta (Session 2)
+**Identical across rest mode**: kdata_base, ktext_base, LSTAR, EFER, STAR, CSTAR,
+SFMASK, CR0, CR3, CR4, GDT limit, IDT base+limit, GSBASE
+
+**Different (expected — different thread/core)**: FSBASE, curthread, td_pcb, GDT base
+
+**Conclusion**: Full kernel state survives rest mode. No KASLR re-randomization.
+Capabilities persist across suspend/resume.
+
+### td_pcb Layout (FreeBSD amd64 struct pcb)
 ```
-+0x00 R15 = 0xffffffff8b74ce00  (kdata address)
-+0x08 R14 = 0x0d
-+0x10 R13 = 0xffff96a4012bc000  (heap pointer)
-+0x18 R12 = 0xffffff8011fa0000  (kernel stack area)
-+0x20 RBP = 0                   (kproc leaf frame)
-+0x28 RSP = 0xffffff80a924f928  (kernel stack)
-+0x30 RBX = 0xffffff801ff6c000
-+0x38 RIP = 0xffffffff8a9b4538  (ktext, LSTAR + 0x320)
++0x00 pcb_r15 = 0xffffffffe09cce00  (kdata address — consistent across runs)
++0x08 pcb_r14 = 0x0b / 0x0f         (small integer, varies)
++0x10 pcb_r13 = 0xffffdd17...       (heap pointer, varies)
++0x18 pcb_r12 = 0xffffff80...       (kernel memory, varies)
++0x20 pcb_rbp = 0                   (kproc leaf frame)
++0x28 pcb_rsp = 0xffffff80...       (kernel stack, near td_pcb)
++0x30 pcb_rbx = 0xffffff80...       (callee-saved, varies)
++0x38 pcb_rip = 0xffffffffdfc34538  (ktext, LSTAR + 0x320 — CONSISTENT)
++0x40..+0x1FF  ALL ZEROS            (CRs/MSRs not saved for running thread)
 ```
 
-### kdata Scan Results
-- LSTAR hits in kdata: **0** (pre and post-resume)
-- CR3 hits in kdata: **0** (pre and post-resume)
-- Scan range: 112 MB from kdata_base
+**Critical insight**: pcb_cr3 and other CR fields (somewhere in +0x40..+0x1FF) are
+ALL ZERO for a running thread. They're only populated by `savectx()` during suspend.
+This means: after resume, only susppcbs PCBs will have non-zero CR values. Scanning
+the heap for CR3 = 0x26cd4000 would find ONLY the suspend-saved PCBs.
 
-**Why zero hits**: Thread PCBs are heap-allocated (`0xffffff80...` range), not in
-kdata. `susppcbs` is also likely heap-allocated (malloc'd during boot in
-`cpu_mp.c`), so it's not in the `.data`/`.bss` segment either.
+### curthread Struct (Mode 0x6 dump, 0x400 bytes)
+Non-zero fields observed:
+```
++0x00: 0xffffffffe3234c28  (kdata ptr — td_lock or td_proc?)
++0x08: 0xffffdd1754669920  (heap ptr)
++0x18: 0xffffdd1754669930  (heap ptr, +0x10 from above)
++0x28: 0xffffffffe3231008  (kdata ptr)
++0x50: 0xffffdd1742834d00  (heap ptr)
++0x58: 0xffffdd1701292788  (heap ptr)
++0x60: 0xffffdd17015a0b90  (heap ptr)
++0x70: 0xffffdd174c0a8400  (heap ptr)
++0x78: 0xffffdd170040ce40  (heap ptr)
++0x88: 0xffffdd174afa9200  (heap ptr)
++0x98: 0x000188f1ffffffff  (flags/bitmap)
++0xc8: 0xffffdd17523667c0  (close to curthread itself — likely td_link)
++0xd0: 0xffffdd1754669920  (same as +0x08 — cross-reference)
++0xd8: 0x0000000000000001
++0xe0: 0x00000004000003ff  (flags)
++0xe8: 0x2020000000000000  (padding or string?)
++0x1a0: 0xffffdd1701274c00 (heap ptr)
++0x1a8: 0xffffdd1701294a00 (heap ptr)
+```
+Most of the struct is zero; kernel threads have minimal state compared to user threads.
+
+## Scan Results Summary
+
+### Option D: kdata Heap Pointer Scan
+| Filter | Result |
+|--------|--------|
+| `(val >> 32) == 0xffffff80` (v1) | **0 hits** |
+| Broadened: any canonical kernel ptr not in kdata/ktext (v2) | **0 hits** |
+| LSTAR exact match | **0 hits** (both pre and post resume) |
+| CR3 exact match | **0 hits** (both pre and post resume) |
+
+**Conclusion**: The 112MB kdata scan range contains ZERO heap pointers and ZERO
+LSTAR/CR3 values. This means:
+1. `susppcbs` is NOT a simple kdata BSS global (or its pointer is accessed via
+   GSBASE per-CPU indirection)
+2. The kdata range is mostly demand-zero pages with no interesting globals
+3. The kdata scan approach is a **dead end** for finding susppcbs
+
+### Option C: curthread + td_pcb Dump
+- Mode 0x6 ran successfully
+- curthread is a ~0x400 byte slab allocation at 0xffffdd17...
+- Contains mostly heap pointers in the 0xffffdd17 range
+- td_pcb confirmed at +0x3F8 offset from curthread (TD_PCB = 0x3f8)
+- PCB fields after GPRs are all zero for running threads
 
 ## What We've Achieved
 1. Stable kernel code execution (no more panics)
 2. Direct MSR/CR/descriptor table reads from kproc context
 3. Full CPU state snapshot pre- and post-suspend
-4. Confirmed PCB layout matches standard FreeBSD
+4. Confirmed PCB layout matches standard FreeBSD amd64
 5. Confirmed all global CPU state survives suspend/resume unchanged
-6. Confirmed kdata scan range doesn't contain PCBs or susppcbs
+6. Confirmed kdata scan does NOT contain susppcbs or heap pointers
+7. Confirmed two distinct kernel memory ranges: 0xffffdd17 (malloc heap) and 0xffffff80 (PCB/stack area)
+8. Confirmed PCB CR fields are zero for running threads (only populated by savectx)
 
 ## Open Questions
-1. Where is `susppcbs` allocated? (heap address unknown, not in kdata)
-2. Can we read AMD-specific MSRs? (SYSCFG, TOP_MEM, VM_CR — HV might block)
-3. What does the curthread struct layout look like? (Mode 0x6 ready to test)
-4. Can we safely read debug registers (DR0-DR7)?
+1. Where is `susppcbs` allocated? Not in kdata. Possibly per-CPU (GSBASE-relative) or accessed through a function pointer table.
+2. Can we read AMD-specific MSRs? (SYSCFG, TOP_MEM, VM_CR — HV might block with #GP)
+3. Can we safely read debug registers (DR0-DR7)?
+4. What is the exact pcb_cr3 offset within struct pcb? (somewhere in +0x40..+0x1FF)
 
-## Next Steps — Options
+## Next Steps — Recommended
 
-### Option A: Scan heap for susppcbs
-Scan the `0xffffff80...` heap range for LSTAR value after resume. This would
-find the actual susppcbs PCBs containing GPR state at the point of suspend.
-**Risk**: heap has unmapped holes — could crash without pcb_onfault.
-**Mitigation**: scan small regions around known-good addresses (td_pcb vicinity),
-or walk pointer chains from curthread.
+### Option A: Heap scan for CR3 after resume (HIGH VALUE)
+Since PCB CR fields are zero for running threads, scanning the heap for
+CR3 = 0x26cd4000 would find ONLY the suspend-saved PCBs (susppcbs entries).
+Scan a 128-256MB range centered on known td_pcb addresses in the 0xffffff80 region.
+**Risk**: heap has unmapped holes — could crash on guard pages.
+**Mitigation**: scan in small page-aligned chunks, accept that some regions may fault.
 
-### Option B: Read AMD-specific MSRs
-Try reading SYSCFG (0xC0010010), TOP_MEM (0xC001001A), TOP_MEM2 (0xC001001D),
-VM_CR (0xC0010114), VM_HSAVE_PA (0xC0010117). These reveal hypervisor config
-and memory topology. Some may be blocked by the HV (#GP on rdmsr).
-**Risk**: #GP causes panic without fault handler. Could test one at a time.
-**Mitigation**: start with least-likely-to-trap MSRs (SYSCFG, TOP_MEM).
+### Option B: Read AMD-specific MSRs (MEDIUM VALUE)
+Try SYSCFG, TOP_MEM, TOP_MEM2, VM_CR, VM_HSAVE_PA to reveal HV config.
+**Risk**: #GP on trapped MSRs causes panic.
+**Mitigation**: test one MSR per run, starting with least-likely-to-trap.
 
-### Option C: Dump curthread struct (Mode 0x6)
-Run the fixed Mode 0x6 to dump 0x400 bytes of curthread struct. This reveals
-thread struct layout, td_proc pointer (leads to process info), thread list
-pointers (enumerate all threads), and other kernel internals.
-**Risk**: minimal — curthread is a large slab allocation, 0x400 bytes is safe.
+### Option E: GSBASE per-CPU structure exploration
+Read the per-CPU data structure starting at GSBASE. In FreeBSD, per-CPU data
+contains pointers to many kernel structures including potentially susppcbs.
+Dump 0x400+ bytes from GSBASE to map out the per-CPU layout.
+**Risk**: low — GSBASE points to mapped kernel data, proven readable.
 
-### Option D: Direct susppcbs discovery via kdata pointer scan
-Instead of scanning heap for values, scan kdata for POINTERS into the heap
-range (`0xffffff80...`). The `susppcbs` global variable is a pointer stored
-in kdata BSS that points to heap memory. Finding it gives us the exact address.
-**Risk**: low — read-only kdata scan, already proven safe.
-**Approach**: scan kdata for any value in range `0xffffff8000000000..0xffffff80ffffffff`,
-filter for page-aligned values (PCB arrays are page-aligned allocations).
+### Option F: Walk curthread pointer chains
+Follow curthread → td_proc → process struct → thread list to enumerate all
+kernel threads and their PCBs. This gives us a complete picture of the kernel's
+thread state without needing to find susppcbs directly.
+**Risk**: each pointer dereference could hit unmapped memory.
+**Mitigation**: validate pointers are in known-good ranges before dereferencing.
