@@ -1976,5 +1976,36 @@ The broad pointer filter (`fw_ver = 0x87 | (page << 8)`) matches any qword with
 **Deployment**: 11 runs (pages 0-10), all safe (read-only). Page 9 should find
 kernel_pmap DMAP pointers as a known control.
 
+### Broad kdata BSS Scan Results (fw_ver=0x87, filter: 0xFFFFxxxx excluding 0xFFFFFFFF)
+
+**Pages 0-2**: Heavy noise. Broad filter matches bitmasks, packed flags, and interrupt
+descriptor data. Pages 1-2 maxed out at 140 hits each (scanner limit). Most values are
+clearly NOT pointers: `0xfffffffefffffffe` (bitmask), `0xffff00010001ffff` (packed halves),
+`0xffff0004ffffffff` (counter/flags). Two potentially interesting tagged heap pointers on
+page 0 at kdata+0x1745f8 (`0xffffff8c86bba801`) and kdata+0x174640 (`0xffffff8c86bba804`)
+but both have non-zero low bits (tag bits, not clean pointers).
+
+**Page 9** (kdata+0x2400000 to +0x2800000): **Clean results — 4 heap pointers found!**
+
+Control test passed: many DMAP pointers (`0xffffbff3...`) from kernel_pmap_store region confirmed.
+
+| # | kdata offset | Heap pointer value | Alignment | Notes |
+|---|-------------|-------------------|-----------|-------|
+| 1 | +0x256c1e0 | `0xffffff80931e3c00` | 1KB | Isolated, ~0xD0000 before cluster |
+| 2 | +0x263a058 | `0xffffff8003afccb0` | 16-byte | Cluster start |
+| 3 | +0x263ae10 | `0xffffff80049a0000` | **64KB** | Suspicious — large allocation (susppcbs?) |
+| 4 | +0x263ae70 | `0xffffff8003af77f8` | 8-byte | ~0x60 after #3 |
+
+**Analysis**:
+- Hit #3 (`0xffffff80049a0000`) is 64KB-aligned — consistent with `malloc(N * sizeof(struct pcb))`
+  for a per-CPU array like `susppcbs`. `sizeof(struct pcb)` on PS5 is ~0x110 bytes,
+  so `MAXCPU * 0x110` rounded up to page alignment could produce a 64KB-aligned allocation.
+- Hits 2-4 are clustered at kdata+0x263aXXX (within ~0xC18 bytes), suggesting they're fields
+  of the same structure or nearby structures in BSS.
+- Hit 1 is isolated ~0xD0000 earlier — likely a different structure.
+
+**Next step**: Follow each pointer — dump 32 qwords (256 bytes) from the heap address
+each points to. If any target contains CR3 at PCB offset 0x68, it's a suspend PCB.
+
 ---
 

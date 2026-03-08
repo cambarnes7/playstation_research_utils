@@ -368,6 +368,10 @@ int module_start(kproc_args *args)
          *       memory via DMAP for CR3 value (ACPI wakeup trampoline).
          *       DMAP_BASE derived from kernel_pmap_store at kdata+0x27ed600.
          *       scan_base = DMAP_BASE + page * 0x100000 (1MB pages)
+         *     filter 0b10 + bit7 (0xC7): FOLLOW PTR — read qword at
+         *       kdata_base + (page * 8), treat it as a pointer, dump 32 qwords
+         *       from that target address. For following heap pointers found by
+         *       the broad scan. page = kdata_offset / 8.
          *     filter 0b11 + bit7 (0xE7): DMAP MEMDUMP — dump 32 qwords from
          *       DMAP_BASE + page * 0x100 (fine-grained physical memory dump)
          *   bits 8-31: scan page
@@ -436,7 +440,23 @@ int module_start(kproc_args *args)
         out[6] = 0;  /* last_scan_addr */
         out[7] = 0;  /* total_scanned */
 
-        if (filter_type == 3 && broad) {
+        if (filter_type == 2 && broad) {
+            /* FOLLOW PTR: read pointer from kdata, dump 32 qwords from target.
+             * page = kdata_offset / 8 (each page = one qword slot in kdata).
+             * Example: heap ptr at kdata+0x263ae10 → page = 0x263ae10/8 = 0x4C75C2 */
+            uint64_t ptr_addr = kdata_base + (uint64_t)page * 8ULL;
+            uint64_t target = *(volatile uint64_t *)ptr_addr;
+            out[3] = ptr_addr;         /* where the pointer lives */
+            out[4] = target;           /* the pointer value (heap address) */
+            out[5] = 32;
+            out[6] = dmap_base;        /* report DMAP base for reference */
+            out[7] = ((uint64_t)0xC7ULL << 48) | page;
+
+            for (int i = 0; i < 32; i++) {
+                out[8 + i * 2]     = target + i * 8;
+                out[8 + i * 2 + 1] = *(volatile uint64_t *)(target + i * 8);
+            }
+        } else if (filter_type == 3 && broad) {
             /* DMAP MEMDUMP: dump 32 qwords from DMAP physical address */
             uint64_t target = dmap_base + (uint64_t)page * 0x100ULL;
             out[3] = target;
