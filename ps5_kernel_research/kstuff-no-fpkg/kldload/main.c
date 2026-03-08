@@ -2309,6 +2309,68 @@ static void _kldload(void* data, size_t data_size)
             }
 
             printf("  end_marker:   %#lx\n", readback[63]);
+        } else if (status == 0x110D || status == 0x010D) {
+            /* v10d: batch execution probe results */
+            uint64_t ktext = readback[2];
+            uint64_t info = readback[3];
+            int batch = (int)(info & 0xFFFF);
+            int start = (int)((info >> 16) & 0xFFFF);
+            int count = (int)((info >> 32) & 0xFFFF);
+            int completed = (int)readback[5];
+
+            printf("\n=== v10d BATCH EXECUTION PROBE (batch %d) ===\n", batch);
+            printf("  kdata_base:        %#lx\n", readback[1]);
+            printf("  ktext_base:        %#lx\n", ktext);
+            printf("  batch:             %d\n", batch);
+            printf("  offset_range:      [%d..%d] of unique table\n", start, start + count - 1);
+            printf("  count:             %d\n", count);
+            printf("  probes_completed:  %d / %d\n", completed, count);
+            printf("  td_pcb:            %#lx\n", readback[4]);
+            printf("  status:            %s\n",
+                   status == 0x110D ? "COMPLETE" : "CRASHED (partial results)");
+
+            int cc_count = 0, c3_count = 0, fault_count = 0;
+
+            printf("\n  %5s  %14s  %8s  %s\n", "idx", "ktext offset", "verdict", "RAX");
+            printf("  %5s  %14s  %8s  %s\n", "-----", "--------------", "--------", "---");
+            for (int i = 0; i < completed && i < count; i++) {
+                uint64_t off = readback[6 + i * 3 + 0];
+                uint64_t rax = readback[6 + i * 3 + 1];
+                uint64_t verdict = readback[6 + i * 3 + 2];
+
+                const char *vtag;
+                if (verdict == 1) { vtag = "CC"; cc_count++; }
+                else if (verdict == 2) { vtag = "C3"; c3_count++; }
+                else if (verdict == 3) { vtag = "FAULT"; fault_count++; }
+                else { vtag = "???"; }
+
+                if (verdict == 1) {
+                    /* Highlight CC entries — potential gadget candidates */
+                    printf("  [%3d]  ktext+%#010lx  >>> %s <<<  RAX=%#lx\n",
+                           start + i, off, vtag, rax);
+                } else {
+                    printf("  [%3d]  ktext+%#010lx  %8s\n",
+                           start + i, off, vtag);
+                }
+            }
+
+            printf("\n  Summary: %d/%d complete — %d CC, %d C3, %d FAULT\n",
+                   completed, count, cc_count, c3_count, fault_count);
+
+            if (cc_count > 0) {
+                printf("\n  >>> %d CC (INT3) ENTRIES FOUND! <<<\n", cc_count);
+                printf("  >>> These have fn-1=0xCC — probe fn-2 for C9 (leave;ret) <<<\n");
+            }
+
+            if (status == 0x010D && completed < count) {
+                printf("\n  !!! CRASHED at probe %d (offset table idx %d) !!!\n",
+                       completed, start + completed);
+                if (start + completed < 406) {
+                    /* Can't access unique_offsets here, but show the index */
+                    printf("  !!! Problematic entry: unique_offsets[%d] !!!\n",
+                           start + completed);
+                }
+            }
         } else if (status == 0x110C) {
             /* v10c: sysent fn ptr batch dump */
             uint64_t ktext = readback[2];

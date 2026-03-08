@@ -1483,11 +1483,54 @@ All 3 v10c batches completed (status=0x110C). Full 678-entry sysent table captur
 - Minus `ktext+0x2985a8` stub (1) and `ktext+0x298918` stub (1) = 403
 - These 403 are the real candidates for `leave;ret` (C9 C3) gadget hunting
 
-### Next Steps
+### Phase 12c: Batch Execution Probe (v10d)
 
-1. **Execution-based probing of sysent handlers**: Use v8f sentinel technique on the 403 unique real handlers. Since all are in the same 7KB span, they likely all use the same epilogue (`48 C3` = `rex.W ret`), but execution probing is the only way to confirm since ktext is XOM.
+Probes fn-1 of all 406 unique sysent fn ptrs using the sentinel technique, batched 50 per deployment.
 
-2. **Priority targets**: The 403 handlers are densely packed with 8-byte spacing — many are likely very short wrapper functions. Short wrappers (e.g., `mov eax, ENOSYS; ret`) are more likely to have useful byte patterns at fn-1.
+**fw_ver encoding:** `0x9800 + batch` (batch 0..8)
+- Batches 0-7: 50 probes each (offsets 0-399)
+- Batch 8: 6 probes (offsets 400-405)
+- 9 deployments total
 
-3. **Batch execution probe**: Build a v10d payload that iterates through unique sysent fn ptrs, calling fn-1 for each with the sentinel technique. Can batch ~50 per deployment (limited by readback buffer) = ~8 deployments for full coverage.
+**Hardcoded offset table**: 406 unique ktext offsets (sorted, 32-bit, from dedup_sysent.py). Eliminates runtime dedup — each deployment knows exactly which fn ptrs to probe.
+
+**Output layout** (288 uint64_t slots):
+```
+out[0]     = MAGIC + status (0x010D=in-progress, 0x110D=complete)
+out[1]     = kdata_base
+out[2]     = ktext_base
+out[3]     = batch | (start_offset_idx << 16) | (count << 32)
+out[4]     = td_pcb
+out[5]     = probes_completed (crash-safe counter)
+out[6+i*3] = ktext offset of fn probed
+out[6+i*3+1] = RAX result
+out[6+i*3+2] = verdict: 1=CC(executed), 2=C3(sentinel), 3=faulted
+```
+
+**Probe logic per entry:**
+1. Reconstruct fn = ktext_base + unique_offsets[idx]
+2. Call `probe_call(fn - 1, onfault_addr)` with IDT[3] armed for INT3
+3. Classify: sentinel unchanged → C3, FAFA → fault, else → executed (CC)
+4. Write result triple, increment probes_completed
+
+**Crash safety:** Status starts at `0x010D` (in-progress). If a probe crashes the kernel, `probes_completed` tells us which entry caused it. Partial results are valid up to that point.
+
+**Binary**: 3544 bytes (1624 bytes offset table + ~1900 bytes code). No .bss.
+
+**Deployment:**
+```bash
+# 9 batches, all safe (probing fn-1 which is almost certainly C3 everywhere)
+for batch in 0 1 2 3 4 5 6 7 8; do
+  printf "\\x$(printf '%02x' $batch)\\x98\\x00\\x00" | nc 192.168.0.88 9022
+  cat resume_chain.bin | nc 192.168.0.88 9022
+done
+```
+
+**Status**: Built, awaiting deployment.
+
+### Next Steps After Batch Probe
+
+1. If all 406 return verdict=2 (C3): confirms `48 C3` epilogue everywhere, need alternative gadget strategy
+2. If any return verdict=1 (CC): those have INT3 padding at fn-1 — probe fn-2 for C9 (leave;ret)
+3. If any return verdict=3 (faulted): unusual, may indicate XOM page boundary or corrupted entry
 
