@@ -1186,3 +1186,98 @@ To build everything from scratch you need:
 - PS5 Payload SDK at `/opt/ps5-payload-sdk/` (only needed for kstuff.elf and kldload.elf)
 - `make`
 
+---
+
+## Phase 10: fn-2 Probing — `leave;ret` Gadget Discovery
+
+**Status: IN PROGRESS**
+
+### v10a Probe Results
+
+Deployed v10a payload to probe fn-2 (two bytes before function entry) for `leave` (C9) bytes. Since v8 confirmed fn-1=C3 (ret) for many entries, finding C9 at fn-2 gives us `leave;ret` (C9 C3) = a stack pivot gadget.
+
+The payload uses fw_ver encoding `0xddXX` where XX = apic_ops entry index, probing that entry's fn-2 address with sentinel-in-RAX + pcb_onfault fault recovery.
+
+#### Run 1: Entry [2] fn-2 (xapic_mode - 2)
+
+```
+fw_ver override: 0x403 → 0xdd02
+kdata_base = 0xffffffff96960000
+ktext_base = 0xffffffff95d60000
+fn         = 0xffffffff95ff4340 (xapic_mode)
+fn-2       = 0xffffffff95ff433e
+sentinel   = 0xbad0bad0bad0bad0 (UNCHANGED)
+result     = 0x02 (FAULT — pcb_onfault caught #PF)
+status     = 0x110a, magic = 0x5253434e ✓
+end marker = 0xdeadbeefcafe010a ✓
+```
+
+#### Run 2: Entry [14] fn-2 (set_tpr - 2)
+
+```
+fw_ver override: 0xdd02 → 0xdd0e
+kdata_base = 0xffffffff96960000  (same boot)
+fn         = 0xffffffff95fee700 (set_tpr)
+fn-2       = 0xffffffff95fee6fe
+sentinel   = 0xbad0bad0bad0bad0 (UNCHANGED)
+result     = 0x02 (FAULT — pcb_onfault caught #PF)
+status     = 0x110a, magic = 0x5253434e ✓
+end marker = 0xdeadbeefcafe010a ✓
+```
+
+### Interpretation: **Strong `leave;ret` (C9 C3) candidates**
+
+Both fn-2 probes returned FAULT with sentinel unchanged. This rules out:
+
+| Byte | What happens | Expected result | Matches? |
+|------|-------------|-----------------|----------|
+| C3 (ret) | Returns immediately | result=0, sentinel unchanged | **No** (result≠0) |
+| CC (int3) | IDT[3]=doreti_iret bounce → return | result=0, sentinel changed | **No** |
+| 48 (REX.W) | 48 C3 = `retq` → returns | result=0, sentinel unchanged | **No** (result≠0) |
+| 90 (NOP) | NOP then C3 ret → returns | result=0, sentinel unchanged | **No** (result≠0) |
+| 66 (operand prefix) | 66 C3 = `retw` → returns | result=0, sentinel unchanged | **No** (result≠0) |
+| 5D (pop rbp) | Pops from valid stack, then ret | result=0, sentinel unchanged | **No** (result≠0) |
+| **C9 (leave)** | RSP=RBP, pop [RBP] → #PF on unmapped addr | **result=2, sentinel unchanged** | **YES ✓** |
+
+`leave` = `RSP ← RBP; pop RBP from [RSP]`. In the probe context, RBP does not point to a valid stack → the `pop` dereferences `[RBP]` → page fault → pcb_onfault catches it. RAX is never touched by `leave`, so sentinel stays at 0xBAD0BAD0BAD0BAD0.
+
+**Combined with v7b result** (entry[2] fn-1 = C3 confirmed):
+- **xapic_mode - 2 = C9 C3 = `leave; ret`** — a stack pivot gadget in ktext
+
+Entry[14] fn-2 shows the same fault pattern → likely also C9. Needs fn-1=C3 confirmation for entry[14].
+
+### All 28 apic_ops Addresses (this boot)
+
+```
+[0]  0xffffffff95fedb88    [14] 0xffffffff95fee700
+[1]  0xffffffff95fed310    [15] 0xffffffff95fedc58
+[2]  0xffffffff95ff4340    [16] 0xffffffff95ff02b8
+[3]  0xffffffff95ff0808    [17] 0xffffffff95ff41d0
+[4]  0xffffffff95ff3f18    [18] 0xffffffff95ff4348
+[5]  0xffffffff95ff4100    [19] 0xffffffff95ff4320
+[6]  0xffffffff95ff43b8    [20] 0xffffffff95fed130
+[7]  0xffffffff95ff0330    [21] 0xffffffff95fedb80
+[8]  0xffffffff95fee9d0    [22] 0xffffffff95ff06d0
+[9]  0xffffffff95fedc60    [23] 0xffffffff95ffe830
+[10] 0xffffffff95ff0240    [24] 0xffffffff95ff0800
+[11] 0xffffffff95ff0aa8    [25] 0xffffffff962b69f0
+[12] 0xffffffff95fed770    [26] 0xffffffff95fedfa8
+[13] 0xffffffff95fee708    [27] 0xffffffff95fee760
+```
+
+### Significance
+
+`leave; ret` at ktext offset (xapic_mode - 2) is a **usable stack pivot gadget**:
+1. Point apic_ops[2] at xapic_mode-2 during LAPIC resume
+2. If RBP → kdata we control: RSP redirects to our ROP chain
+3. `pop RBP` loads controlled value, `ret` pops controlled RIP → full chain execution
+
+### Next Steps
+
+1. Confirm fn-1=C3 for entry[14] (run v7b byte-ID on entry[14])
+2. **Determine RBP value at LAPIC resume call site** — this is the critical unknown:
+   - If RBP → kdata range → immediate pivot capability
+   - If RBP → stack/heap → need to analyze resume stack layout
+   - If RBP = 0/garbage → `leave;ret` won't work, try alternative gadget
+3. Build a `leave;ret` diagnostic payload: arm apic_ops[2]=xapic_mode-2, enter rest mode, observe crash (the fault address reveals what [RBP+8] was → tells us RBP's value)
+
