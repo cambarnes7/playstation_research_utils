@@ -107,14 +107,14 @@ SFMASK, CR0, CR3, CR4, GDT limit, IDT base+limit, GSBASE
 | Range | Purpose | Example |
 |-------|---------|---------|
 | `0xffffffff8...`-`0xffffffffa...` | ktext + kdata (KASLR) | ktext_base, kdata_base, GSBASE, GDT, IDT |
-
-**CRITICAL CONSTRAINT**: ktext is **execute-only memory (XOM)**. We can execute
-code from ktext (inline asm, function calls) but CANNOT read ktext bytes. This
-means we cannot disassemble kernel functions or scan ktext for instruction patterns.
 | `0xfffff073...` / `0xffffdd17...` | Kernel malloc heap (threads) | curthread, pc_idlethread |
 | `0xffffff80...` | Kernel memory (PCBs, stacks) | td_pcb, pcb_rsp |
 | `0x00000008ff...` | User-space TLS (FSBASE) | Thread-local storage |
 | `0x00000000_2XXXXXXX` | Physical addresses (CR3) | Page table base |
+
+**CRITICAL CONSTRAINT**: ktext is **execute-only memory (XOM)**. We can execute
+code from ktext (inline asm, function calls) but CANNOT read ktext bytes. This
+means we cannot disassemble kernel functions or scan ktext for instruction patterns.
 
 Note: The heap thread range changed between sessions (0xffffdd17 → 0xfffff073),
 but td_pcb is always in 0xffffff80.
