@@ -1336,7 +1336,7 @@ out[63]    = end marker
 
 ## Sysent fn-1 Probe Results (v10b)
 
-### Scan Results — Real Syscall Handlers (0x88b5xxxx region)
+### Boot 1 Results — Real Syscall Handlers (0x88b5xxxx region)
 
 All real syscall handler fn ptrs on this boot are clustered in the `0xffffffff88b5xxxx` range. Every fn-1 read in this region **faults** (#PF caught by pcb_onfault, error code 3).
 
@@ -1349,7 +1349,7 @@ All real syscall handler fn ptrs on this boot are clustered in the `0xffffffff88
 | 73 (munmap) | 0xffffffff88b57d20 | FAULT | error=3 |
 | 97 (socket) | 0xffffffff88b57648 | FAULT | error=3 |
 
-### Scan Results — Stub Functions (0x8827xxxx region)
+### Boot 1 Results — Stub Functions (0x8827xxxx region)
 
 Multiple entries share the same fn ptr — these are `nosys`/`lkmnosys` stubs. The fn-1 reads in this region **succeed**.
 
@@ -1366,28 +1366,50 @@ Multiple entries share the same fn ptr — these are `nosys`/`lkmnosys` stubs. T
 - **lkmnosys** candidate: `0xffffffff88277cf0` (entry 456)
 - Entry 560: Different fn ptr `0x88278638` but still faults — possibly on a different page with stricter protections
 
-### Panic Entry
+### Boot 1 — Panic Entry
 
 | Sysent Index | Result |
 |-------------|--------|
 | 122 (0x7A) | **Kernel panic** — likely triggers #UD/#GP not caught by pcb_onfault |
 
+### Boot 2 Results — Mixed Region (0x8827xxxx, different KASLR slide)
+
+Different boot, all fn ptrs landed in `0x8827xxxx` range. Mixed read results within the same address range:
+
+| Sysent Index | fn ptr | fn-1 byte | Result |
+|-------------|--------|-----------|--------|
+| 9 (link) | 0xffffffff882777b8 | 0x00 | SUCCESS |
+| 27 (recvmsg) | 0xffffffff88277ea0 | FAULT | error=3 |
+| 54 (ioctl) | 0xffffffff882771f0 | FAULT | error=3 |
+| 78 (mincore) | 0xffffffff88278650 | 0x00 | SUCCESS |
+| 104 (setitimer) | 0xffffffff88277868 | FAULT | error=3 |
+| 138 (utrace) | — | — | Not tested (panic from entry 104 delayed effects) |
+
+**Notable**: Entries 9 and 78 succeed (byte=0x00) while 27, 54, 104 fault, despite ALL being in the `0x8827xxxx` range. Entries 9 (`sys_link`) and 78 (`sys_mincore`) may be nosys stubs on PS5 (removed/unimplemented syscalls). The byte=0x00 is likely padding before the stub function, same pattern as the Boot 1 nosys results.
+
 ### Key Finding: Execute-Only ktext Pages
 
-The PS5 hypervisor appears to enforce **execute-only** page protections on most kernel text pages. Two distinct ktext regions show different read behavior:
+The PS5 hypervisor enforces **execute-only** page protections on most kernel text pages. Read-based probing (pcb_onfault) results:
 
-| Region | Address Range | Readable? | Contents |
-|--------|--------------|-----------|----------|
-| Stub functions (nosys/lkmnosys) | `0x8827xxxx` | **YES** | Small stubs, possibly on a mixed code+data page |
-| Real syscall handlers | `0x88b5xxxx` | **NO** | Core syscall implementations, execute-only |
+| Category | Readable? | Byte Value | Notes |
+|----------|-----------|------------|-------|
+| nosys/lkmnosys stubs | **YES** | 0x00 | Padding before stub functions |
+| Real syscall handlers | **NO** | FAULT | Execute-only, error code 3 |
+| Some real handlers | **NO** | PANIC | #UD/#GP not caught by pcb_onfault |
 
-This means the fn-1 byte probing strategy works only for functions that happen to reside on **readable** pages. The hypervisor's execute-only enforcement is page-granular, so functions near page boundaries or on pages with mixed code+data may be readable.
+XOM is NOT simply range-based — functions on the same 4K page can have different read behavior, suggesting the hypervisor's NPT permissions may be more granular or that readable entries are nosys stubs residing on special pages.
 
 ### Implications for Strategy
 
-1. Most sysent entries point to either `nosys` (unimplemented) or real handlers in the execute-only `0x88b5xxxx` region
-2. Need to find sysent entries whose fn ptrs fall in **readable** ktext pages (outside `0x88b5xxxx`)
-3. The apic_ops functions (tested earlier) had 4/10 readable fn-1 bytes — those functions may be on different, readable pages
-4. Scanning more entries across the full 678-entry table may reveal fn ptrs in readable regions
-5. Alternative approach: probe fn-2/fn-3 of the readable stubs (nosys, lkmnosys) — while these are trivial functions, confirming multi-byte reads helps validate the technique
+The pcb_onfault READ-based scan is hitting XOM walls for all real syscall handlers. Every successful read (byte=0x00) is likely just another nosys/unimplemented stub. The approach is useful for:
+1. **Deduplication**: Identifying which entries share the nosys fn ptr (skip duplicates)
+2. **Classification**: Separating nosys stubs from real handlers by fn ptr uniqueness
+
+But for finding `leave;ret` (C9 C3) gadgets, we need to **switch to execution-based probing** (v8f sentinel technique) for unique sysent fn ptrs. This bypasses XOM entirely since we CALL fn-1 rather than READ fn-1. Trade-off: one probe per boot for dangerous bytes (non-C3/non-CC), but it's the only way to probe execute-only pages.
+
+### Recommended Next Steps
+
+1. **Quick dedup scan**: Probe ~20 more entries via READ to map out nosys coverage. Focus on entries likely to be implemented (low-numbered POSIX syscalls with unique fn ptrs)
+2. **Execution-based v10b mode**: Add sentinel-in-RAX execution probing for sysent (like v8f for apic_ops). Probe fn-1 of unique, real syscall handlers
+3. **Priority targets**: Entries whose fn ptrs are at different ktext offsets from the main cluster — different compilation units may use `leave;ret`
 
