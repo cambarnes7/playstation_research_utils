@@ -59,12 +59,17 @@
  *   [110] lstar_hits (count)
  *   [111] cr3_hits (count)
  *   [112] scan_range (bytes)
+ *   [113] heap_ptr_total (0xffffff80... pointers found in kdata)
+ *   [114] best_run_len (longest consecutive heap pointer array)
  *   [115..130] LSTAR hit addresses (up to 16)
  *   [135..150] CR3 hit addresses (up to 16)
  *   --- Context around first LSTAR hit ---
  *   [160..191] 32 qwords centered on first LSTAR hit
  *   --- Context around first CR3 hit (as PCB) ---
  *   [200..231] 32 qwords from (cr3_hit - 0x68)
+ *   --- Best consecutive heap pointer array (susppcbs candidate) ---
+ *   [232] best_run_start (kdata address of array)
+ *   [235..258] up to 24 pointer values from the array
  *   [287] end marker
  *
  * Mode 0x6 (DUMP):
@@ -204,10 +209,25 @@ int module_start(kproc_args *args)
                 out[40 + i] = read8(td_pcb + i * 8);
         }
 
-        /* Scan kdata for LSTAR and CR3 values */
+        /* Single-pass kdata scan for:
+         * 1. LSTAR value (susppcbs PCB after resume)
+         * 2. CR3 value (PCB identification)
+         * 3. Heap pointers in 0xffffff80... range (susppcbs discovery)
+         *
+         * For heap pointers, track consecutive runs — an array of 4+
+         * consecutive heap pointers is likely susppcbs (MAXCPU pcb ptrs).
+         */
         uint32_t lstar_hits = 0;
         uint32_t cr3_hits = 0;
+        uint32_t heap_ptr_total = 0;
         uint64_t scan_end = kdata_base + 0x7000000;
+
+        /* Track longest consecutive run of heap pointers */
+        uint64_t run_start = 0;
+        uint32_t run_len = 0;
+        uint64_t best_run_start = 0;
+        uint32_t best_run_len = 0;
+        uint64_t prev_heap_addr = 0;
 
         for (uint64_t addr = kdata_base; addr < scan_end; addr += 8) {
             uint64_t val = read8(addr);
@@ -221,10 +241,35 @@ int module_start(kproc_args *args)
                     out[135 + cr3_hits] = addr;
                 cr3_hits++;
             }
+            /* Heap pointer: 0xffffff80_XXXXXXXX (where td_pcb lives) */
+            if ((val >> 32) == 0xffffff80ULL) {
+                heap_ptr_total++;
+                if (addr == prev_heap_addr + 8) {
+                    run_len++;
+                } else {
+                    if (run_len > best_run_len) {
+                        best_run_len = run_len;
+                        best_run_start = run_start;
+                    }
+                    run_start = addr;
+                    run_len = 1;
+                }
+                prev_heap_addr = addr;
+            }
         }
+        /* Final run check */
+        if (run_len > best_run_len) {
+            best_run_len = run_len;
+            best_run_start = run_start;
+        }
+
         out[110] = lstar_hits;
         out[111] = cr3_hits;
         out[112] = scan_end - kdata_base;
+
+        /* Heap pointer scan results */
+        out[113] = heap_ptr_total;
+        out[114] = best_run_len;
 
         /* Context dump around first LSTAR hit */
         if (lstar_hits > 0) {
@@ -244,6 +289,15 @@ int module_start(kproc_args *args)
                 for (int i = 0; i < 32; i++)
                     out[200 + i] = read8(pcb_base + i * 8);
             }
+        }
+
+        /* Dump best array of consecutive heap pointers (likely susppcbs) */
+        if (best_run_len >= 2) {
+            out[232] = best_run_start;
+            uint32_t dump_count = best_run_len;
+            if (dump_count > 24) dump_count = 24;
+            for (uint32_t i = 0; i < dump_count; i++)
+                out[235 + i] = read8(best_run_start + i * 8);
         }
 
         out32[0] = MAGIC_SCAP;
