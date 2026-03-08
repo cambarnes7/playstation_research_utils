@@ -15,15 +15,15 @@
  * - CR0, CR3, CR4 via inline mov
  * - GDT, IDT base+limit via sgdt/sidt
  * - td_pcb dump (direct memory read of our thread's PCB)
- * - kdata scan for LSTAR/CR3 values (post-resume susppcbs discovery)
+ * - GSBASE per-CPU structure dump (struct pcpu exploration)
  *
  * Workflow:
- *   1. Mode 0x5 before suspend: baseline CPU state + kdata scan
- *   2. Suspend/resume via PS5 UI
- *   3. Mode 0x5 after resume: compare MSRs + find new LSTAR hits = susppcbs
+ *   1. Mode 0x5: capture CPU state + per-CPU structure
+ *   2. Analyze struct pcpu to find pointers to suspend infrastructure
+ *   3. Follow pointer chains to locate susppcbs
  *
  * Mode (via fw_ver):
- *   0x5: SCAN — full CPU state capture + kdata scan (288 slots)
+ *   0x5: SCAN — full CPU state capture + per-CPU dump (288 slots)
  *   0x6: DUMP — deep td_pcb dump (256 qwords = 2KB)
  *
  * Output layout (uint64_t indices, 288 slots = 2304 bytes):
@@ -55,21 +55,9 @@
  *   [31]  td_pcb
  *   --- td_pcb dump: 64 qwords = 0x200 bytes ---
  *   [40..103]  td_pcb[0x00..0x1FF]
- *   --- Scan results ---
- *   [110] lstar_hits (count)
- *   [111] cr3_hits (count)
- *   [112] scan_range (bytes)
- *   [113] heap_ptr_total (0xffffff80... pointers found in kdata)
- *   [114] best_run_len (longest consecutive heap pointer array)
- *   [115..130] LSTAR hit addresses (up to 16)
- *   [135..150] CR3 hit addresses (up to 16)
- *   --- Context around first LSTAR hit ---
- *   [160..191] 32 qwords centered on first LSTAR hit
- *   --- Context around first CR3 hit (as PCB) ---
- *   [200..231] 32 qwords from (cr3_hit - 0x68)
- *   --- Best consecutive heap pointer array (susppcbs candidate) ---
- *   [232] best_run_start (kdata address of array)
- *   [235..258] up to 24 pointer values from the array
+ *   --- Per-CPU structure (struct pcpu at GSBASE) ---
+ *   [110]     gsbase value
+ *   [120..247] 128 qwords from GSBASE (0x400 bytes of struct pcpu)
  *   [287] end marker
  *
  * Mode 0x6 (DUMP):
@@ -158,11 +146,11 @@ int module_start(kproc_args *args)
 
     if (mode == 0x5) {
         /* ============================================================
-         * MODE 0x5: SCAN — Full CPU state capture + kdata scan
+         * MODE 0x5: SCAN — Full CPU state + per-CPU structure dump
          *
          * ZERO function calls. ZERO writes to kdata.
          * Reads all MSRs and CRs directly via inline asm.
-         * Scans kdata for LSTAR/CR3 to find susppcbs after resume.
+         * Dumps struct pcpu at GSBASE to map per-CPU infrastructure.
          * ============================================================ */
         for (int i = 0; i < 288; i++) out[i] = 0;
 
@@ -209,108 +197,20 @@ int module_start(kproc_args *args)
                 out[40 + i] = read8(td_pcb + i * 8);
         }
 
-        /* Single-pass kdata scan for:
-         * 1. LSTAR value (susppcbs PCB after resume)
-         * 2. CR3 value (PCB identification)
-         * 3. Kernel heap pointers (susppcbs discovery)
+        /* Per-CPU structure dump (struct pcpu at GSBASE)
          *
-         * Heap pointer detection: canonical kernel ptr (0xffff...)
-         * that is NOT in the kdata or ktext range. This catches both
-         * the 0xffffff80... range (where PCBs live) and the
-         * 0xffffdd17... range (kernel malloc heap).
-         *
-         * Track consecutive runs — an array of 4+ consecutive heap
-         * pointers is likely susppcbs (MAXCPU pcb pointer array).
+         * The kdata scan (LSTAR/CR3/heap-pointer matching) found ZERO
+         * hits across 4 runs. kdata is mostly demand-zero pages.
+         * Instead, dump the per-CPU structure which is the kernel's
+         * hub for thread/PCB/CPU state and may reveal the path to
+         * susppcbs through per-CPU indirection.
          */
-        uint32_t lstar_hits = 0;
-        uint32_t cr3_hits = 0;
-        uint32_t heap_ptr_total = 0;
-        uint64_t scan_end = kdata_base + 0x7000000;
+        uint64_t gsbase = rdmsr(MSR_GSBASE);
+        out[110] = gsbase;
 
-        /* Track longest consecutive run of heap pointers */
-        uint64_t run_start = 0;
-        uint32_t run_len = 0;
-        uint64_t best_run_start = 0;
-        uint32_t best_run_len = 0;
-        uint64_t prev_heap_addr = 0;
-
-        /* Ranges to exclude (kdata and ktext are NOT heap) */
-        uint64_t kdata_end = scan_end;
-        uint64_t ktext_start = ktext_base;
-        uint64_t ktext_end = ktext_base + 0x2000000;
-
-        for (uint64_t addr = kdata_base; addr < scan_end; addr += 8) {
-            uint64_t val = read8(addr);
-            if (val == lstar) {
-                if (lstar_hits < 16)
-                    out[115 + lstar_hits] = addr;
-                lstar_hits++;
-            }
-            if (val == cr3) {
-                if (cr3_hits < 16)
-                    out[135 + cr3_hits] = addr;
-                cr3_hits++;
-            }
-            /* Kernel heap pointer: canonical kernel addr, not kdata/ktext */
-            if ((val >> 48) == 0xffffULL && val > 0xffff000000000000ULL &&
-                !(val >= kdata_base && val < kdata_end) &&
-                !(val >= ktext_start && val < ktext_end)) {
-                heap_ptr_total++;
-                if (addr == prev_heap_addr + 8) {
-                    run_len++;
-                } else {
-                    if (run_len > best_run_len) {
-                        best_run_len = run_len;
-                        best_run_start = run_start;
-                    }
-                    run_start = addr;
-                    run_len = 1;
-                }
-                prev_heap_addr = addr;
-            }
-        }
-        /* Final run check */
-        if (run_len > best_run_len) {
-            best_run_len = run_len;
-            best_run_start = run_start;
-        }
-
-        out[110] = lstar_hits;
-        out[111] = cr3_hits;
-        out[112] = scan_end - kdata_base;
-
-        /* Heap pointer scan results */
-        out[113] = heap_ptr_total;
-        out[114] = best_run_len;
-
-        /* Context dump around first LSTAR hit */
-        if (lstar_hits > 0) {
-            uint64_t hit = out[115];
-            uint64_t base = hit - 16 * 8;
-            if (base >= kdata_base && base + 32 * 8 <= scan_end) {
-                for (int i = 0; i < 32; i++)
-                    out[160 + i] = read8(base + i * 8);
-            }
-        }
-
-        /* Context dump around first CR3 hit (treat as PCB_CR3 at +0x68) */
-        if (cr3_hits > 0) {
-            uint64_t hit = out[135];
-            uint64_t pcb_base = hit - 0x68;
-            if (pcb_base >= kdata_base && pcb_base + 32 * 8 <= scan_end) {
-                for (int i = 0; i < 32; i++)
-                    out[200 + i] = read8(pcb_base + i * 8);
-            }
-        }
-
-        /* Dump best array of consecutive heap pointers (likely susppcbs) */
-        if (best_run_len >= 2) {
-            out[232] = best_run_start;
-            uint32_t dump_count = best_run_len;
-            if (dump_count > 24) dump_count = 24;
-            for (uint32_t i = 0; i < dump_count; i++)
-                out[235 + i] = read8(best_run_start + i * 8);
-        }
+        /* Dump 128 qwords (0x400 bytes) from GSBASE */
+        for (int i = 0; i < 128; i++)
+            out[120 + i] = read8(gsbase + i * 8);
 
         out32[0] = MAGIC_SCAP;
         out32[1] = 0x0005;
