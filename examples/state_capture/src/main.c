@@ -53,11 +53,11 @@
  *   --- Thread info ---
  *   [30]  curthread
  *   [31]  td_pcb
- *   --- td_pcb dump: 64 qwords = 0x200 bytes ---
- *   [40..103]  td_pcb[0x00..0x1FF]
+ *   --- td_pcb GPRs (8 qwords = first 0x40 bytes) ---
+ *   [40..47]  td_pcb[0x00..0x3F] (r15,r14,r13,r12,rbp,rsp,rbx,rip)
  *   --- Per-CPU structure (struct pcpu at GSBASE) ---
- *   [110]     gsbase value
- *   [120..247] 128 qwords from GSBASE (0x400 bytes of struct pcpu)
+ *   [48]      gsbase value
+ *   [50..113] 64 qwords from GSBASE (0x200 bytes of struct pcpu)
  *   [287] end marker
  *
  * Mode 0x6 (DUMP):
@@ -191,26 +191,23 @@ int module_start(kproc_args *args)
             td_pcb = read8(curthread + TD_PCB);
         out[31] = td_pcb;
 
-        /* td_pcb dump: 64 qwords (0x200 bytes) */
+        /* td_pcb GPRs: first 8 qwords (0x40 bytes, rest is always zero) */
         if (td_pcb) {
-            for (int i = 0; i < 64; i++)
+            for (int i = 0; i < 8; i++)
                 out[40 + i] = read8(td_pcb + i * 8);
         }
 
         /* Per-CPU structure dump (struct pcpu at GSBASE)
          *
-         * The kdata scan (LSTAR/CR3/heap-pointer matching) found ZERO
-         * hits across 4 runs. kdata is mostly demand-zero pages.
-         * Instead, dump the per-CPU structure which is the kernel's
-         * hub for thread/PCB/CPU state and may reveal the path to
-         * susppcbs through per-CPU indirection.
+         * Compact layout: starts at slot 48 so it's visible in the
+         * debug readback (which truncates around offset 0x400).
          */
         uint64_t gsbase = rdmsr(MSR_GSBASE);
-        out[110] = gsbase;
+        out[48] = gsbase;
 
-        /* Dump 128 qwords (0x400 bytes) from GSBASE */
-        for (int i = 0; i < 128; i++)
-            out[120 + i] = read8(gsbase + i * 8);
+        /* Dump 64 qwords (0x200 bytes) from GSBASE */
+        for (int i = 0; i < 64; i++)
+            out[50 + i] = read8(gsbase + i * 8);
 
         out32[0] = MAGIC_SCAP;
         out32[1] = 0x0005;
