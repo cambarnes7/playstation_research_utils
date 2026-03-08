@@ -1793,23 +1793,46 @@ All probes land in:
 - savectx's entry point (full save + return 1)
 - Padding (NOPs/INT3 → fault caught by pcb_onfault)
 
-**Status**: state_capture v3 rebuilt with fixed probe range. Binary: `examples/state_capture/state_capture.bin`.
+**Result**: Still crashed. pcb_onfault only catches #PF (page faults). Entering mid-instruction
+at 16-byte aligned boundaries inside savectx causes #UD or #GP — NOT caught → instant panic.
 
-### Deployment Plan (Revised)
+### v4: Zero Probing — Call rdmsr_start Directly
+
+Key constraints discovered:
+1. **ktext is XOM** (Execute Only Memory) — cannot read bytes to find prologue signatures
+2. **pcb_onfault** only catches #PF, not #UD/#GP from mid-instruction entry
+3. **td_pcb may be 0** for kproc threads, making onfault completely inoperative
+4. **No kdata references** to savectx (only relative calls within ktext)
+
+**Solution**: Call `rdmsr_start` directly. It's a KNOWN address inside savectx at a verified
+instruction boundary. The code sets ECX before each rdmsr, writes to [RDI+offsets], then
+falls through to sgdt/sidt/sldt/str, then `mov $1, %eax; ret`.
+
+**Captures** (MSRs + descriptors): FSBASE, GSBASE, KGSBASE, EFER, STAR, LSTAR, CSTAR, SFMASK, GDT, IDT, LDT, TR
+
+**Does NOT capture** (before rdmsr_start): GPRs, CRs, DRs
+
+Mode 0x4 calls rdmsr_start with a clean buffer to discover which PCB offsets receive MSR values.
+Mode 0x2 arms apic_ops[2] with rdmsr_start for ACPI resume capture.
+Mode 0x3 scans kdata for LSTAR value to find the MSR dump after resume.
+
+**Status**: state_capture v4 built. Binary: `examples/state_capture/state_capture.bin`.
+
+### Deployment Plan (v4)
 
 ```bash
-# Mode 0x4: FIND savectx (safe — narrow probe range)
+# Mode 0x4: Call rdmsr_start, discover PCB MSR layout
 printf '\x04\x00\x00\x00' | nc PS5_IP 9022
 cat state_capture.bin | nc PS5_IP 9022
-# Expected: savectx found at ~cpu_switch + 0x6200, returns 1, CR3 match
+# Expected: returns 1, LSTAR offset found, MSR fields mapped
 
-# Mode 0x2: ARM apic_ops[2] = savectx
+# Mode 0x2: ARM apic_ops[2] = rdmsr_start
 printf '\x02\x00\x00\x00' | nc PS5_IP 9022
 cat state_capture.bin | nc PS5_IP 9022
 
 # Enter rest mode via PS5 UI, then resume
 
-# Mode 0x3: READBACK — scan for PCB dump
+# Mode 0x3: READBACK — scan for LSTAR to find MSR dump
 printf '\x03\x00\x00\x00' | nc PS5_IP 9022
 cat state_capture.bin | nc PS5_IP 9022
 ```
