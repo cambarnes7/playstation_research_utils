@@ -2030,3 +2030,15 @@ suspend mechanism entirely, or suspend PCBs use a non-standard allocation path.
 
 ---
 
+## Dead End: nop_ret as apic_ops[2] During Resume
+
+**Test**: Point apic_ops[2] at `nop_ret` (bare `ret`, kdata-0x9d20ca). System enters rest mode, **never resumes**.
+
+**Conclusion**: The LAPIC resume caller checks the return value of xapic_mode. `nop_ret` returns whatever RAX contains at the call site (likely 0 or garbage). A non-1 return value causes the caller to take the wrong LAPIC access path (x2APIC MSR-based on XAPIC hardware), crashing during resume. **apic_ops[2] MUST return non-zero** (get_timer_freq's 0x13b0 works, bare ret does not).
+
+## Dead End: DMAP Access to Ktext Physical Pages
+
+Confirmed across multiple attempts: ktext physical pages are **completely unmapped from DMAP** (PTE = 0). The hypervisor removes ktext backing pages from the guest's DMAP region entirely. Cannot read ktext bytes through any guest-accessible path (VA, DMAP, or page table walk). Only execution-based probing works.
+
+---
+
