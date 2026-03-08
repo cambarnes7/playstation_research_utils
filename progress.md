@@ -1945,24 +1945,36 @@ In FreeBSD, `susppcbs` is a `struct pcb **` pointer in BSS. The pointer itself m
 in kdata BSS, but it points to heap-allocated PCB structures. The CR3 scan only searched
 for the CR3 VALUE in BSS — it wouldn't find a pointer-to-heap.
 
-### Next Step: ACPI Wakeup Trampoline via DMAP
+### DMAP Low-Memory CR3 Scan — FAILED
 
-In FreeBSD, `acpi_wakeup_cpus()` patches runtime values into a low-memory real-mode
-wakeup trampoline using `WAKECODE_FIXUP`:
+Scanned first 11MB of physical memory (pages 0-10, 1MB each) via DMAP for the CR3 value,
+looking for FreeBSD's ACPI wakeup trampoline containing `WAKECODE_FIXUP(wakeup_pdir, KPML4phys)`.
 
-```c
-WAKECODE_FIXUP(wakeup_pdir, uint64_t, KPML4phys);           // = CR3
-WAKECODE_FIXUP(wakeup_pcb,  uint64_t, (uint64_t)susppcbs[0]); // = PCB vaddr
-```
+**Results**: ZERO hits across all 11 pages. Every page completed without panic (DMAP reads
+of low physical memory work), but CR3 was not found.
 
-The trampoline lives at a low physical address (< 1MB). With DMAP_BASE, we can:
-1. Scan physical addresses 0x0000–0x100000 via DMAP for the CR3 value
-2. Locate the wakeup trampoline
-3. Read the adjacent `wakeup_pcb` fixup to get `susppcbs[0]` virtual address
-4. Dump the suspend PCB at that address
+**Likely causes**:
+1. Sony does not use FreeBSD's standard `WAKECODE_FIXUP` / ACPI wakeup trampoline
+2. CR3 may be stored at 4-byte alignment (scanner reads 8-byte-aligned qwords only)
+3. PS5 rest mode may use a completely custom suspend/resume mechanism
 
-This approach is targeted (1MB search space vs 44MB+), uses the DMAP_BASE we just
-discovered, and directly leads to the susppcbs PCBs.
+**Conclusion**: ACPI wakeup trampoline approach is a **dead end**. Cannot locate `susppcbs`
+through low physical memory scanning.
+
+### Next Step: Broad kdata BSS Pointer Scan
+
+Since the CR3-in-BSS scan found only kernel_pmap, and the DMAP low-memory scan found
+nothing, the remaining approach is to search kdata BSS for the `susppcbs` **pointer variable**
+itself (a heap address in BSS), rather than the PCB data it points to.
+
+The broad pointer filter (`fw_ver = 0x87 | (page << 8)`) matches any qword with
+`upper32 & 0xFFFF0000 == 0xFFFF0000` excluding `0xFFFFFFFF` (kdata/ktext). This catches:
+- Heap pointers (`0xffffff80...`) — where susppcbs points
+- DMAP pointers (`0xffffbff3...`) — kernel_pmap fields (control test)
+- Thread pointers (`0xffffXXXX...`) — other kernel globals
+
+**Deployment**: 11 runs (pages 0-10), all safe (read-only). Page 9 should find
+kernel_pmap DMAP pointers as a known control.
 
 ---
 
