@@ -56,6 +56,15 @@ to understand hypervisor behavior and kernel state management.
 - **Key finding**: No hardware breakpoints (DR0-3=0, DR7=default) — HV not using debug regs
 - **Key finding**: XCR0=7 — x87+SSE+AVX available, no AVX-512
 
+### v7: kdata Heap Pointer Scanner (Session 4, continued)
+- Mode 0x7: scan kdata for 0xffffff80 pointers (find susppcbs)
+- v7.0 hit -Os compiler bug: volatile locals corrupted, counters showed garbage
+- v7.1 fix: use output buffer directly as counters
+- v7.1 page 0: scanner works, 0 hits in first 4MB (genuine — no 0xffffff80 ptrs)
+- v7.1 page 0x193 (GSBASE area): kernel panic — **GSBASE/GDT/IDT are NOT in kdata**
+- **Key finding**: kdata segment is ~8-15MB, not 100+MB. Per-CPU structs, GDT, IDT
+  are in separately-allocated kernel virtual address space.
+
 ## Confirmed Data
 
 ### Constants Across All Sessions
@@ -144,10 +153,11 @@ SFMASK, CR0, CR3, CR4, GDT limit, IDT base+limit, GSBASE
 
 ## Kernel Memory Map
 
-### Address Ranges (observed across 3 boot sessions)
+### Address Ranges (observed across 4 boot sessions)
 | Range | Purpose | Example |
 |-------|---------|---------|
-| `0xffffffff8...`-`0xffffffffa...` | ktext + kdata (KASLR) | ktext_base, kdata_base, GSBASE, GDT, IDT |
+| `0xffffffff8...`-`0xffffffff9...` | ktext + kdata (KASLR, ~8-15MB each) | ktext_base, kdata_base |
+| `0xffffffff9d...`-`0xffffffffa...` | Per-CPU / descriptor tables (separate alloc) | GSBASE, GDT, IDT |
 | `0xfffff073...` / `0xffffdd17...` | Kernel malloc heap (threads) | curthread, pc_idlethread |
 | `0xffffff80...` | Kernel memory (PCBs, stacks) | td_pcb, pcb_rsp |
 | `0x00000008ff...` | User-space TLS (FSBASE) | Thread-local storage |
@@ -252,6 +262,30 @@ but td_pcb is always in 0xffffff80.
 - PCB CR fields zero for running threads (key insight for heap scanning)
 - curthread is ~0x400 bytes, mostly heap pointers in 0xfffff073/0xffffdd17 range
 
+### v7 kdata Heap Pointer Scanner — IN PROGRESS (Session 4)
+**Goal**: Find 0xffffff80 pointers in kdata to locate susppcbs.
+Rebuilt scanner with counters stored directly in output buffer (volatile locals
+corrupted by -Os in v7.0).
+
+**v7.0**: Counter corruption — hit_count showed 0xffffff800c824371 (a heap pointer
+value, not a count). Root cause: -Os reuses registers for volatile locals.
+
+**v7.1 page 0** (kdata + 0x00 to +0x400000): 0 hits, total_scanned=0x80000 ✓
+- Scanner working correctly. First 4MB of kdata has no 0xffffff80 pointers.
+
+**v7.1 page 0x193** (GSBASE area, kdata + 0x64C00000): **KERNEL PANIC**
+- **Critical discovery**: GSBASE, GDT, and IDT are NOT in the kdata segment.
+  They are in separately-allocated kernel virtual address space (per-CPU memory,
+  descriptor table allocations). The kdata segment is much smaller than 101MB.
+- This also explains why the v5.1 "112MB scan" found zero hits — it was scanning
+  unmapped memory, but the broken compiler output meant it never actually read
+  those addresses, so it didn't crash.
+- **kdata actual size**: Unknown, but likely 8-15MB. Pages 1-3 should be safe.
+
+**Key insight**: The GSBASE "self-test" was invalid — pc_curpcb IS 0xffffff80,
+but it's NOT in kdata. The scanner works correctly; kdata genuinely has
+zero 0xffffff80 pointers in the first 4MB.
+
 ---
 
 ## What We've Achieved
@@ -270,6 +304,9 @@ but td_pcb is always in 0xffffff80.
 13. Confirmed AMD MSRs all #GP trapped — HV blocks SYSCFG/VM_CR/VM_HSAVE_PA
 14. Confirmed no hardware breakpoints active (DR0-3=0, DR7=default)
 15. XCR0=7: x87+SSE+AVX available, no AVX-512
+16. v7 scanner working correctly (counter fix verified, total_scanned = 0x80000)
+17. Confirmed GSBASE/GDT/IDT are NOT in kdata segment (separate KVA allocation)
+18. kdata segment is ~8-15MB, not the assumed 100+MB
 
 ## Open Questions
 1. **Where is `susppcbs`?** Not in kdata globals, not in per-CPU structure.
@@ -280,8 +317,11 @@ but td_pcb is always in 0xffffff80.
 3. ~~Can we read AMD-specific MSRs?~~ **ANSWERED**: All #GP — HV traps them.
 4. ~~Can we safely read debug registers?~~ **ANSWERED**: Yes, all default/empty.
 5. What's in the rest of struct pcpu (+0x1C0..+0x900)?
-6. **Why did kdata scan find zero heap pointers?** Probable -Os compiler bug
-   or filter logic optimized away. Needs bulletproof reimplementation.
+6. ~~Why did kdata scan find zero heap pointers?~~ **PARTIALLY ANSWERED**: v7.1
+   scanner works correctly (counters verified). Zero 0xffffff80 hits in first
+   4MB is genuine — kdata .data section may not contain heap pointers. GSBASE
+   area (where heap pointers exist) is NOT in kdata. Remaining question: does
+   deeper kdata (pages 1-3) contain any, or is susppcbs a static array in BSS?
 7. **Can we call savectx without panic?** savectx has no trapped instructions
    (pure movq+ret), unlike rdmsr_start which hit sldt/str.
 
@@ -289,25 +329,51 @@ but td_pcb is always in 0xffffff80.
 
 ### ~~Option B: Complete CPU state~~ — DONE (v6)
 ### ~~Option G: Read ktext instructions~~ — IMPOSSIBLE (XOM)
+### ~~Option K: kdata heap pointer scan~~ — IN PROGRESS (v7, page 0 = 0 hits)
 
-### Option K: Targeted kdata BSS scan for heap pointers (RECOMMENDED)
-Previous kdata scan found zero hits — probable -Os compiler bug.
-Rewrite with bulletproof scanner: volatile everywhere, self-test against
-GSBASE area (known heap pointers exist there as control).
-Filter: value starts with 0xffffff80 (kernel heap range where PCBs live).
-susppcbs is a `static struct pcb **` in BSS → should be a heap pointer.
-**Risk**: LOW — read-only scan within kdata range.
+### Option L: Scan kdata for CR3 value after rest mode (RECOMMENDED)
+**Why this is the best next step**: The v7 scanner works correctly but found
+zero 0xffffff80 pointers in kdata page 0. This may be correct — kdata globals
+mostly contain integers, flags, and ktext function pointers, not heap pointers.
+
+**Key insight**: In some FreeBSD versions, `susppcbs` is a static array in BSS,
+not a pointer to heap:
+```c
+static struct pcb susppcbs[MAXCPU];  // PCBs directly in BSS
+```
+If this is the case, the PCBs are IN kdata, not on the heap. After a suspend/
+resume cycle, each susppcbs[cpu].pcb_cr3 would contain the CR3 value (a physical
+address like 0x1e104000), not a heap pointer.
+
+**Approach**:
+1. Put console into rest mode and wake it (if not already done this session)
+2. Scan kdata for the raw CR3 value (0x1e104000) — Mode 0x7 with new filter
+3. Any hit at address X means pcb_cr3 is at X, and the susppcbs entry starts
+   at X - pcb_cr3_offset (likely 0x68 in stock FreeBSD)
+4. Can also scan for CR0 (0x8005003b) as secondary confirmation
+
+**Risk**: LOW — read-only scan, just need a new filter mode.
+**Requires**: One code change (add CR3-value filter), rest mode cycle.
+
+### Option K continued: Scan kdata pages 1-3
+Continue sequential scan with broad filter (0xffff???? upper).
+Pages 1-3 cover kdata 4-16MB. Will establish kdata boundary (panic = end).
+**Risk**: LOW for pages 1-2, MEDIUM for page 3+ (may exceed kdata).
+**Value**: LOW-MEDIUM — even if we find pointers, need to follow each one.
 
 ### Option H: Try calling savectx
 savectx is a simple register-save function (movq sequences + ret).
 Unlike rdmsr_start, it has no trapped instructions.
+Calling it populates our td_pcb with CR0/CR2/CR3/CR4/DR0-7, revealing the
+exact PCB field offsets. This is THE most direct path to understanding PCB layout.
 **Risk**: MEDIUM — calling any ktext function has crashed before (rdmsr_start),
 but savectx is simpler and might work.
+**Value**: HIGH — directly reveals PCB CR/DR field offsets.
 
 ### Option I: Dump other CPUs' pcpu structs
 Read GSBASE ± N*0x900 to see all CPU per-CPU data. Find CPU 0.
-**Risk**: LOW — all in kdata range, proven mapped.
+**Risk**: LOW — GSBASE ± 0x900 proven mapped in Session 3.
 
 ### Option J: Expand pcpu dump (+0x1C0..+0x900)
 Per-CPU struct is 0x900 bytes, we only saw 0x1C0.
-**Risk**: LOW — within kdata range.
+**Risk**: LOW — within per-CPU allocation.

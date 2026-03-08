@@ -20,9 +20,10 @@
  * Mode (via fw_ver):
  *   0x5: CPUSTATE — complete CPU register snapshot (64 qwords)
  *   0x6: DUMP — curthread struct + td_pcb dump
- *   0x7: SCAN — kdata heap pointer scanner (find susppcbs)
- *         bits 8-31 of fw_ver = scan page (each page = 4MB)
- *         bit 7 = broaden filter (0xffff???? instead of 0xffffff80 only)
+ *   0x7: SCAN — kdata scanner (find susppcbs)
+ *         bits 5-6: filter (00=heap ptr, 01=CR3 exact, 10=CR0 exact)
+ *         bit 7: broaden ptr filter to 0xffff???? (only when bits 5-6=00)
+ *         bits 8-31: scan page (each page = 4MB)
  *
  * Output layout (uint64_t indices, 64 qwords = 0x200 bytes readback limit):
  *
@@ -343,47 +344,54 @@ int module_start(kproc_args *args)
         return 0;
     }
 
-    if ((mode & 0x7f) == 0x7) {
+    if ((mode & 0x07) == 0x7) {
         /* ============================================================
-         * MODE 0x7: kdata heap pointer scanner
+         * MODE 0x7: kdata scanner
          *
-         * Scans kdata for qwords with upper 32 bits == 0xffffff80.
-         * These are kernel heap pointers (PCBs, stacks).
-         * susppcbs in FreeBSD BSS is a pointer to heap-allocated PCBs
-         * in this range.
-         *
-         * Previous kdata scan (v5.1) found ZERO hits — probable -Os
-         * compiler bug. This version uses volatile everywhere and
-         * explicit per-qword reads to prevent optimization.
+         * Scans kdata for qwords matching a configurable filter.
+         * Used to find susppcbs and other kernel structures.
          *
          * fw_ver encoding:
-         *   bits 0-6:  mode (0x07)
-         *   bit 7:     if set, broaden filter to any 0xffff???? upper
-         *              (catches heap thread ptrs in 0xffff????... too)
+         *   bits 0-2:  mode (0x7)
+         *   bits 3-4:  unused
+         *   bits 5-6:  filter type:
+         *     0b00 (0x07): narrow — upper32 == 0xffffff80 (heap PCB ptrs)
+         *     0b01 (0x27): CR3 exact — match current CR3 value
+         *     0b10 (0x47): CR0 exact — match current CR0 value
+         *     0b11 (0x67): reserved
+         *   bit 7:     broaden narrow filter to 0xffff???? (heap ptrs)
+         *              only applies when bits 5-6 == 0b00
          *   bits 8-31: scan page (each page = 4MB = 0x400000 bytes)
-         *              page 0 = kdata_base, page 1 = kdata_base+4MB...
          *
-         * Self-test: set page to cover GSBASE area. pc_curpcb at
-         * GSBASE+0x20 is always 0xffffff80... — validates scanner.
+         * CR3 scan (0x27): after rest mode, susppcbs PCBs contain CR3.
+         *   Finds pcb_cr3 fields directly in kdata BSS.
+         *   fw_ver = 0x27 | (page << 8)
+         *
+         * CR0 scan (0x47): secondary confirmation — CR0 is constant.
+         *   fw_ver = 0x47 | (page << 8)
          *
          * Output layout (288 qwords):
          *   [0]   magic | status
          *   [1]   kdata_base
          *   [2]   ktext_base
-         *   [3]   scan_base (start of scanned range)
+         *   [3]   scan_base
          *   [4]   scan_end
          *   [5]   hit_count
-         *   [6]   last_scan_addr (where scanner stopped)
-         *   [7]   total_scanned (qwords checked)
+         *   [6]   last_scan_addr
+         *   [7]   total_scanned | (filter_type << 48)
          *   [8..287] hits: pairs of (address, value), up to 140 hits
-         *   [287] end marker (if not overwritten by hits)
          * ============================================================ */
         uint32_t raw_fwver = args->fw_ver;
         uint32_t page = raw_fwver >> 8;
+        uint32_t filter_type = (raw_fwver >> 5) & 3;
         uint32_t broad = (raw_fwver >> 7) & 1;
 
         uint64_t scan_base = kdata_base + (uint64_t)page * 0x400000ULL;
         uint64_t scan_end  = scan_base + 0x400000ULL;
+
+        /* Precompute search targets for exact-value filters */
+        uint64_t search_cr3 = cr3;
+        uint64_t search_cr0 = read_cr0();
 
         for (int i = 0; i < 288; i++) out[i] = 0;
 
@@ -393,9 +401,7 @@ int module_start(kproc_args *args)
         out[4] = scan_end;
 
         /* Use output buffer directly as counters — volatile locals
-         * get corrupted by -Os register reuse (v7 first run proved this:
-         * hit_count showed 0xffffff800c824371 instead of a small int).
-         * out[] is volatile uint64_t * so writes are not optimized away. */
+         * get corrupted by -Os register reuse (v7.0 proved this). */
         out[5] = 0;  /* hit_count */
         out[6] = 0;  /* last_scan_addr */
         out[7] = 0;  /* total_scanned */
@@ -403,13 +409,22 @@ int module_start(kproc_args *args)
         uint64_t addr;
         for (addr = scan_base; addr < scan_end; addr += 8) {
             uint64_t val = *(volatile uint64_t *)addr;
-            uint32_t upper = (uint32_t)(val >> 32);
 
-            int match;
-            if (broad)
-                match = (upper >> 16) == 0xffff && upper != 0xffffffff;
-            else
-                match = upper == 0xffffff80;
+            int match = 0;
+            if (filter_type == 1) {
+                /* CR3 exact match */
+                match = (val == search_cr3);
+            } else if (filter_type == 2) {
+                /* CR0 exact match */
+                match = (val == search_cr0);
+            } else {
+                /* Pointer pattern filter (original) */
+                uint32_t upper = (uint32_t)(val >> 32);
+                if (broad)
+                    match = (upper >> 16) == 0xffff && upper != 0xffffffff;
+                else
+                    match = upper == 0xffffff80;
+            }
 
             if (match && out[5] < 140) {
                 uint64_t idx = out[5];
@@ -420,7 +435,7 @@ int module_start(kproc_args *args)
         }
 
         out[6] = addr - 8;  /* last address scanned */
-        out[7] = (addr - scan_base) >> 3;  /* total qwords scanned */
+        out[7] = ((uint64_t)filter_type << 48) | ((addr - scan_base) >> 3);
 
         out32[0] = MAGIC_SCAP;
         out32[1] = 0x0007;
