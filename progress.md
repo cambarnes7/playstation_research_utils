@@ -1256,5 +1256,79 @@ printf '\x12\xCC\x00\x00' | nc 192.168.0.88 9022   # [18] set_tpr fn-3
 - Crash (step stuck at 0x100+idx) → fn-3 is NOT benign → could be C9 (leave;ret!) or other
 - RAX changed → fn-3 executed something that modified RAX
 
-**Status**: Built (976 bytes, no .bss), awaiting deployment.
+### fn-3 Probe Results
+
+| Entry | Name | Offset | fn-1 | fn-2 | fn-3 | Notes |
+|-------|------|--------|------|------|------|-------|
+| [2] | xapic_mode | +0x294340 | C3 | 48 (benign) | **benign** | Sentinel unchanged |
+| [14] | set_lvt_mode | +0x28E700 | C3 | 48 (benign) | **benign** | Sentinel unchanged |
+| [17] | lvt_eoi_clear | +0x2941D0 | C3 | 48 (benign) | **benign** | Sentinel unchanged |
+| [18] | set_tpr | +0x294348 | C3 | 48 (benign) | **benign** | Sentinel unchanged |
+
+**Conclusion**: All 4 fn-1=C3 entries have identical `?? 48 C3` epilogues. fn-3 is another benign prefix byte in every case. Sony Clang is completely consistent — no `leave;ret` (C9 C3) gadget exists anywhere near apic_ops function boundaries.
+
+**apic_ops is exhausted for gadget discovery.** Moving to sysent scanning.
+
+---
+
+## Phase 12: Sysent Scanner (resume_chain v10b)
+
+### Why Sysent?
+
+The 28 apic_ops entries come from a single compilation unit (`x86/apic/`) and share compiler flags — all use `48 C3` epilogues. The sysent table has 678 entries (~150 unique functions) spanning the entire kernel: hundreds of source files, different optimization levels, potentially hand-written asm. `leave;ret` (C9 C3) is much more likely among syscall handlers.
+
+### Sysent Table Layout
+
+From proven apic_dump.c results:
+```
+Base:        kdata + 0x1709c0
+Entry size:  0x30 (48 bytes) — struct sysent
+Fn ptr:      offset +0x08 within entry (sy_call_t*)
+Entries:     678 total (~150 unique after dedup)
+```
+
+### fw_ver Encoding (v10b, backward-compatible)
+
+```
+Existing (apic_ops):
+  0xEE00 + idx  → apic_ops[idx] fn-1 probe
+  0xDD00 + idx  → apic_ops[idx] fn-2 probe
+  0xCC00 + idx  → apic_ops[idx] fn-3 probe
+
+New (sysent, idx = 0-255 per page):
+  0xAA00 + idx  → sysent[idx] fn-1 probe        (entries 0-255)
+  0xAB00 + idx  → sysent[256+idx] fn-1 probe     (entries 256-511)
+  0xAC00 + idx  → sysent[512+idx] fn-1 probe     (entries 512-677)
+  0xBA00 + idx  → sysent[idx] fn-2 probe
+  0xBB00 + idx  → sysent[256+idx] fn-2 probe
+  0xBC00 + idx  → sysent[512+idx] fn-2 probe
+```
+
+### Output Layout
+
+Same as v10a with one new field:
+```
+out[0]     = MAGIC + status
+out[1]     = kdata_base
+out[2]     = ktext_base
+out[3]     = td_pcb
+out[4..31] = apic_ops fn ptrs (always dumped for reference)
+out[32]    = step progress
+out[33]    = real sysent index (page*256 + idx)
+out[34]    = target fn ptr
+out[35]    = probe address (fn - probe_offset)
+out[36]    = call result (RAX after call)
+out[37]    = verdict (1=executed, 2=sentinel/benign, 3=faulted)
+out[38]    = probe type (1=fn-1, 2=fn-2, 3=fn-3)
+out[39]    = source (0=apic_ops, 1=sysent)
+out[63]    = end marker
+```
+
+### Strategy
+
+1. Scan all sysent entries fn-1 (0xAA/AB/AC modes) — skip duplicates after first probe
+2. For every fn-1=C3 entry, immediately probe fn-2 (0xBA/BB/BC modes)
+3. If fn-2=C9 or crash → potential leave;ret gadget found
+
+**Status**: Building v10b payload.
 

