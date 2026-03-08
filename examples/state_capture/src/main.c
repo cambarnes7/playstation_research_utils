@@ -75,7 +75,10 @@
  *   [4]   cr3
  *   [5]   curthread
  *   [6]   td_pcb
- *   [20..275] td_pcb[0x00..0x7F8] (256 qwords = 2048 bytes)
+ *   --- curthread struct dump ---
+ *   [20..147]  curthread[0x00..0x3FF] (128 qwords = 1024 bytes)
+ *   --- td_pcb dump (proven safe at 0x200) ---
+ *   [160..223] td_pcb[0x00..0x1FF] (64 qwords = 512 bytes)
  *   [287] end marker
  */
 
@@ -251,9 +254,13 @@ int module_start(kproc_args *args)
 
     if (mode == 0x6) {
         /* ============================================================
-         * MODE 0x6: DUMP — Deep td_pcb dump (2KB)
+         * MODE 0x6: DUMP — curthread struct + td_pcb
          *
-         * Dumps 256 qwords (2048 bytes) of td_pcb for full PCB analysis.
+         * td_pcb is at the top of a kernel stack page — reading beyond
+         * ~0x200 bytes hits a guard page and panics (v5.1 learned this).
+         *
+         * Instead: dump the curthread struct (large slab allocation,
+         * safe to read ~0x400 bytes) plus td_pcb (0x200, proven safe).
          * ============================================================ */
         for (int i = 0; i < 288; i++) out[i] = 0;
 
@@ -271,14 +278,20 @@ int module_start(kproc_args *args)
             td_pcb = read8(curthread + TD_PCB);
         out[6] = td_pcb;
 
-        /* Dump 256 qwords = 0x800 bytes of td_pcb */
+        /* Dump curthread struct: 128 qwords = 0x400 bytes */
+        if (curthread) {
+            for (int i = 0; i < 128; i++)
+                out[20 + i] = read8(curthread + i * 8);
+        }
+
+        /* Dump td_pcb: 64 qwords = 0x200 bytes (proven safe) */
         if (td_pcb) {
-            for (int i = 0; i < 256 && (20 + i) < 276; i++)
-                out[20 + i] = read8(td_pcb + i * 8);
+            for (int i = 0; i < 64; i++)
+                out[160 + i] = read8(td_pcb + i * 8);
         }
 
         out32[0] = MAGIC_SCAP;
-        out32[1] = td_pcb ? 0x0006 : 0x00FD;
+        out32[1] = (curthread && td_pcb) ? 0x0006 : 0x00FD;
         out[287] = 0xdeadbeefcafe0060ULL;
         return 0;
     }
