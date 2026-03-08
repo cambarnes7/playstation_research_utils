@@ -1534,3 +1534,205 @@ done
 2. If any return verdict=1 (CC): those have INT3 padding at fn-1 — probe fn-2 for C9 (leave;ret)
 3. If any return verdict=3 (faulted): unusual, may indicate XOM page boundary or corrupted entry
 
+---
+
+## Phase 13: FreeBSD Source-Guided Analysis + savectx State Capture
+
+**Status: BUILT, AWAITING DEPLOYMENT**
+
+### Key Insight: Stop Blind Probing, Read the Source
+
+We have ~50 known ktext function offsets from the DEF() macro list. Each maps to a real FreeBSD kernel function whose behavior is **fully documented** in open-source FreeBSD. Instead of probing unknown bytes or guessing register state, we can read the FreeBSD source code and pick the right tool.
+
+### FreeBSD Source Analysis Results
+
+#### savectx (cpu_switch.S) — THE breakthrough candidate
+
+From FreeBSD `sys/amd64/amd64/cpu_switch.S`:
+
+```asm
+savectx:
+  movq (%rsp), %rax       ; save return address
+  movq %rax, PCB_RIP(%rdi)
+  movq %rbx, PCB_RBX(%rdi)
+  movq %rsp, PCB_RSP(%rdi)
+  movq %rbp, PCB_RBP(%rdi)
+  movq %r12-r15, PCB_R12-R15(%rdi)
+  movq %cr0-cr4, PCB_CR0-CR4(%rdi)
+  movq %dr0-dr7, PCB_DR0-DR7(%rdi)
+  rdmsr(FSBASE, GSBASE, KGSBASE, EFER, STAR, LSTAR, CSTAR, SF_MASK)
+  sgdt PCB_GDT(%rdi)
+  sidt PCB_IDT(%rdi)
+  sldt PCB_LDT(%rdi)
+  str  PCB_TR(%rdi)
+  movl $1, %eax           ; ← returns 1
+  ret
+```
+
+**Why savectx is perfect as apic_ops[2]:**
+1. Takes RDI as PCB pointer — writes ALL CPU state (GPRs, CRs, DRs, MSRs including **LSTAR**, GDT, IDT, TR)
+2. **Returns 1** — matches what Sony's xapic_mode returns (non-zero = "yes, XAPIC mode")
+3. If RDI → writable memory during resume: **non-crashing full state dump** AND system resumes normally
+4. This breaks the circular problem (need register state to pick gadget / need gadget to capture register state) in one shot
+
+#### resumectx (cpu_switch.S) — Total CPU control if RDI controllable
+
+```asm
+resumectx:
+  movq KPML4phys, %rax    ; load known-good page table
+  movq %rax, %cr3
+  ; restore ALL MSRs (FSBASE, GSBASE, EFER, STAR, LSTAR, CSTAR, SF_MASK)
+  ; restore CR0, CR2, CR4, CR3
+  ; restore IDT, LDT, TR
+  ; restore DR0-DR7
+  ; restore R15-R12, RBP, RSP, RBX
+  ; movq PCB_RIP(%rdi), %rax; movq %rax, (%rsp); ret → jumps to saved RIP
+```
+
+If RDI → fake PCB in kdata we control: **total CPU state control** including LSTAR, CR3, IDT, all registers, RIP.
+
+#### Offset-to-Function Reference (from FreeBSD source)
+
+| Offset | Function | Args | Return | As apic_ops[2]? |
+|--------|----------|------|--------|-----------------|
+| `wrmsr_ret` (-0x9d20cc) | wrmsr; ret | ECX=MSR#, EDX:EAX=val | - | Dangerous: unknown ECX |
+| `nop_ret` (wrmsr_ret+2) | ret | none | RAX unchanged | Test: does caller check retval? |
+| `rdmsr_start` (-0x9d0cfa) | rdmsr sequence | ECX=MSR#, writes [RDI] | - | Inside savectx, needs valid RDI |
+| `dr2gpr_start` (-0x9d6d93) | DR save | Reads DR0-7 to [RDI] | - | Needs valid RDI |
+| `gpr2dr_1_start` (-0x9d6c7a) | DR restore | Loads DR0-7 from [RDI] | - | **Sets debug breakpoints** from [RDI] |
+| `mov_cr3_rax` (-0x396f9e) | mov cr3, rax | RAX = new PT root | - | Crash unless RAX valid |
+| `mov_rdi_cr3` (-0x39700e) | mov rdi, cr3 | Reads CR3 → RDI | - | Safe read, needs chain |
+| `copyin` (-0x9908e0) | copyin(u,k,len) | RDI=src RSI=dst RDX=len | 0/EFAULT | Needs controlled regs |
+| `pop_all_iret` (-0x9cf8ab) | Restore trapframe + iretq | Pops 15 regs from stack | - | Full control from stack |
+| `savectx` (near cpu_switch) | **Save full CPU state** | **RDI=pcb** | **1** | **IDEAL** |
+| `resumectx` (near cpu_switch) | **Restore full CPU state** | **RDI=pcb** | via RIP | **Total control** |
+
+**Key insight**: Most powerful gadgets need **RDI pointing to controlled memory**. savectx lets us discover what RDI is, and if it's controllable, resumectx gives us everything.
+
+#### LAPIC Resume Call Path (from FreeBSD source)
+
+```
+lapic_resume(pic, suspend_cancelled)
+  → lapic_setup(0)
+    → native_lapic_setup(boot=0)
+      → lapic_id()           ; reads LAPIC_ID register
+      → lapic_set_tpr(0)     ; sets Task Priority Register
+      → lapic_enable()       ; enables LAPIC
+      → lapic_write32(...)   ; programs LVT entries
+      → timer setup
+```
+
+`native_lapic_setup()` does NOT call xapic_mode in upstream FreeBSD. **Sony added the xapic_mode call** — likely at the beginning of their modified resume path, before LAPIC register access (to ensure correct access mode: MMIO vs MSR).
+
+#### PCB Layout (FreeBSD `machine/pcb.h` + FreeBSD 11 additions)
+
+```
+Offset  Field           What savectx writes
+0x00    pcb_r15         R15
+0x08    pcb_r14         R14
+0x10    pcb_r13         R13
+0x18    pcb_r12         R12
+0x20    pcb_rbp         RBP            ← KEY: if kdata range, leave;ret works
+0x28    pcb_rsp         RSP            ← Stack pointer at call site
+0x30    pcb_rbx         RBX
+0x38    pcb_rip         Return address ← WHO called xapic_mode
+0x40    pcb_fsbase      MSR FS.base
+0x48    pcb_gsbase      MSR GS.base
+0x50    pcb_kgsbase     MSR KernelGS.base
+0x58    pcb_cr0         CR0            ← WP bit = HV active?
+0x60    pcb_cr2         CR2
+0x68    pcb_cr3         CR3            ← Page table root
+0x70    pcb_cr4         CR4
+0x78    pcb_dr0-dr7     DR0-DR7 (6 regs)
+0xA8    pcb_gdt         GDT descriptor (10 bytes)
+0xB2    pcb_idt         IDT descriptor (10 bytes)
+0xBC    pcb_ldt         LDT descriptor (10 bytes)
+0xC6    pcb_tr          TR selector
+~0xD0+  pcb_efer       MSR EFER       (FreeBSD 11 addition)
+~0xD8+  pcb_star       MSR STAR
+~0xE0+  pcb_lstar      MSR LSTAR      ← THE target
+~0xE8+  pcb_cstar      MSR CSTAR
+~0xF0+  pcb_sfmask     MSR SF_MASK
+0x108   pcb_onfault     Fault recovery (confirmed PS5 offset)
+```
+
+PS5's PCB is larger than FreeBSD 9.0 headers (pcb_onfault at 0x108 vs ~0xD0). Mode 0x4 (VERIFY) maps the exact layout.
+
+### state_capture Payload (`examples/state_capture/`)
+
+**Binary**: 3416 bytes. Four modes:
+
+#### Mode 0x4 — VERIFY (local savectx test)
+1. Scans kdata for pointers near cpu_switch (same as savectx_finder SCAN)
+2. For each candidate: calls it with RDI → kdata+0x400 buffer
+3. Verifies: return value == 1 AND saved CR3 matches actual CR3
+4. If match: confirmed savectx. Dumps 256 bytes of PCB, finds LSTAR offset
+5. Reports exact PCB layout for this PS5 firmware version
+
+**Deploy first** — runs during normal operation (no NPT NX issue), confirms savectx works.
+
+#### Mode 0x403 — LOCATE (find savectx address)
+Same scan + verification as Mode 0x4, but focused on reporting the savectx ktext address and all cpu_switch-range hits for analysis.
+
+#### Mode 0x2 — ARM (point apic_ops[2] at savectx)
+1. Finds savectx via scan + verification
+2. Saves LSTAR/CR3 fingerprints to kdata+0x200 (for READBACK matching)
+3. Saves original apic_ops[2] to kdata+0x210
+4. Overwrites apic_ops[2] with savectx address
+5. Writes sentinel to kdata+0x100
+6. **Leave armed for rest mode**
+
+#### Mode 0x3 — READBACK (scan for PCB dump after resume)
+1. Checks sentinel survived rest mode
+2. Reads fingerprints from kdata+0x200
+3. Calls savectx locally to determine LSTAR's PCB offset
+4. **Scans all kdata (up to 112MB)** for a region where:
+   - [addr + 0x68] == saved CR3 (PCB_CR3 offset)
+   - [addr + lstar_offset] == saved LSTAR
+   - [addr + 0x58] has PG+PE bits set (valid CR0)
+5. If found: dumps everything:
+   - pcb_rip → reveals WHO calls xapic_mode during resume
+   - pcb_rbp → tells us if leave;ret stack pivot is viable
+   - pcb_cr0 → WP bit reveals if HV is active at this point
+   - pcb_lstar → confirms LSTAR value during resume
+   - All debug registers, GDT, IDT, TR
+6. Restores apic_ops[2] to original xapic_mode
+
+### Deployment Plan
+
+```bash
+# Step 1: Local verify (normal operation, safe)
+printf "\\x04\\x00\\x00\\x00" | nc PS5_IP 9022
+cat state_capture.bin | nc PS5_IP 9022
+# Check: savectx found? PCB layout mapped? LSTAR offset identified?
+
+# Step 2: ARM for resume test
+printf "\\x02\\x00\\x00\\x00" | nc PS5_IP 9022
+cat state_capture.bin | nc PS5_IP 9022
+# Check: apic_ops[2] set to savectx? Fingerprints saved?
+
+# Step 3: Enter rest mode via PS5 UI, then resume
+
+# Step 4: READBACK
+printf "\\x03\\x00\\x00\\x00" | nc PS5_IP 9022
+cat state_capture.bin | nc PS5_IP 9022
+# Check: PCB found in kdata? Full register state dumped?
+```
+
+### What the State Dump Tells Us
+
+| Finding | Implication | Next Step |
+|---------|------------|-----------|
+| pcb_cr0 has WP clear | HV not active at this point | Use wrmsr_ret directly to set LSTAR |
+| pcb_cr0 has WP set | HV active, intercepting | Need ROP chain approach |
+| pcb_rbp → kdata range | leave;ret gives stack pivot | Build ROP chain at [RBP] |
+| pcb_rdi → kdata range | resumectx with fake PCB | Total CPU state control |
+| pcb_rsp → known stack | pop_all_iret controllable | Load all regs from stack |
+| pcb_rip → ktext addr | Identifies exact caller | Trace FreeBSD source for caller's register setup |
+
+### If savectx Crashes (RDI Invalid)
+
+**Fallback 1**: Test nop_ret (bare `ret`) as apic_ops[2] — determines if return value matters.
+**Fallback 2**: Overwrite OTHER apic_ops entries that receive known arguments (init gets vm_paddr_t in RDI, dump gets string pointer in RDI).
+**Fallback 3**: Find and modify susppcbs[0] PCB (used by ACPI save/resume, very early in resume path).
+
