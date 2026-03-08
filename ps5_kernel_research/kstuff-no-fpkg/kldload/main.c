@@ -1979,7 +1979,65 @@ static void _kldload(void* data, size_t data_size)
         uint32_t status = (uint32_t)(readback[0] >> 32);
         printf("[debug] kthread_args readback (status=0x%x):\n", status);
 
-        if (status == 0x008D || status == 0x018D) {
+        if (status == 0x008E || status == 0x018E) {
+            /* v8e: execution-based CC byte scanner */
+            uint64_t ktext = readback[2];
+            printf("\n=== v8e EXECUTION-BASED CC SCANNER ===\n");
+            printf("  kdata_base:  %#lx\n", readback[1]);
+            printf("  ktext_base:  %#lx\n", ktext);
+            printf("  td_pcb:      %#lx\n", readback[3]);
+            printf("  step:        %#lx (%s)\n", readback[32],
+                   status == 0x018E ? "COMPLETE" : "CRASHED");
+
+            static const char* names8e[] = {
+                "create", "init", "xapic_mode", "is_x2apic",
+                "setup", "dump", "disable", "set_id",
+                "ipi_raw", "ipi_vectored", "ipi_wait", "ipi_alloc",
+                "ipi_free", "set_lvt_mask", "set_lvt_mode", "set_lvt_polarity",
+                "set_lvt_triggermode", "lvt_eoi_clear", "set_tpr", "get_timer_freq",
+                "timer_enable_intr", "timer_disable_intr", "timer_set_divisor",
+                "timer_initial_count", "timer_current_count", "self_ipi",
+                "unknown_26", "unknown_27"
+            };
+
+            printf("\n  %-4s %-24s %-14s %s\n", "Slot", "Name", "ktext off", "Result");
+            printf("  %-4s %-24s %-14s %s\n", "----", "----", "---------", "------");
+            for (int i = 0; i < 28; i++) {
+                uint64_t fn = readback[4 + i];
+                uint64_t res = readback[33 + i];
+
+                if (fn == 0) continue;
+
+                const char* verdict;
+                if (res == 0x5B5B5B5B5B5B5B5BULL)
+                    verdict = "SKIPPED (dangerous)";
+                else if (res == 0xFAFAFAFAFAFAFAFAULL)
+                    verdict = "FAULTED (pcb_onfault)";
+                else if (res == 0xBAD0BAD0BAD0BAD0ULL)
+                    verdict = "C3 (ret, sentinel unchanged)";
+                else
+                    verdict = "<<< CC (INT3 → fn executed) >>>";
+
+                printf("  [%2d] %-24s ktext+%-8lx %s (RAX=%#lx)\n",
+                       i, names8e[i], fn - ktext, verdict, res);
+            }
+
+            uint64_t cc_bm = readback[61];
+            uint64_t c3_bm = readback[62];
+            printf("\n  cc_bitmap: 0x%08lx\n", cc_bm);
+            printf("  c3_bitmap: 0x%08lx\n", c3_bm);
+
+            if (cc_bm) {
+                printf("\n  >>> CC-PADDED ENTRIES: <<<\n");
+                for (int i = 0; i < 28; i++) {
+                    if (cc_bm & (1ULL << i))
+                        printf("  >>> [%2d] %s at ktext+%#lx <<<\n",
+                               i, names8e[i], readback[4 + i] - ktext);
+                }
+            }
+
+            printf("  end_marker: %#lx\n", readback[63]);
+        } else if (status == 0x008D || status == 0x018D) {
             /* v8d: ktext readability diagnostic */
             printf("\n=== v8d KTEXT READABILITY DIAGNOSTIC ===\n");
             printf("  kdata_base:     %#lx\n", readback[1]);

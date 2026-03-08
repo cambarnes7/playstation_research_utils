@@ -1008,5 +1008,21 @@ Step-by-step diagnostic with progress markers and magic written EARLY (so kldloa
 3. Read 1 byte from ktext with pcb_onfault (the dangerous test)
 Progress marker at out[32] shows how far we got. If step marker = 0x04 and status = in-progress, confirms ktext read crashed (XOM).
 
-**Status**: Built (680 bytes), awaiting deployment.
+**Status**: Superseded by v8e. ktext XOM confirmed (already documented in progress.md: "Cannot read ktext bytes through any path", "XOM enforced even through DMAP alias").
+
+### Phase 9e: v8e — Execution-Based CC Scanner
+
+Returned to the proven v7b execution-based approach: CALL fn-1 with sentinel in RAX, observe result. No ktext reads needed (XOM-safe).
+
+For each of the 28 apic_ops entries:
+1. Set IDT[3] = doreti_iret (IST=0) — catches INT3 via iretq, falls through to fn
+2. Arm pcb_onfault for crash recovery on weird bytes
+3. Load RAX = sentinel (0xBAD0BAD0BAD0BAD0)
+4. CALL fn-1
+5. Check RAX: unchanged = C3 (ret), changed = CC (INT3 → fn executed), 0xFAFA... = faulted
+
+Skips dangerous entries: [6] disable, [8] ipi_raw, [9] ipi_vectored, [23] timer_initial_count.
+Magic written early with step markers for crash diagnostics.
+
+**Status**: Built (904 bytes), awaiting deployment.
 
