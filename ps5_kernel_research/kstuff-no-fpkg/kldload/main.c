@@ -110,10 +110,20 @@ static void _kldload(void* data, size_t data_size)
         return;
     }
 
-    /* Clear NX bit on exec_code pages (mode=1: PTE walk via DMEM + TLB flush) */
+    /* Clear NX bit on all pages spanning exec_code.
+     * Kernel malloc doesn't guarantee page alignment, so code can span
+     * 2+ pages. Only the first page was cleared before — if probe_call
+     * or idt_set_handler land on the second page, we get an instant #PF. */
     printf("[debug] clearing NX bit on exec_code pages...\n");
-    uint64_t pte = kekcall_make_exec(exec_code, 1);
-    printf("[debug] kekcall_make_exec returned %#lx (original PTE)\n", pte);
+    {
+        uint64_t page_mask = ~(uint64_t)0xFFF;
+        uint64_t first_page = exec_code & page_mask;
+        uint64_t last_page  = (exec_code + data_size - 1) & page_mask;
+        for (uint64_t page = first_page; page <= last_page; page += 0x1000) {
+            uint64_t pte = kekcall_make_exec(page, 1);
+            printf("[debug] kekcall_make_exec(%#lx) returned %#lx\n", page, pte);
+        }
+    }
 
     /* Launch the kernel thread */
     printf("[debug] calling kproc_create via kekcall...\n");
