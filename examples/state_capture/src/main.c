@@ -358,7 +358,10 @@ int module_start(kproc_args *args)
          *     0b00 (0x07): narrow — upper32 == 0xffffff80 (heap PCB ptrs)
          *     0b01 (0x27): CR3 exact — match current CR3 value
          *     0b10 (0x47): CR0 exact — match current CR0 value
-         *     0b11 (0x67): reserved
+         *     0b11 (0x67): MEMDUMP — dump 32 qwords from target address
+         *              target = kdata_base + 0x33ed600 + page * 0x100
+         *              page=0: dumps PCB candidate at +0x33ed600
+         *              page=1: dumps +0x33ed700, etc.
          *   bit 7:     broaden narrow filter to 0xffff???? (heap ptrs)
          *              only applies when bits 5-6 == 0b00
          *   bits 8-31: scan page (each page = 4MB = 0x400000 bytes)
@@ -406,36 +409,51 @@ int module_start(kproc_args *args)
         out[6] = 0;  /* last_scan_addr */
         out[7] = 0;  /* total_scanned */
 
-        uint64_t addr;
-        for (addr = scan_base; addr < scan_end; addr += 8) {
-            uint64_t val = *(volatile uint64_t *)addr;
+        if (filter_type == 3) {
+            /* MEMDUMP: dump 32 qwords from target address */
+            uint64_t target = kdata_base + 0x33ed600ULL + (uint64_t)page * 0x100ULL;
+            out[3] = target;           /* report target address */
+            out[4] = target + 0x100;   /* end */
+            out[5] = 32;               /* "hit_count" = number of qwords dumped */
+            out[6] = target;
+            out[7] = ((uint64_t)filter_type << 48) | 32;
 
-            int match = 0;
-            if (filter_type == 1) {
-                /* CR3 exact match */
-                match = (val == search_cr3);
-            } else if (filter_type == 2) {
-                /* CR0 exact match */
-                match = (val == search_cr0);
-            } else {
-                /* Pointer pattern filter (original) */
-                uint32_t upper = (uint32_t)(val >> 32);
-                if (broad)
-                    match = (upper >> 16) == 0xffff && upper != 0xffffffff;
-                else
-                    match = upper == 0xffffff80;
+            for (int i = 0; i < 32; i++) {
+                out[8 + i * 2]     = target + i * 8;  /* address */
+                out[8 + i * 2 + 1] = *(volatile uint64_t *)(target + i * 8); /* value */
+            }
+        } else {
+            uint64_t addr;
+            for (addr = scan_base; addr < scan_end; addr += 8) {
+                uint64_t val = *(volatile uint64_t *)addr;
+
+                int match = 0;
+                if (filter_type == 1) {
+                    /* CR3 exact match */
+                    match = (val == search_cr3);
+                } else if (filter_type == 2) {
+                    /* CR0 exact match */
+                    match = (val == search_cr0);
+                } else {
+                    /* Pointer pattern filter (original) */
+                    uint32_t upper = (uint32_t)(val >> 32);
+                    if (broad)
+                        match = (upper >> 16) == 0xffff && upper != 0xffffffff;
+                    else
+                        match = upper == 0xffffff80;
+                }
+
+                if (match && out[5] < 140) {
+                    uint64_t idx = out[5];
+                    out[8 + idx * 2]     = addr;
+                    out[8 + idx * 2 + 1] = val;
+                    out[5] = idx + 1;
+                }
             }
 
-            if (match && out[5] < 140) {
-                uint64_t idx = out[5];
-                out[8 + idx * 2]     = addr;
-                out[8 + idx * 2 + 1] = val;
-                out[5] = idx + 1;
-            }
+            out[6] = addr - 8;  /* last address scanned */
+            out[7] = ((uint64_t)filter_type << 48) | ((addr - scan_base) >> 3);
         }
-
-        out[6] = addr - 8;  /* last address scanned */
-        out[7] = ((uint64_t)filter_type << 48) | ((addr - scan_base) >> 3);
 
         out32[0] = MAGIC_SCAP;
         out32[1] = 0x0007;
