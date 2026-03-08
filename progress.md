@@ -2046,3 +2046,148 @@ Spectre v1 Flush+Reload attack attempted to speculatively read ktext bytes and l
 
 ---
 
+## Session 11: DR+IDT Persistence Strategy — Research & Worst-Case Analysis
+
+### FreeBSD 11 Source Research Findings
+
+Fetched and analyzed FreeBSD 11 amd64 source code for `cpu_switch.S`, `savectx()`/`resumectx()`, `acpi_wakeup.c`, and `pcb.h`.
+
+#### Key Finding 1: savectx/resumectx handle DRs UNCONDITIONALLY
+
+```asm
+; savectx: saves ALL DRs (no PCB_DBREGS check)
+movq %dr0,%rax / movq %rax,PCB_DR0(%rdi)  ; through DR7
+
+; resumectx: restores ALL DRs (no PCB_DBREGS check)
+movq PCB_DR0(%rdi),%rax / movq %rax,%dr0   ; through DR7
+
+; resumectx also restores IDT:
+lidt PCB_IDT(%rdi)
+```
+
+This is the ACPI suspend/resume path. On standard FreeBSD 11, any DR values present at suspend time are saved into `susppcbs[cpu].sp_pcb` by `savectx()` and restored on resume by `resumectx()`. No PCB_DBREGS flag check — completely unconditional.
+
+#### Key Finding 2: cpu_switch handles DRs CONDITIONALLY
+
+```asm
+; Save path (old thread):
+testl   $PCB_DBREGS, PCB_FLAGS(%r8)
+jnz     store_dr          ; only if PCB_DBREGS (0x02) set in pcb_flags
+; store_dr: saves DR0-3,DR6,DR7 to PCB, then clears DR7
+
+; Restore path (new thread):
+testl   $PCB_DBREGS, PCB_FLAGS(%r8)
+jnz     load_dr           ; only if PCB_DBREGS set
+; load_dr: loads DR0-3,DR6,DR7 from PCB to hardware
+```
+
+This is the normal context switch path. DR save/restore only happens if `pcb_flags & PCB_DBREGS`. On the restore side, cpu_switch loads DR values from the PCB into hardware registers.
+
+#### Key Finding 3: susppcbs structure
+
+```c
+struct susppcb {
+    struct pcb  sp_pcb;           /* full PCB for suspend context */
+    void       *sp_fpususpend;    /* FPU state save area */
+};
+// Allocated: susppcbs = malloc(mp_ncpus * sizeof(*susppcbs), M_DEVBUF, M_WAITOK);
+// One per CPU, dynamically allocated
+```
+
+Suspend flow uses setjmp-like semantics: `savectx(pcb)` returns non-zero initially (saving), returns 0 when `resumectx(pcb)` restores context (waking).
+
+#### Key Finding 4: IDT saved via sidt, restored via lidt
+
+`savectx()` does `sidt PCB_IDT(%rdi)` — saves the current IDTR (base + limit). `resumectx()` does `lidt PCB_IDT(%rdi)` — reloads IDTR from the saved value. The IDT TABLE itself (in kdata) is not copied — just the register that points to it. This is why our IDT modifications persist: the table in kdata memory is unchanged, and the IDTR is restored to point at it.
+
+### kstuff Mechanism Research
+
+Analyzed sleirsgoevy's ps5-kstuff from `ps4jb-payloads/bd-jb/ps5-kstuff/`:
+
+#### Pointer Poisoning
+
+kstuff uses "pointer poisoning" to hook kernel functions without text patching. Replaces top 16 bits of function pointers with `0xdeb7` (non-canonical address). When dereferenced → #GP (IDT[13]) → kstuff's handler fixes the pointer and emulates the call.
+
+#### IDT Hooks
+
+- **IDT[1] (#DB)**: Debug trap handler — fires on hardware breakpoint (DR0-DR3) hits
+- **IDT[13] (#GP)**: General protection fault — fires on poisoned pointer dereference
+- **IDT[2] (NMI)**: Redirected to `doreti_iret`
+- Uses **IST3** and **IST7** (from code analysis) for dedicated interrupt stacks
+
+#### DR Usage
+
+Sets DR0-DR3 as execution breakpoints on specific kernel code addresses (e.g., `kmem_alloc` internals). When the CPU executes the breakpoint address → #DB fires → IDT[1] handler patches the instruction on-the-fly using register manipulation (can't write ktext, but can manipulate the return context to skip/modify behavior).
+
+**Critical**: kstuff does NOT persist through rest mode. It must be re-deployed after every boot/resume. Our goal is to make this mechanism persist.
+
+### Worst-Case Scenario Analysis
+
+#### Unknown 1: DR persistence through rest mode
+
+| Scenario | Probability | Evidence |
+|----------|------------|---------|
+| DRs persist (savectx saves them) | Medium | FreeBSD 11 savectx does it unconditionally |
+| DRs zeroed (Sony removed from suspend path) | Medium | susppcbs not found (line 2029), Sony modifies everything |
+| DRs zeroed (HV clears in wakeup trampoline) | Low | HV doesn't intercept DR access during normal operation |
+
+**Worst case**: DRs zeroed. savectx/resumectx don't exist on PS5 or Sony's wakeup trampoline explicitly zeros DRs.
+
+**Recovery**: Approach B (PCB_DBREGS via cpu_switch). cpu_switch confirmed running during resume. If PCB_DBREGS flag triggers DR loading from PCB, DRs get armed during first context switch after resume (normal operation, post-NPT window).
+
+**If Approach B also fails**: Approach C (sysent hijack) — pure kdata, no DRs needed.
+
+#### Unknown 2: PCB_DBREGS flag loading on PS5
+
+| Scenario | Probability | Evidence |
+|----------|------------|---------|
+| cpu_switch checks PCB_DBREGS | High | Core FreeBSD debugger support, hard to remove without breaking ptrace |
+| Sony removed DR handling from cpu_switch | Low | Would break kernel debugger, ptrace DR support |
+
+**Worst case**: PCB_DBREGS ignored. cpu_switch never loads DRs from PCB.
+
+**Recovery**: Only matters if DRs don't persist natively. If both fail → sysent hijack (Approach C), GPU DMA, or VMMCALL.
+
+**Key insight**: This is testable pre-suspend (no risk). Write DR values to current thread's PCB, set PCB_DBREGS, trigger context switch, read DRs back.
+
+#### Unknown 3: Sysent dispatch CFI
+
+| Scenario | Probability | Evidence |
+|----------|------------|---------|
+| No CFI on sysent dispatch | High | apic_ops has no CFI, PS5 kernel predates LLVM kernel CFI |
+| CFI active on sysent dispatch | Low | Sony could add CFI selectively |
+
+**Worst case**: Sysent indirect call checks CFI → panic when calling kdata handler.
+
+**Recovery**: This failure is learned pre-suspend (immediate test, single-boot crash, no persistence damage). Non-blocking because DR+IDT approaches (A/B) don't use sysent.
+
+#### Unknown 4: Kdata execution post-resume
+
+| Scenario | Probability | Evidence |
+|----------|------------|---------|
+| Kdata execution works post-resume | Very High | kstuff works on 4.03, IDT mods proven to persist and system runs stably |
+| HV blocks kdata execution permanently after resume | Very Low | Would break kstuff entirely, contradicts Phase 7 results |
+
+**Worst case**: HV permanently marks kdata NX after resume cycle.
+
+**Recovery**: GPU DMA (bypass NPT via IOMMU path), VMMCALL probing (17 untested hypercalls), or ktext-only ROP chains via IDT+iretq gadgets.
+
+#### Nuclear worst case: Everything fails simultaneously
+
+DRs zeroed + PCB_DBREGS removed + sysent CFI + kdata NX post-resume.
+
+**Remaining vectors**:
+1. **GPU DMA** (unexplored on 4.03, proven concept on 6.00+ by flatz)
+2. **VMMCALL hypercalls** (17 untested, IOMMU-related)
+3. **Alternative apic_ops entries** (init/dump receive known args, unexplored)
+4. **LAPIC timer hijack** (point IDT timer entry to ktext gadget chain)
+
+### Action Items
+
+1. **Deploy suspend_stackprobe** ARM → rest mode → READBACK → check DR sentinel slots [39-43]
+2. **Build PCB_DBREGS pre-flight test** (normal operation, no rest mode needed)
+3. **Build sysent CFI test** (normal operation, no rest mode needed)
+4. Based on results, build the appropriate DR+IDT hook payload
+
+---
+
