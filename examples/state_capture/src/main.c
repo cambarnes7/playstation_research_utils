@@ -392,15 +392,18 @@ int module_start(kproc_args *args)
         out[3] = scan_base;
         out[4] = scan_end;
 
-        volatile uint64_t hit_count = 0;
-        volatile uint64_t total_scanned = 0;
-        volatile uint64_t last_addr = scan_base;
+        /* Use output buffer directly as counters — volatile locals
+         * get corrupted by -Os register reuse (v7 first run proved this:
+         * hit_count showed 0xffffff800c824371 instead of a small int).
+         * out[] is volatile uint64_t * so writes are not optimized away. */
+        out[5] = 0;  /* hit_count */
+        out[6] = 0;  /* last_scan_addr */
+        out[7] = 0;  /* total_scanned */
 
         uint64_t addr;
         for (addr = scan_base; addr < scan_end; addr += 8) {
-            volatile uint64_t val = *(volatile uint64_t *)addr;
+            uint64_t val = *(volatile uint64_t *)addr;
             uint32_t upper = (uint32_t)(val >> 32);
-            total_scanned++;
 
             int match;
             if (broad)
@@ -408,17 +411,16 @@ int module_start(kproc_args *args)
             else
                 match = upper == 0xffffff80;
 
-            if (match && hit_count < 140) {
-                out[8 + hit_count * 2]     = addr;
-                out[8 + hit_count * 2 + 1] = val;
-                hit_count++;
+            if (match && out[5] < 140) {
+                uint64_t idx = out[5];
+                out[8 + idx * 2]     = addr;
+                out[8 + idx * 2 + 1] = val;
+                out[5] = idx + 1;
             }
-            last_addr = addr;
         }
 
-        out[5] = hit_count;
-        out[6] = last_addr;
-        out[7] = total_scanned;
+        out[6] = addr - 8;  /* last address scanned */
+        out[7] = (addr - scan_base) >> 3;  /* total qwords scanned */
 
         out32[0] = MAGIC_SCAP;
         out32[1] = 0x0007;
