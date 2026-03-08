@@ -272,13 +272,14 @@ int module_start(kproc_args *args)
         out[26] = idt.base;
         out[27] = idt.limit;
 
-        /* [28-32] AMD-specific MSRs — MAY #GP IF HV-TRAPPED
-         * If this run panics, comment out these 5 lines and rebuild. */
-        out[28] = rdmsr(MSR_SYSCFG);
-        out[29] = rdmsr(MSR_TOP_MEM);
-        out[30] = rdmsr(MSR_TOP_MEM2);
-        out[31] = rdmsr(MSR_VM_CR);
-        out[32] = rdmsr(MSR_VM_HSAVE_PA);
+        /* [28-32] AMD-specific MSRs — CONFIRMED #GP (panic in v6 first run)
+         * The hypervisor traps these. Left as zero.
+         * TODO: test individually to find which specific MSR(s) trap. */
+        /* out[28] = rdmsr(MSR_SYSCFG);      — #GP trapped */
+        /* out[29] = rdmsr(MSR_TOP_MEM);      — #GP trapped */
+        /* out[30] = rdmsr(MSR_TOP_MEM2);     — #GP trapped */
+        /* out[31] = rdmsr(MSR_VM_CR);        — #GP trapped */
+        /* out[32] = rdmsr(MSR_VM_HSAVE_PA);  — #GP trapped */
 
         /* [33-37] Per-CPU summary (key fields from struct pcpu at GSBASE) */
         out[33] = read8(gsbase + 0x00);  /* pc_curthread */
