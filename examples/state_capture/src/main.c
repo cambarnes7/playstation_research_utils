@@ -9,12 +9,17 @@
  *   (swapgs/iret), crashes during LAPIC resume
  * - PCB scan found 0 results on fresh boot (no savectx called yet)
  *
- * v3 approach:
- * - Probe ktext addresses near cpu_switch to find savectx
- * - savectx is in cpu_switch.S, after gpr2dr_2_start (+0x3F9)
+ * v3 approach (FIXED probe range):
+ * - rdmsr_start (-0x9d0cfa) is the MSR save sequence INSIDE savectx
+ * - savectx entry is ~0x80-0xA0 bytes before rdmsr_start
+ * - Probe narrow range: rdmsr_start-0x100 to rdmsr_start+0x10
  * - ENTRY() macro uses .p2align 4, so probe 16-byte aligned addrs
  * - Signature: returns 1 AND writes current CR3 to [RDI+0x68]
  * - Use pcb_onfault for fault recovery during probing
+ *
+ * Previous probe range (cpu_switch+0x500 to +0x1500) was wrong —
+ * savectx is at ~cpu_switch+0x6200, not +0x500. The old range hit
+ * random destructive kernel functions causing delayed panics.
  *
  * Mode (via fw_ver):
  *   0x4:   FIND    — probe ktext to find savectx, map PCB layout
@@ -81,6 +86,7 @@
 /* FW 4.03 offsets */
 #define APIC_OPS_OFF_KTEXT   0x1934AC8
 #define CPU_SWITCH_OFF       (-0x9d6f80)
+#define RDMSR_START_OFF      (-0x9d0cfa)  /* MSR save sequence inside savectx */
 
 /* kdata regions */
 #define SENTINEL_OFF     0x100
@@ -235,13 +241,18 @@ int module_start(kproc_args *args)
         uint32_t probes_ret1 = 0;
         uint32_t log_idx = 0;
 
-        /* Probe 16-byte aligned ktext addresses after cpu_switch.
-         * Range: +0x500 to +0x1500 (covers cpu_throw + savectx + resumectx).
-         * This is ~128 probes. */
-        uint64_t probe_start = (cpu_switch + 0x500) & ~0xFULL;
+        /* rdmsr_start is the MSR save sequence INSIDE savectx.
+         * savectx entry is ~0x80-0xA0 bytes before rdmsr_start
+         * (GPR saves + CR saves + DR saves).
+         * Probe a narrow range: rdmsr_start-0x100 to rdmsr_start+0x10.
+         * All probes land inside savectx's register-to-memory stores
+         * (safe) or padding (faults caught by pcb_onfault). */
+        uint64_t rdmsr_start_addr = kdata_base + (int64_t)RDMSR_START_OFF;
+        uint64_t probe_start = (rdmsr_start_addr - 0x100) & ~0xFULL;
+        uint64_t probe_end = rdmsr_start_addr + 0x10;
 
         for (uint64_t addr = probe_start;
-             addr < cpu_switch + 0x1500 && !savectx_addr;
+             addr < probe_end && !savectx_addr;
              addr += 0x10) {
             probes_tried++;
 
@@ -337,7 +348,6 @@ int module_start(kproc_args *args)
 
         if (!savectx_addr) {
             /* Try to find it now */
-            uint64_t cpu_switch = kdata_base + (int64_t)CPU_SWITCH_OFF;
             uint64_t curthread;
             __asm__ volatile("movq %%gs:0, %0" : "=r"(curthread));
             uint64_t td_pcb = read8(curthread + TD_PCB);
@@ -345,9 +355,11 @@ int module_start(kproc_args *args)
 
             if (onfault_addr) {
                 uint64_t pcb_buf = kdata_base + PCB_BUF_OFF;
-                uint64_t probe_start = (cpu_switch + 0x500) & ~0xFULL;
-                for (uint64_t addr = probe_start;
-                     addr < cpu_switch + 0x1500 && !savectx_addr;
+                uint64_t rdmsr_start_addr = kdata_base + (int64_t)RDMSR_START_OFF;
+                uint64_t ps = (rdmsr_start_addr - 0x100) & ~0xFULL;
+                uint64_t pe = rdmsr_start_addr + 0x10;
+                for (uint64_t addr = ps;
+                     addr < pe && !savectx_addr;
                      addr += 0x10) {
                     for (int i = 0; i < PCB_SCAN_SIZE / 8; i++)
                         write8(pcb_buf + i * 8, 0);
@@ -448,7 +460,6 @@ int module_start(kproc_args *args)
         /* Also try to discover lstar_offset if we don't have it */
         if (!saved_lstar_off) {
             /* Find savectx and call it locally to discover layout */
-            uint64_t cpu_switch = kdata_base + (int64_t)CPU_SWITCH_OFF;
             uint64_t curthread;
             __asm__ volatile("movq %%gs:0, %0" : "=r"(curthread));
             uint64_t td_pcb = read8(curthread + TD_PCB);
@@ -456,9 +467,11 @@ int module_start(kproc_args *args)
 
             if (onfault_addr) {
                 uint64_t pcb_buf = kdata_base + PCB_BUF_OFF;
-                uint64_t probe_start = (cpu_switch + 0x500) & ~0xFULL;
-                for (uint64_t addr = probe_start;
-                     addr < cpu_switch + 0x1500;
+                uint64_t rdmsr_start_addr = kdata_base + (int64_t)RDMSR_START_OFF;
+                uint64_t ps = (rdmsr_start_addr - 0x100) & ~0xFULL;
+                uint64_t pe = rdmsr_start_addr + 0x10;
+                for (uint64_t addr = ps;
+                     addr < pe;
                      addr += 0x10) {
                     for (int i = 0; i < PCB_SCAN_SIZE / 8; i++)
                         write8(pcb_buf + i * 8, 0);

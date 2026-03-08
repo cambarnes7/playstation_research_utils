@@ -1736,3 +1736,81 @@ cat state_capture.bin | nc PS5_IP 9022
 **Fallback 2**: Overwrite OTHER apic_ops entries that receive known arguments (init gets vm_paddr_t in RDI, dump gets string pointer in RDI).
 **Fallback 3**: Find and modify susppcbs[0] PCB (used by ACPI save/resume, very early in resume path).
 
+---
+
+## Phase 14: kdata_scanner + Probe Range Fix
+
+### kdata_scanner Results
+
+Built `kdata_scanner` payload to scan kdata for all ktext pointers without executing anything. Scans 4.4MB across 4 kdata regions. Added paged output (modes 0x403-0x408, 57 entries per page) to work within kldloader's 0x1f8 readback limit.
+
+**Results**: 270 unique ktext pointers found across 5 pages (57+57+57+57+42).
+
+**Critical finding — cpu_switch dark zone:**
+- Normalizing to offsets from ktext_base (stable across boots):
+  - Page 0's last entry: offset ~0x190160 from ktext_base
+  - Page 1's first entry: offset ~0x290160 from ktext_base
+  - cpu_switch is at ktext_base + 0x229080
+- **cpu_switch sits in a ~1MB gap with ZERO kdata references**
+- savectx, resumectx, cpu_throw — none are referenced from any kdata function pointer table
+- They're called exclusively via direct `call` instructions within ktext
+
+### state_capture v3 Crash Root Cause
+
+Deployed Mode 0x4 (FIND) — **instant system crash** (30-second delayed kernel panic).
+
+**Root cause**: The probe range was `cpu_switch + 0x500` to `cpu_switch + 0x1500`. Computing offsets from the DEF() macros in offsets.c reveals this range is **20KB away from savectx**:
+
+```
+Offset from cpu_switch (FW 4.03):
++0x0000: cpu_switch        (-0x9d6f80)
++0x01ED: dr2gpr_start      (-0x9d6d93)
++0x0306: gpr2dr_1_start    (-0x9d6c7a)
++0x03F9: gpr2dr_2_start    (-0x9d6b87)
+  ← OLD PROBE RANGE: +0x500 to +0x1500 (WRONG — random destructive functions) →
++0x4EB4: wrmsr_ret         (-0x9d20cc)  inside resumectx
++0x4EB6: nop_ret           (wrmsr_ret+2)
++0x6286: rdmsr_start       (-0x9d0cfa)  inside savectx (MSR save sequence)
+  ← savectx entry is ~0x80-0xA0 bytes BEFORE rdmsr_start →
+```
+
+The probes hit random kernel functions between cpu_throw and resumectx. pcb_onfault only catches page faults, not "this function acquired locks and corrupted the scheduler."
+
+### Fix: Precision Probe Near rdmsr_start
+
+`rdmsr_start` (-0x9d0cfa) is the MSR save sequence **inside** savectx. Before it:
+- GPR saves (movq %rbx/%rsp/%rbp/%r12-r15 to [RDI]) ≈ 34 bytes
+- CR saves (movq %cr0-%cr4 via %rax to [RDI]) ≈ 28 bytes
+- DR saves (movq %dr0-%dr7 via %rax to [RDI]) ≈ 60 bytes
+- Total ≈ 122 bytes
+
+savectx entry ≈ `rdmsr_start - 0x7A` to `- 0xA0` ≈ **cpu_switch + 0x61E6 to 0x620C** (16-byte aligned: ~0x6200)
+
+**New probe range**: `rdmsr_start - 0x100` to `rdmsr_start + 0x10` (only 17 probes)
+
+All probes land in:
+- savectx's register-to-memory store code (safe `movq %reg, offset(%rdi)`)
+- savectx's entry point (full save + return 1)
+- Padding (NOPs/INT3 → fault caught by pcb_onfault)
+
+**Status**: state_capture v3 rebuilt with fixed probe range. Binary: `examples/state_capture/state_capture.bin`.
+
+### Deployment Plan (Revised)
+
+```bash
+# Mode 0x4: FIND savectx (safe — narrow probe range)
+printf '\x04\x00\x00\x00' | nc PS5_IP 9022
+cat state_capture.bin | nc PS5_IP 9022
+# Expected: savectx found at ~cpu_switch + 0x6200, returns 1, CR3 match
+
+# Mode 0x2: ARM apic_ops[2] = savectx
+printf '\x02\x00\x00\x00' | nc PS5_IP 9022
+cat state_capture.bin | nc PS5_IP 9022
+
+# Enter rest mode via PS5 UI, then resume
+
+# Mode 0x3: READBACK — scan for PCB dump
+printf '\x03\x00\x00\x00' | nc PS5_IP 9022
+cat state_capture.bin | nc PS5_IP 9022
+```
+
