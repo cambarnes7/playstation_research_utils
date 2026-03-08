@@ -1979,7 +1979,54 @@ static void _kldload(void* data, size_t data_size)
         uint32_t status = (uint32_t)(readback[0] >> 32);
         printf("[debug] kthread_args readback (status=0x%x):\n", status);
 
-        if (status == 0x018F || status == 0x00FE || status == 0x00FF || status == 0x01F0) {
+        if (status == 0x0191) {
+            /* v9a: CC bounce ARM */
+            printf("\n=== v9a CC BOUNCE — ARM ===\n");
+            printf("  kdata_base:        %#lx\n", readback[1]);
+            printf("  ktext_base:        %#lx\n", readback[2]);
+            printf("  doreti_iret:       %#lx\n", readback[3]);
+            printf("  orig xapic_mode:   %#lx\n", readback[4]);
+            printf("  CC target (fn-1):  %#lx (get_timer_freq - 1)\n", readback[5]);
+            printf("  orig IDT[3] hndlr: %#lx\n", readback[6]);
+            printf("  new  IDT[3] hndlr: %#lx%s\n", readback[7],
+                   readback[7] == readback[3] ? " (= doreti_iret)" : " MISMATCH");
+            printf("  saved IDT[3] lo:   %#lx\n", readback[8]);
+            printf("  saved IDT[3] hi:   %#lx\n", readback[9]);
+            printf("  saved apic_ops[2]: %#lx\n", readback[10]);
+            printf("\n  >>> ARMED: IDT[3]=doreti_iret, apic_ops[2]=CC byte <<<\n");
+            printf("  >>> Enter rest mode to test CC bounce persistence <<<\n");
+            printf("  >>> After resume, send fw_ver=0x0903 + binary for READBACK <<<\n");
+            printf("  end_marker: %#lx\n", readback[63]);
+        } else if (status == 0x0193) {
+            /* v9a: CC bounce READBACK */
+            printf("\n=== v9a CC BOUNCE — READBACK ===\n");
+            printf("  kdata_base:        %#lx\n", readback[1]);
+            printf("  ktext_base:        %#lx\n", readback[2]);
+            printf("  cur IDT[3] hndlr:  %#lx\n", readback[3]);
+            printf("  cur apic_ops[2]:   %#lx\n", readback[4]);
+            printf("  armed marker:      %#lx%s\n", readback[5],
+                   readback[5] == 0xCC90CC90CC90CC90ULL ? " (survived)" : " (lost)");
+            printf("  armed mode:        %#lx\n", readback[6]);
+            printf("  cur IDT[3] lo:     %#lx\n", readback[7]);
+            printf("  cur IDT[3] hi:     %#lx\n", readback[8]);
+
+            if (readback[9])
+                printf("\n  >>> IDT[3] = doreti_iret PERSISTED through rest mode <<<\n");
+            else
+                printf("\n  IDT[3] handler did NOT persist (was restored by ACPI?)\n");
+
+            if (readback[10])
+                printf("  >>> apic_ops[2] = CC byte PERSISTED through rest mode <<<\n");
+            else
+                printf("  apic_ops[2] did NOT persist\n");
+
+            if (readback[9] && readback[10])
+                printf("\n  >>> SUCCESS: CC BOUNCE SURVIVED REST MODE! <<<\n");
+
+            printf("\n  Restored IDT[3]:     %s\n", readback[11] ? "YES" : "NO");
+            printf("  Restored apic_ops[2]: %s\n", readback[12] ? "YES" : "NO");
+            printf("  end_marker: %#lx\n", readback[63]);
+        } else if (status == 0x018F || status == 0x00FE || status == 0x00FF || status == 0x01F0) {
             /* v8f: single-probe CC scanner */
             uint64_t ktext = readback[2];
             int target_idx = (int)readback[33];

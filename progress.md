@@ -1057,5 +1057,66 @@ Magic written early with step markers for crash diagnostics.
 - out[35] = call result (RAX after fn-1 call)
 - out[36] = verdict: 1=CC, 2=C3, 3=faulted
 
-**Status**: Built (864 bytes, no .bss), awaiting deployment. Start with control test (fw_ver=0xEE02).
+**Status**: Deployed. Results below.
+
+### v8f Probe Results
+
+| Entry | Name | Offset | fw_ver | Result |
+|-------|------|--------|--------|--------|
+| [2] | xapic_mode | +0x294340 | 0xEE02 | **C3** (control test, sentinel unchanged) |
+| [24] | timer_current_count | +0x290800 | 0xEE18 | **PANIC** (fn-1 not CC or C3) |
+| [14] | set_lvt_mode | +0x28E700 | 0xEE0E | **C3** (sentinel unchanged) |
+| [19] | get_timer_freq | +0x294320 | 0xEE13 | **CC** — RAX=0x13b0 (timer freq) |
+
+**CONFIRMED: get_timer_freq - 1 (ktext+0x29431F) = 0xCC (INT3)**
+
+The doreti_iret bounce caught the INT3, get_timer_freq executed and returned the LAPIC timer frequency (0x13b0 = 5040). This is the CC entry we need for the persistence chain.
+
+---
+
+## Phase 10: CC Bounce Persistence Test (resume_chain v9a)
+
+### Context
+
+v7 mode 0x2 failed because xapic_mode-1 = C3 (not CC). Now that v8f confirmed get_timer_freq-1 = CC, we can retry the doreti_iret bounce with the correct CC byte.
+
+### v9a Design
+
+Simple bounce test: `apic_ops[2] = get_timer_freq - 1` (CC byte) + `IDT[3] = doreti_iret, IST=0`.
+
+During LAPIC resume:
+```
+call *apic_ops[2]  (= ktext+0x29431F = CC byte)
+  → INT3 fires
+  → IDT[3] = doreti_iret (iretq)
+  → CPU pushes {RIP=get_timer_freq, CS, RFLAGS, RSP, SS}
+  → iretq pops everything back
+  → get_timer_freq executes, returns 0x13b0
+  → clean return to LAPIC caller
+```
+
+Properties:
+- Self-sustaining across all CPUs (each uses own kernel stack, no IST)
+- No ROP chain, no IST, no multi-CPU race
+- get_timer_freq is read-only and safe
+
+### Modes
+
+- `fw_ver=0x0901` (ARM): Set IDT[3]=doreti_iret IST=0, apic_ops[2]=CC byte, save originals to kdata persistence area
+- `fw_ver=0x0903` (READBACK): After resume, verify persistence, restore originals
+
+### Key Addresses
+
+- CC byte: `ktext+0x29431F` (get_timer_freq - 1)
+- doreti_iret: `kdata + (-0x9cf84c)`
+- Persistence area: `kdata+0x200` (marker, mode, saved originals)
+
+**Status**: Built (888 bytes, no .bss), awaiting deployment.
+
+**Deployment**:
+1. `printf '\x01\x09\x00\x00' | nc 192.168.0.88 9022` → ARM
+2. Send binary → confirm armed output
+3. Enter rest mode
+4. After resume: `printf '\x03\x09\x00\x00' | nc 192.168.0.88 9022` → READBACK
+5. Send binary → verify persistence
 
