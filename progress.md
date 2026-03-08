@@ -1443,13 +1443,51 @@ cat resume_chain.bin | nc 192.168.0.88 9022          # batch 2
 
 **Binary**: 1432 bytes, no .bss. All existing v10b probe modes preserved (0xAA-0xBC, 0xCC-0xEE).
 
-**Status**: Built, awaiting deployment.
+**Status**: All 3 batches deployed and captured successfully. Full analysis below.
 
-### Next Steps After Dedup
+### Phase 12b: Sysent Dedup Results
 
-1. Identify all unique fn ptrs from the 678-entry dump
-2. Classify by ktext offset range — entries from different compilation units are higher-priority targets
-3. Use execution-based probing (v8f sentinel technique) on the ~150 unique fn ptrs, prioritizing:
-   - Entries at unusual ktext offsets (different source files may use `leave;ret`)
-   - Entries with fn ptrs far from the main syscall handler cluster
+All 3 v10c batches completed (status=0x110C). Full 678-entry sysent table captured.
+
+**Summary:**
+```
+678 sysent entries total
+  234 nosys (unimplemented)     = ktext+0x2984d8
+  444 with handlers
+  406 distinct handler functions
+    4 handlers shared by multiple syscalls
+  All handlers in 7,120-byte span: ktext+0x297180 to ktext+0x298d50
+```
+
+**Key findings:**
+
+1. **No outliers** — every single syscall handler lives in one 7KB compilation unit (`ktext+0x2971xx` to `ktext+0x298dxx`). No entries from different source files, no far-off outliers. This means all syscall wrappers were compiled together with identical calling conventions.
+
+2. **nosys** = `ktext+0x2984d8` (234 entries, 34.5% of table). Consistent across all 3 batches.
+
+3. **Two additional "stub" handlers** shared by many syscalls:
+   - `ktext+0x2985a8`: 28 syscalls (indices 154-155, 169-171, 220-231, 339, 377, 457-462, 505, 510-512) — likely `lkmnosys` or similar unloaded-module stub
+   - `ktext+0x298918`: 10 syscalls (indices 210-219) — likely a block of related unimplemented calls
+
+4. **Only 2 other shared handlers:**
+   - `ktext+0x297598`: sysent[254, 275]
+   - `ktext+0x297e18`: sysent[65, 277]
+
+5. **Fn ptr spacing**: predominantly 8-byte aligned. Most common spacings: 8 bytes (184×), 16 bytes (107×), 24 bytes (54×). Densely packed function stubs.
+
+6. **No overlap with apic_ops** — sysent handlers (`0x2971xx`) are in a completely different region from apic_ops (`0x28D1xx-0x29E8xx`). Despite nearby ktext ranges, no actual fn ptr collisions.
+
+**Effective unique targets for execution probing:**
+- 406 distinct fn ptrs total
+- Minus nosys (1) = 405
+- Minus `ktext+0x2985a8` stub (1) and `ktext+0x298918` stub (1) = 403
+- These 403 are the real candidates for `leave;ret` (C9 C3) gadget hunting
+
+### Next Steps
+
+1. **Execution-based probing of sysent handlers**: Use v8f sentinel technique on the 403 unique real handlers. Since all are in the same 7KB span, they likely all use the same epilogue (`48 C3` = `rex.W ret`), but execution probing is the only way to confirm since ktext is XOM.
+
+2. **Priority targets**: The 403 handlers are densely packed with 8-byte spacing — many are likely very short wrapper functions. Short wrappers (e.g., `mov eax, ENOSYS; ret`) are more likely to have useful byte patterns at fn-1.
+
+3. **Batch execution probe**: Build a v10d payload that iterates through unique sysent fn ptrs, calling fn-1 for each with the sentinel technique. Can batch ~50 per deployment (limited by readback buffer) = ~8 deployments for full coverage.
 
