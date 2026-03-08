@@ -1024,5 +1024,38 @@ For each of the 28 apic_ops entries:
 Skips dangerous entries: [6] disable, [8] ipi_raw, [9] ipi_vectored, [23] timer_initial_count.
 Magic written early with step markers for crash diagnostics.
 
-**Status**: Built (904 bytes), awaiting deployment.
+**Status**: Crashed instantly — pcb_onfault only catches #PF, not #UD/#GP from arbitrary fn-1 bytes. Bulk scanning abandoned.
+
+### v8f: Single-Probe CC Scanner (Safe)
+
+**Approach**: Probe ONE apic_ops entry per deployment, selected by fw_ver encoding.
+- `fw_ver = 0xEE00 + entry_index` selects which entry to probe
+- Only one CALL to fn-1 per deployment — limits blast radius to one reboot if non-CC/non-C3
+- IDT[3] set to doreti_iret before probe, restored after
+- Magic written LAST (no early readback race)
+
+**Why single-probe works**:
+- If fn-1 = CC (INT3): doreti_iret catches it → fn executes → clean return with RAX result
+- If fn-1 = C3 (ret): immediate return, sentinel unchanged
+- If fn-1 = other: kernel panic, reboot, try next candidate
+- pcb_onfault armed but only helps with #PF — main safety is choosing likely-CC entries first
+
+**Probe priority** (by alignment + safety, highest CC probability first):
+1. `fw_ver=0xEE02` → [2] xapic_mode — **CONTROL TEST** (known C3, validates mechanism)
+2. `fw_ver=0xEE18` → [24] timer_current_count (+0x290800, 256-byte aligned, read-only)
+3. `fw_ver=0xEE0E` → [14] set_lvt_mode (+0x28E700, 256-byte aligned)
+4. `fw_ver=0xEE13` → [19] get_timer_freq (+0x294320, 32-byte aligned, read-only)
+5. `fw_ver=0xEE0A` → [10] ipi_wait (+0x290240, 64-byte aligned)
+
+**Evidence CC exists**: PS5 kernel uses CC padding (copyin-1 = CC confirmed). 15 of 28 entries are 16-byte+ aligned. Entries [14] and [24] are 256-byte aligned → near-certain CC at fn-1.
+
+**Output layout** (64 uint64_t slots):
+- out[0] = MAGIC (lo32) + status (hi32): 0x018F = complete
+- out[1] = kdata_base, out[2] = ktext_base, out[3] = td_pcb
+- out[4..31] = all 28 fn ptrs (from kdata, safe read)
+- out[33] = target entry index, out[34] = target fn ptr
+- out[35] = call result (RAX after fn-1 call)
+- out[36] = verdict: 1=CC, 2=C3, 3=faulted
+
+**Status**: Built (864 bytes, no .bss), awaiting deployment. Start with control test (fw_ver=0xEE02).
 

