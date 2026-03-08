@@ -2040,5 +2040,9 @@ suspend mechanism entirely, or suspend PCBs use a non-standard allocation path.
 
 Confirmed across multiple attempts: ktext physical pages are **completely unmapped from DMAP** (PTE = 0). The hypervisor removes ktext backing pages from the guest's DMAP region entirely. Cannot read ktext bytes through any guest-accessible path (VA, DMAP, or page table walk). Only execution-based probing works.
 
+## Dead End: Spectre v1 Side-Channel to Read Ktext (XOM Bypass)
+
+Spectre v1 Flush+Reload attack attempted to speculatively read ktext bytes and leak via cache timing. **Failed**: NPT (nested page tables) enforce XOM even on speculative accesses. The hypervisor's NPT marks ktext pages as execute-only at the hardware level — speculative loads fault in the MMU before reaching the cache. Cannot bypass XOM via any known microarchitectural side-channel on this platform.
+
 ---
 
