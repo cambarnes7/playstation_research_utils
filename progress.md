@@ -1736,6 +1736,8 @@ cat state_capture.bin | nc PS5_IP 9022
 **Fallback 2**: Overwrite OTHER apic_ops entries that receive known arguments (init gets vm_paddr_t in RDI, dump gets string pointer in RDI).
 **Fallback 3**: Find and modify susppcbs[0] PCB (used by ACPI save/resume, very early in resume path).
 
+**UPDATE (Session 10)**: RDI confirmed invalid during resume (R8 gamble). savectx as apic_ops[2] is not viable. Fallback 3 (susppcbs) is now the primary approach — see Phase 16.
+
 ---
 
 ## Phase 14: kdata_scanner + Probe Range Fix
@@ -1865,4 +1867,102 @@ printf '\x05\x00\x00\x00' | nc PS5_IP 9022
 cat state_capture.bin | nc PS5_IP 9022
 # Expected: additional PCB(s) with LSTAR and full MSR state
 ```
+
+---
+
+## Phase 16: CR3 Scan Results + kernel_pmap_store Discovery
+
+### CR3 Scan of kdata BSS (state_capture v7.2, Mode 0x7 filter_type 1)
+
+Scanned 44MB of kdata BSS (pages 0-10, each 4MB) for the exact CR3 value after rest mode.
+
+**Results**: ONE hit across entire 44MB scan.
+
+| Boot | kdata_base | CR3 | Hit Address | Offset from kdata |
+|------|-----------|-----|-------------|-------------------|
+| Boot 1 | `0xffffffff97800000` | `0x1df34000` | `0xffffffff99fed6c8` | **+0x27ed6c8** |
+| Boot 2 | `0xffffffff8d1d0000` | `0x13904000` | `0xffffffff8f9bd6c8` | **+0x27ed6c8** |
+
+**Offset +0x27ed6c8 is stable across boots** (different KASLR slides, different CR3 values).
+
+### Memory Dump at kdata+0x27ed600 (MEMDUMP filter_type 3)
+
+Dumped 32 qwords (256 bytes) around the hit. Structure analysis:
+
+```
+Offset  Value                    Interpretation
++0x00   0x0000000000000000       (lock/zero)
++0x08   self-pointer             TAILQ_HEAD (points to +0x00)
++0x10-  zeros
++0x38   0x7fffffffffffffff       CPU bitmask (all CPUs active)
++0x40-  zeros
++0x98   0x0000000000000031       Flags
++0xa0   ktext pointer            Function pointer (ktext+0xF0E951)
++0xa8   0x0000000001430000       Physical address
++0xb8   0x0000000000000004       Small constant
++0xc0   0xffffbff313904000       pm_pml4 (virtual addr of PML4 via DMAP)
++0xc8   0x0000000013904000       pm_cr3 (physical CR3)
++0xd0   0x0000000000000000
++0xd8   pointer to +0xd0         List linkage
+```
+
+### Identification: kernel_pmap_store (NOT susppcbs)
+
+This is the **kernel pmap** (`kernel_pmap_store`), the page map structure for the kernel
+address space. Key evidence:
+- Self-pointer at +0x08 (TAILQ list head, standard for pmap)
+- CPU bitmask `0x7fffffffffffffff` at +0x38 (pm_active, all CPUs)
+- Two CR3 representations: virtual PML4 at +0xc0, physical CR3 at +0xc8
+- Structure is mostly zeros with sparse metadata — NOT a PCB (which would have saved registers)
+
+### DMAP Base Derivation
+
+From the pmap structure:
+```
+DMAP_BASE = pm_pml4_va - CR3_phys
+          = 0xffffbff313904000 - 0x13904000
+          = 0xffffbff300000000
+```
+
+**DMAP_BASE = `0xffffbff300000000`** — any physical address can be read as `DMAP_BASE + phys_addr`.
+
+### Key Discoveries
+
+| Finding | Value | Significance |
+|---------|-------|-------------|
+| kernel_pmap_store | kdata + 0x27ed600 | Kernel page map, stable offset |
+| DMAP_BASE | `0xffffbff300000000` | Physical memory readable via DMAP |
+| susppcbs NOT in kdata BSS | Confirmed (1 hit in 44MB = kernel_pmap only) | Must search elsewhere |
+| kdata BSS extends 44MB+ | Pages 0-10 safe, no panic | Larger than initially estimated |
+
+### Implications for susppcbs Search
+
+The single CR3 hit proves **susppcbs PCB data is NOT in kdata BSS**. It's heap-allocated
+(in the `0xffffff80...` range), consistent with `state_capture/progress.md` findings
+("Mode 0x5 found 0 PCBs: thread PCBs are heap-allocated, not in kdata").
+
+In FreeBSD, `susppcbs` is a `struct pcb **` pointer in BSS. The pointer itself might be
+in kdata BSS, but it points to heap-allocated PCB structures. The CR3 scan only searched
+for the CR3 VALUE in BSS — it wouldn't find a pointer-to-heap.
+
+### Next Step: ACPI Wakeup Trampoline via DMAP
+
+In FreeBSD, `acpi_wakeup_cpus()` patches runtime values into a low-memory real-mode
+wakeup trampoline using `WAKECODE_FIXUP`:
+
+```c
+WAKECODE_FIXUP(wakeup_pdir, uint64_t, KPML4phys);           // = CR3
+WAKECODE_FIXUP(wakeup_pcb,  uint64_t, (uint64_t)susppcbs[0]); // = PCB vaddr
+```
+
+The trampoline lives at a low physical address (< 1MB). With DMAP_BASE, we can:
+1. Scan physical addresses 0x0000–0x100000 via DMAP for the CR3 value
+2. Locate the wakeup trampoline
+3. Read the adjacent `wakeup_pcb` fixup to get `susppcbs[0]` virtual address
+4. Dump the suspend PCB at that address
+
+This approach is targeted (1MB search space vs 44MB+), uses the DMAP_BASE we just
+discovered, and directly leads to the susppcbs PCBs.
+
+---
 

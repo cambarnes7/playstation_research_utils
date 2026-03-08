@@ -362,13 +362,25 @@ int module_start(kproc_args *args)
          *              target = kdata_base + 0x27ed600 + page * 0x100
          *              page=0: dumps PCB candidate at +0x27ed600
          *              page=1: dumps +0x27ed700, etc.
-         *   bit 7:     broaden narrow filter to 0xffff???? (heap ptrs)
-         *              only applies when bits 5-6 == 0b00
-         *   bits 8-31: scan page (each page = 4MB = 0x400000 bytes)
+         *   bit 7:     modifier flag:
+         *     filter 0b00 + bit7: broaden to 0xffff???? (heap ptrs)
+         *     filter 0b01 + bit7 (0xA7): DMAP CR3 scan — scan low physical
+         *       memory via DMAP for CR3 value (ACPI wakeup trampoline).
+         *       DMAP_BASE derived from kernel_pmap_store at kdata+0x27ed600.
+         *       scan_base = DMAP_BASE + page * 0x100000 (1MB pages)
+         *     filter 0b11 + bit7 (0xE7): DMAP MEMDUMP — dump 32 qwords from
+         *       DMAP_BASE + page * 0x100 (fine-grained physical memory dump)
+         *   bits 8-31: scan page
+         *     Normal modes: page * 4MB from kdata_base
+         *     DMAP CR3 (0xA7): page * 1MB from DMAP_BASE
+         *     DMAP MEMDUMP (0xE7): DMAP_BASE + page * 0x100
          *
-         * CR3 scan (0x27): after rest mode, susppcbs PCBs contain CR3.
-         *   Finds pcb_cr3 fields directly in kdata BSS.
+         * CR3 scan (0x27): scan kdata BSS for CR3 value.
          *   fw_ver = 0x27 | (page << 8)
+         *
+         * DMAP CR3 scan (0xA7): scan low physical memory for CR3 value.
+         *   Finds ACPI wakeup trampoline containing susppcbs[0] address.
+         *   fw_ver = 0xA7 | (page << 8)
          *
          * CR0 scan (0x47): secondary confirmation — CR0 is constant.
          *   fw_ver = 0x47 | (page << 8)
@@ -389,8 +401,23 @@ int module_start(kproc_args *args)
         uint32_t filter_type = (raw_fwver >> 5) & 3;
         uint32_t broad = (raw_fwver >> 7) & 1;
 
-        uint64_t scan_base = kdata_base + (uint64_t)page * 0x400000ULL;
-        uint64_t scan_end  = scan_base + 0x400000ULL;
+        /* Derive DMAP base from kernel_pmap_store at kdata+0x27ed600 */
+        uint64_t pmap_addr = kdata_base + 0x27ed600ULL;
+        uint64_t pm_pml4 = *(volatile uint64_t *)(pmap_addr + 0xc0);
+        uint64_t pm_cr3  = *(volatile uint64_t *)(pmap_addr + 0xc8);
+        uint64_t dmap_base = pm_pml4 - pm_cr3;
+
+        /* Compute scan range based on mode */
+        uint64_t scan_base, scan_end;
+        if (broad && filter_type == 1) {
+            /* DMAP CR3 scan: 1MB pages of physical memory */
+            scan_base = dmap_base + (uint64_t)page * 0x100000ULL;
+            scan_end  = scan_base + 0x100000ULL;
+        } else {
+            /* Normal kdata scan: 4MB pages */
+            scan_base = kdata_base + (uint64_t)page * 0x400000ULL;
+            scan_end  = scan_base + 0x400000ULL;
+        }
 
         /* Precompute search targets for exact-value filters */
         uint64_t search_cr3 = cr3;
@@ -409,18 +436,31 @@ int module_start(kproc_args *args)
         out[6] = 0;  /* last_scan_addr */
         out[7] = 0;  /* total_scanned */
 
-        if (filter_type == 3) {
-            /* MEMDUMP: dump 32 qwords from target address */
+        if (filter_type == 3 && broad) {
+            /* DMAP MEMDUMP: dump 32 qwords from DMAP physical address */
+            uint64_t target = dmap_base + (uint64_t)page * 0x100ULL;
+            out[3] = target;
+            out[4] = target + 0x100;
+            out[5] = 32;
+            out[6] = dmap_base;  /* report DMAP base for reference */
+            out[7] = ((uint64_t)filter_type << 48) | 32;
+
+            for (int i = 0; i < 32; i++) {
+                out[8 + i * 2]     = target + i * 8;
+                out[8 + i * 2 + 1] = *(volatile uint64_t *)(target + i * 8);
+            }
+        } else if (filter_type == 3) {
+            /* kdata MEMDUMP: dump 32 qwords from kdata offset */
             uint64_t target = kdata_base + 0x27ed600ULL + (uint64_t)page * 0x100ULL;
-            out[3] = target;           /* report target address */
-            out[4] = target + 0x100;   /* end */
-            out[5] = 32;               /* "hit_count" = number of qwords dumped */
+            out[3] = target;
+            out[4] = target + 0x100;
+            out[5] = 32;
             out[6] = target;
             out[7] = ((uint64_t)filter_type << 48) | 32;
 
             for (int i = 0; i < 32; i++) {
-                out[8 + i * 2]     = target + i * 8;  /* address */
-                out[8 + i * 2 + 1] = *(volatile uint64_t *)(target + i * 8); /* value */
+                out[8 + i * 2]     = target + i * 8;
+                out[8 + i * 2 + 1] = *(volatile uint64_t *)(target + i * 8);
             }
         } else {
             uint64_t addr;
