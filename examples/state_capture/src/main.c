@@ -212,10 +212,15 @@ int module_start(kproc_args *args)
         /* Single-pass kdata scan for:
          * 1. LSTAR value (susppcbs PCB after resume)
          * 2. CR3 value (PCB identification)
-         * 3. Heap pointers in 0xffffff80... range (susppcbs discovery)
+         * 3. Kernel heap pointers (susppcbs discovery)
          *
-         * For heap pointers, track consecutive runs — an array of 4+
-         * consecutive heap pointers is likely susppcbs (MAXCPU pcb ptrs).
+         * Heap pointer detection: canonical kernel ptr (0xffff...)
+         * that is NOT in the kdata or ktext range. This catches both
+         * the 0xffffff80... range (where PCBs live) and the
+         * 0xffffdd17... range (kernel malloc heap).
+         *
+         * Track consecutive runs — an array of 4+ consecutive heap
+         * pointers is likely susppcbs (MAXCPU pcb pointer array).
          */
         uint32_t lstar_hits = 0;
         uint32_t cr3_hits = 0;
@@ -229,6 +234,11 @@ int module_start(kproc_args *args)
         uint32_t best_run_len = 0;
         uint64_t prev_heap_addr = 0;
 
+        /* Ranges to exclude (kdata and ktext are NOT heap) */
+        uint64_t kdata_end = scan_end;
+        uint64_t ktext_start = ktext_base;
+        uint64_t ktext_end = ktext_base + 0x2000000;
+
         for (uint64_t addr = kdata_base; addr < scan_end; addr += 8) {
             uint64_t val = read8(addr);
             if (val == lstar) {
@@ -241,8 +251,10 @@ int module_start(kproc_args *args)
                     out[135 + cr3_hits] = addr;
                 cr3_hits++;
             }
-            /* Heap pointer: 0xffffff80_XXXXXXXX (where td_pcb lives) */
-            if ((val >> 32) == 0xffffff80ULL) {
+            /* Kernel heap pointer: canonical kernel addr, not kdata/ktext */
+            if ((val >> 48) == 0xffffULL && val > 0xffff000000000000ULL &&
+                !(val >= kdata_base && val < kdata_end) &&
+                !(val >= ktext_start && val < ktext_end)) {
                 heap_ptr_total++;
                 if (addr == prev_heap_addr + 8) {
                     run_len++;
