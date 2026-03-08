@@ -2004,8 +2004,29 @@ Control test passed: many DMAP pointers (`0xffffbff3...`) from kernel_pmap_store
   of the same structure or nearby structures in BSS.
 - Hit 1 is isolated ~0xD0000 earlier — likely a different structure.
 
-**Next step**: Follow each pointer — dump 32 qwords (256 bytes) from the heap address
-each points to. If any target contains CR3 at PCB offset 0x68, it's a suspend PCB.
+### Pointer Follow Results (fw_ver=0xC7)
+
+Followed all 4 heap pointers — **none are PCBs**:
+
+| Hit | kdata offset | Heap target | Identity | Evidence |
+|-----|-------------|-------------|----------|----------|
+| 1 | +0x256c1e0 | `0xffffff80931e3c00` | Descriptor/segment table | Repeating `0xffff` limits at 16-byte stride |
+| 2 | +0x263a058 | `0xffffff8003afccb0` | Empty allocated buffer | All zeros after single back-pointer to kdata |
+| 3 | +0x263ae10 | `0xffffff80049a0000` | UMA zone allocator metadata | Self-referential ptrs, ktext fn ptr at +0x58, 0x88-byte repeating elements |
+| 4 | +0x263ae70 | `0xffffff8003af77f8` | Live kernel variable | Value changed between scan and follow (now `0xffffffff8fc0c5b8`) |
+
+### susppcbs Search — EXHAUSTED
+
+| Approach | Result |
+|----------|--------|
+| CR3-in-kdata-BSS scan (44MB, 11 pages) | 1 hit = kernel_pmap_store (not susppcbs) |
+| DMAP low-memory CR3 scan (11MB) | 0 hits (Sony doesn't use WAKECODE_FIXUP) |
+| Broad BSS pointer scan (44MB, 0xFFFFxxxx filter) | 4 heap ptrs = allocator/descriptor metadata |
+| Pointer follow of all 4 candidates | None are PCBs (no CR3, no saved registers) |
+
+**Conclusion**: `susppcbs` is either not in kdata BSS, Sony replaced FreeBSD's ACPI
+suspend mechanism entirely, or suspend PCBs use a non-standard allocation path.
+**The susppcbs approach is a dead end.**
 
 ---
 
