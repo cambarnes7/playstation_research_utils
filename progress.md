@@ -1330,5 +1330,64 @@ out[63]    = end marker
 2. For every fn-1=C3 entry, immediately probe fn-2 (0xBA/BB/BC modes)
 3. If fn-2=C9 or crash → potential leave;ret gadget found
 
-**Status**: Building v10b payload.
+**Status**: v10b payload deployed. Initial scan in progress.
+
+---
+
+## Sysent fn-1 Probe Results (v10b)
+
+### Scan Results — Real Syscall Handlers (0x88b5xxxx region)
+
+All real syscall handler fn ptrs on this boot are clustered in the `0xffffffff88b5xxxx` range. Every fn-1 read in this region **faults** (#PF caught by pcb_onfault, error code 3).
+
+| Sysent Index | fn ptr | fn-1 byte | Result |
+|-------------|--------|-----------|--------|
+| 3 (read) | 0xffffffff88b575d0 | FAULT | error=3 |
+| 4 (write) | 0xffffffff88b583f0 | FAULT | error=3 |
+| 5 (open) | 0xffffffff88b578a8 | FAULT | error=3 |
+| 20 (getpid) | 0xffffffff88b58178 | FAULT | error=3 |
+| 73 (munmap) | 0xffffffff88b57d20 | FAULT | error=3 |
+| 97 (socket) | 0xffffffff88b57648 | FAULT | error=3 |
+
+### Scan Results — Stub Functions (0x8827xxxx region)
+
+Multiple entries share the same fn ptr — these are `nosys`/`lkmnosys` stubs. The fn-1 reads in this region **succeed**.
+
+| Sysent Index | fn ptr | fn-1 byte | Result |
+|-------------|--------|-----------|--------|
+| 197 | 0xffffffff882784d8 | 0x00 | SUCCESS |
+| 244 | 0xffffffff882784d8 | 0x00 | SUCCESS (same nosys) |
+| 279 | 0xffffffff882784d8 | 0x00 | SUCCESS (same nosys) |
+| 350 | 0xffffffff882784d8 | 0x00 | SUCCESS (same nosys) |
+| 456 | 0xffffffff88277cf0 | 0x00 | SUCCESS (lkmnosys?) |
+| 560 | 0xffffffff88278638 | FAULT | error=3 |
+
+- **nosys** address: `0xffffffff882784d8` (shared by 197, 244, 279, 350 — and likely many more unimplemented entries)
+- **lkmnosys** candidate: `0xffffffff88277cf0` (entry 456)
+- Entry 560: Different fn ptr `0x88278638` but still faults — possibly on a different page with stricter protections
+
+### Panic Entry
+
+| Sysent Index | Result |
+|-------------|--------|
+| 122 (0x7A) | **Kernel panic** — likely triggers #UD/#GP not caught by pcb_onfault |
+
+### Key Finding: Execute-Only ktext Pages
+
+The PS5 hypervisor appears to enforce **execute-only** page protections on most kernel text pages. Two distinct ktext regions show different read behavior:
+
+| Region | Address Range | Readable? | Contents |
+|--------|--------------|-----------|----------|
+| Stub functions (nosys/lkmnosys) | `0x8827xxxx` | **YES** | Small stubs, possibly on a mixed code+data page |
+| Real syscall handlers | `0x88b5xxxx` | **NO** | Core syscall implementations, execute-only |
+
+This means the fn-1 byte probing strategy works only for functions that happen to reside on **readable** pages. The hypervisor's execute-only enforcement is page-granular, so functions near page boundaries or on pages with mixed code+data may be readable.
+
+### Implications for Strategy
+
+1. Most sysent entries point to either `nosys` (unimplemented) or real handlers in the execute-only `0x88b5xxxx` region
+2. Need to find sysent entries whose fn ptrs fall in **readable** ktext pages (outside `0x88b5xxxx`)
+3. The apic_ops functions (tested earlier) had 4/10 readable fn-1 bytes — those functions may be on different, readable pages
+4. Scanning more entries across the full 678-entry table may reveal fn ptrs in readable regions
+5. Alternative approach: probe fn-2/fn-3 of the readable stubs (nosys, lkmnosys) — while these are trivial functions, confirming multi-byte reads helps validate the technique
 
