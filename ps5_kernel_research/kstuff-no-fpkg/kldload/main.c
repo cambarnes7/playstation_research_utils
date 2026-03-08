@@ -2309,6 +2309,61 @@ static void _kldload(void* data, size_t data_size)
             }
 
             printf("  end_marker:   %#lx\n", readback[63]);
+        } else if (status == 0x110C) {
+            /* v10c: sysent fn ptr batch dump */
+            uint64_t ktext = readback[2];
+            uint64_t info = readback[3];
+            int batch = (int)(info & 0xFFFF);
+            int start_idx = (int)((info >> 16) & 0xFFFF);
+            int count = (int)((info >> 32) & 0xFFFF);
+
+            printf("\n=== v10c SYSENT FN PTR DUMP (batch %d) ===\n", batch);
+            printf("  kdata_base:  %#lx\n", readback[1]);
+            printf("  ktext_base:  %#lx\n", ktext);
+            printf("  batch:       %d\n", batch);
+            printf("  start_idx:   %d\n", start_idx);
+            printf("  count:       %d\n", count);
+
+            /* Count unique and nosys */
+            uint64_t nosys_addr = 0;
+            int nosys_count = 0;
+            /* First pass: find most common (nosys) */
+            for (int i = 0; i < count && i < 284; i++) {
+                uint64_t fn = readback[4 + i];
+                /* Simple nosys detection: count first candidate */
+                if (i == 0 || fn == readback[4]) {
+                    if (i == 0) nosys_addr = fn;
+                    if (fn == nosys_addr) nosys_count++;
+                }
+            }
+            /* Better: count occurrences of most frequent */
+            nosys_count = 0;
+            for (int pass = 0; pass < count && pass < 284; pass++) {
+                int c = 0;
+                for (int j = 0; j < count && j < 284; j++)
+                    if (readback[4 + j] == readback[4 + pass]) c++;
+                if (c > nosys_count) {
+                    nosys_count = c;
+                    nosys_addr = readback[4 + pass];
+                }
+            }
+
+            printf("  nosys addr:  %#lx (ktext+%#lx, %d entries)\n",
+                   nosys_addr, nosys_addr - ktext, nosys_count);
+
+            int unique = 0;
+            printf("\n  %5s  %20s  %14s\n", "idx", "fn ptr", "ktext offset");
+            printf("  %5s  %20s  %14s\n", "-----", "--------------------", "--------------");
+            for (int i = 0; i < count && i < 284; i++) {
+                uint64_t fn = readback[4 + i];
+                int sysent_idx = start_idx + i;
+                if (fn == nosys_addr) continue; /* skip nosys */
+                unique++;
+                printf("  [%3d]  %#018lx  ktext+%#010lx\n",
+                       sysent_idx, fn, fn - ktext);
+            }
+            printf("\n  Total: %d entries, %d nosys, %d unique handlers\n",
+                   count, nosys_count, unique);
         } else {
             /* Generic dump for other payloads */
             for (int i = 0; i < 64; i++) {
