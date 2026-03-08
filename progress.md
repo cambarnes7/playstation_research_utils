@@ -1188,9 +1188,9 @@ To build everything from scratch you need:
 
 ---
 
-## Phase 10: fn-2 Probing — `leave;ret` Gadget Discovery
+## Phase 10: Gadget Discovery — apic_ops → sysent
 
-**Status: IN PROGRESS**
+**Status: apic_ops EXHAUSTED, sysent scanner READY**
 
 ### v10a Probe Results
 
@@ -1272,12 +1272,81 @@ Entry[14] fn-2 shows the same fault pattern → likely also C9. Needs fn-1=C3 co
 2. If RBP → kdata we control: RSP redirects to our ROP chain
 3. `pop RBP` loads controlled value, `ret` pops controlled RIP → full chain execution
 
-### Next Steps
+### fn-3 Probing: Final apic_ops Conclusion
 
-1. Confirm fn-1=C3 for entry[14] (run v7b byte-ID on entry[14])
-2. **Determine RBP value at LAPIC resume call site** — this is the critical unknown:
-   - If RBP → kdata range → immediate pivot capability
-   - If RBP → stack/heap → need to analyze resume stack layout
-   - If RBP = 0/garbage → `leave;ret` won't work, try alternative gadget
-3. Build a `leave;ret` diagnostic payload: arm apic_ops[2]=xapic_mode-2, enter rest mode, observe crash (the fault address reveals what [RBP+8] was → tells us RBP's value)
+Probed fn-3 for all 4 entries where fn-1=C3 (ret). Entry [18] fn-3: benign (sentinel unchanged, verdict=2). All 4 fn-1=C3 entries show an identical pattern:
+
+| Entry | fn-3 | fn-2 | fn-1 | Pattern |
+|-------|------|------|------|---------|
+| [2]   | benign | 48 (REX.W, benign) | C3 (ret) | `?? 48 C3` |
+| [14]  | benign | 48 (REX.W, benign) | C3 (ret) | `?? 48 C3` |
+| [17]  | benign | 48 (REX.W, benign) | C3 (ret) | `?? 48 C3` |
+| [18]  | benign | 48 (REX.W, benign) | C3 (ret) | `?? 48 C3` |
+
+**Sony Clang epilogue pattern**: Every function ends with `... 48 C3` — a REX.W-prefixed instruction followed by `ret`. This is completely consistent across all apic_ops functions. No `leave;ret` (C9 C3) exists anywhere in apic_ops epilogues.
+
+**Correction**: The v10a analysis incorrectly identified fn-2=FAULT as evidence of `leave` (C9). The FAULT result was actually caused by the `48` (REX.W prefix) byte creating `48 <next_instr_byte>` which decoded as a different instruction and faulted. The actual byte at fn-2 is `48`, not `C9`.
+
+**apic_ops is exhausted as a gadget source.** All 28 functions are compiled by the same Sony Clang with identical calling conventions — no epilogue variation exists.
+
+---
+
+## Phase 10b: Sysent Table Scanner — Expanding the Search
+
+### Rationale
+
+The sysent (system call entry) table contains ~678 function pointers spanning the **entire kernel** — different subsystems, different compilation units, potentially different compiler flags or even hand-written assembly. This gives us ~150+ unique functions (many sysent entries point to `nosys`) from across the kernel, vastly expanding the search space beyond the 28 apic_ops functions.
+
+### v10b Design
+
+Single-entry probe payload supporting two modes:
+
+| Mode | fw_ver encoding | Source |
+|------|----------------|--------|
+| 0xAA | `printf '\xNN\xAA\xHH\x00'` | sysent[HH:NN] (index = HH<<8 \| NN) |
+| 0xEE | `printf '\xNN\xEE\x00\x00'` | apic_ops[NN] (backward compat) |
+
+**Probe technique**: Same as v8/v10a — IDT[3]=doreti_iret for CC bounce, pcb_onfault for #PF recovery, sentinel-in-RAX classification.
+
+**RSP/RBP fix**: The probe function (`probe_byte`) now saves and restores both RBX and RBP before calling the target. This prevents stack corruption when the target function modifies RBP before faulting — pcb_onfault recovery restores RSP from RBX, then pops both RBP and RBX to return to a clean state.
+
+**Sysent structure** (FreeBSD):
+```c
+struct sysent {       /* 48 bytes per entry */
+    int      sy_narg;        /* +0: number of arguments */
+    sy_call_t *sy_call;      /* +8: implementing function pointer */
+    /* ... other fields ... */
+};
+```
+
+Sysent table at ktext + 0x1100310. Function pointer: `sysent_base + entry * 48 + 8`.
+
+**Output layout** (512 bytes, 64 uint64_t slots):
+```
+[0]      = MAGIC(lo32) | status(hi32)  — 0x010b=in-progress, 0x110b=complete
+[1]      = kdata_base
+[2]      = ktext_base
+[3]      = curthread
+[4..31]  = apic_ops[0..27] (always dumped)
+[32]     = step (0x100=probing, 0x101=verdict, 4=done)
+[33]     = entry index
+[34]     = fn ptr
+[35]     = probe addr (fn-1)
+[36]     = raw result
+[37]     = verdict (0=skip, 1=CC, 2=C3, 3=fault)
+[38]     = source (0=apic_ops, 1=sysent)
+[39]     = probe_offset (1=fn-1)
+[63]     = end marker 0xdeadbeefcafe010b
+```
+
+**Binary**: 984 bytes, no .bss.
+
+**Status**: Built, ready for deployment.
+
+### Scanning Strategy
+
+1. Start with a few entries to validate and identify the `nosys` function pointer
+2. Once `nosys` is known, skip all duplicate entries pointing to it
+3. Focus on entries with verdict=2 (C3 at fn-1) — these are candidates for fn-2 probing
+4. Any fn-2=C9 with fn-1=C3 gives us `leave;ret` — a stack pivot gadget from a different compilation unit
 
