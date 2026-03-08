@@ -359,9 +359,9 @@ int module_start(kproc_args *args)
          *     0b01 (0x27): CR3 exact — match current CR3 value
          *     0b10 (0x47): CR0 exact — match current CR0 value
          *     0b11 (0x67): MEMDUMP — dump 32 qwords from target address
-         *              target = kdata_base + 0x33ed600 + page * 0x100
-         *              page=0: dumps PCB candidate at +0x33ed600
-         *              page=1: dumps +0x33ed700, etc.
+         *              target = kdata_base + 0x27ed600 + page * 0x100
+         *              page=0: dumps PCB candidate at +0x27ed600
+         *              page=1: dumps +0x27ed700, etc.
          *   bit 7:     broaden narrow filter to 0xffff???? (heap ptrs)
          *              only applies when bits 5-6 == 0b00
          *   bits 8-31: scan page (each page = 4MB = 0x400000 bytes)
@@ -411,7 +411,7 @@ int module_start(kproc_args *args)
 
         if (filter_type == 3) {
             /* MEMDUMP: dump 32 qwords from target address */
-            uint64_t target = kdata_base + 0x33ed600ULL + (uint64_t)page * 0x100ULL;
+            uint64_t target = kdata_base + 0x27ed600ULL + (uint64_t)page * 0x100ULL;
             out[3] = target;           /* report target address */
             out[4] = target + 0x100;   /* end */
             out[5] = 32;               /* "hit_count" = number of qwords dumped */
