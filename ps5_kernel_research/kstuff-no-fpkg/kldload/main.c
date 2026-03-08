@@ -2436,6 +2436,198 @@ static void _kldload(void* data, size_t data_size)
             }
             printf("\n  Total: %d entries, %d nosys, %d unique handlers\n",
                    count, nosys_count, unique);
+        } else if (magic == 0x53435458) { /* "SCTX" - savectx finder results */
+            uint32_t status = (uint32_t)(readback[0] >> 32);
+            uint64_t ktext = readback[2];
+            uint64_t cpu_sw = readback[3];
+
+            printf("\n=== SAVECTX FINDER RESULTS ===\n");
+            printf("  status:        %s\n",
+                   status == 1 ? "COMPLETE" :
+                   status == 0xFF ? "ERROR (bad mode)" : "UNKNOWN");
+            printf("  kdata_base:    %#lx\n", readback[1]);
+            printf("  ktext_base:    %#lx\n", ktext);
+            printf("  cpu_switch:    %#lx (ktext+%#lx)\n", cpu_sw, cpu_sw - ktext);
+
+            /* Check mode by examining scan range vs arm/readback data */
+            if (readback[4] >= ktext && readback[5] >= ktext) {
+                /* Mode 0x403: SCAN */
+                uint32_t hits = (uint32_t)readback[6];
+                printf("  scan_range:    %#lx .. %#lx\n", readback[4], readback[5]);
+                printf("  hits:          %u\n\n", hits);
+
+                for (uint32_t i = 0; i < hits && i < 40; i++) {
+                    uint64_t kd_addr = readback[10 + i * 3 + 0];
+                    uint64_t kt_ptr  = readback[10 + i * 3 + 1];
+                    int64_t  offset  = (int64_t)readback[10 + i * 3 + 2];
+
+                    const char* guess = "";
+                    if (offset == 0) guess = " <-- cpu_switch";
+                    else if (offset > 0 && offset < 0x100) guess = " <-- savectx?";
+                    else if (offset > 0x100 && offset < 0x300) guess = " <-- resumectx?";
+
+                    printf("  kdata %#lx -> %#lx (cpu_switch%+ld, ktext+%#lx)%s\n",
+                           kd_addr, kt_ptr, (long)offset, kt_ptr - ktext, guess);
+                }
+            } else if (readback[6] != 0 && readback[7] != 0) {
+                /* Mode 0x2: ARM */
+                printf("  justreturn:    %#lx (ktext+%#lx)\n", readback[4], readback[4] - ktext);
+                printf("  orig xapic:    %#lx\n", readback[5]);
+                printf("  sentinel @:    %#lx\n", readback[6]);
+                printf("  sentinel val:  %#lx\n", readback[7]);
+                printf("  readback [2]:  %#lx\n", readback[8]);
+                printf("  readback sen:  %#lx\n", readback[9]);
+            } else {
+                /* Mode 0x3: READBACK */
+                printf("  sentinel rb:   %#lx\n", readback[4]);
+                printf("  survived:      %s\n", readback[5] ? "YES" : "NO");
+                printf("  cur apic[2]:   %#lx\n", readback[6]);
+                printf("  restored:      %#lx\n", readback[7]);
+                printf("  get_timer:     %#lx\n", readback[8]);
+            }
+
+            printf("\n  sentinel[131]: %#lx [%s]\n", readback[131],
+                   readback[131] == 0xdeadbeefcafe0020ULL ? "OK" : "MISSING");
+            printf("\n=== END SAVECTX FINDER ===\n");
+        } else if (magic == 0x4B53434E) { /* "KSCN" - kdata scanner results */
+            uint32_t status = (uint32_t)(readback[0] >> 32);
+            uint64_t ktext = readback[2];
+            uint64_t cpu_sw = readback[3];
+            int total = (int)readback[4];
+            uint64_t scanned = readback[5];
+
+            /* Detect mode: targeted has triples (addr, val, offset),
+             * full has single values. Check if slot [8] looks like a
+             * signed offset (small value) — that means targeted mode. */
+            int is_targeted = 0;
+            if (total > 0) {
+                uint64_t slot8 = readback[8]; /* 3rd element of first triple */
+                int64_t as_signed = (int64_t)slot8;
+                if (as_signed >= -0x2000 && as_signed <= 0x4000)
+                    is_targeted = 1;
+            }
+
+            printf("\n=== KDATA SCANNER RESULTS ===\n");
+            printf("  status:        %s\n",
+                   status == 1 ? "COMPLETE" :
+                   status == 0xAAAA ? "IN PROGRESS" : "UNKNOWN");
+            printf("  kdata_base:    %#lx\n", readback[1]);
+            printf("  ktext_base:    %#lx\n", ktext);
+            printf("  cpu_switch:    %#lx (ktext+%#lx)\n", cpu_sw, cpu_sw - ktext);
+            printf("  bytes_scanned: %#lx (%lu MB)\n", scanned, scanned / (1024*1024));
+            printf("  mode:          %s\n", is_targeted ? "TARGETED (near cpu_switch)" : "FULL SCAN");
+
+            if (is_targeted) {
+                printf("  hits:          %d\n\n", total);
+
+                printf("  %-20s %-20s %-10s %s\n",
+                       "kdata addr", "ktext ptr", "cpu_sw+", "kdata offset");
+                printf("  %-20s %-20s %-10s %s\n",
+                       "--------------------", "--------------------", "----------", "------------");
+
+                for (int i = 0; i < total && i < 80; i++) {
+                    uint64_t kd_addr = readback[6 + i * 3 + 0];
+                    uint64_t kt_ptr  = readback[6 + i * 3 + 1];
+                    int64_t  offset  = (int64_t)readback[6 + i * 3 + 2];
+
+                    const char* guess = "";
+                    if (offset == 0)
+                        guess = " <-- cpu_switch!";
+                    else if (offset > 0 && offset < 0x100)
+                        guess = " <-- savectx? (close after cpu_switch)";
+                    else if (offset > 0x100 && offset < 0x300)
+                        guess = " <-- resumectx?";
+                    else if (offset > 0x300 && offset < 0x600)
+                        guess = " <-- fork_trampoline?";
+                    else if (offset < 0 && offset > -0x200)
+                        guess = " <-- sw_return? (just before cpu_switch)";
+
+                    printf("  %#-20lx %#-20lx %+d%s\n",
+                           kd_addr, kt_ptr, (int)offset, guess);
+                }
+
+                /* Group by offset to find clusters */
+                printf("\n  --- Offset clusters ---\n");
+                for (int i = 0; i < total && i < 80; i++) {
+                    int64_t offset = (int64_t)readback[6 + i * 3 + 2];
+                    int dup_count = 0;
+                    for (int j = 0; j < total && j < 80; j++) {
+                        if ((int64_t)readback[6 + j * 3 + 2] == offset)
+                            dup_count++;
+                    }
+                    /* Only print first occurrence of each offset */
+                    int first = 1;
+                    for (int j = 0; j < i; j++) {
+                        if ((int64_t)readback[6 + j * 3 + 2] == offset) {
+                            first = 0;
+                            break;
+                        }
+                    }
+                    if (first) {
+                        uint64_t kt_ptr = readback[6 + i * 3 + 1];
+                        printf("  cpu_switch%+d = %#lx (ktext+%#lx) — %d ref(s)\n",
+                               (int)offset, kt_ptr, kt_ptr - ktext, dup_count);
+                    }
+                }
+            } else {
+                printf("  unique ptrs:   %d\n\n", total);
+
+                printf("  %-5s %-20s %-14s %s\n",
+                       "Idx", "Address", "ktext offset", "Gap");
+                printf("  %-5s %-20s %-14s %s\n",
+                       "-----", "--------------------", "--------------", "----");
+
+                for (int i = 0; i < total && i < 270; i++) {
+                    uint64_t ptr = readback[6 + i];
+                    uint64_t off = ptr - ktext;
+                    int gap = 0;
+                    if (i > 0) gap = (int)(ptr - readback[6 + i - 1]);
+
+                    /* Annotate known offsets */
+                    const char* note = "";
+                    int64_t cpu_off = (int64_t)(ptr - cpu_sw);
+                    if (cpu_off == 0) note = " <-- cpu_switch";
+                    else if (cpu_off > 0 && cpu_off < 0x100) note = " <-- savectx?";
+                    else if (cpu_off > 0x100 && cpu_off < 0x300) note = " <-- resumectx?";
+
+                    if (i == 0)
+                        printf("  [%3d] %#-20lx ktext+%#010lx%s\n",
+                               i, ptr, off, note);
+                    else
+                        printf("  [%3d] %#-20lx ktext+%#010lx  gap=%d%s\n",
+                               i, ptr, off, gap, note);
+                }
+
+                /* Show distribution across ktext */
+                printf("\n  --- Coverage distribution (256KB buckets) ---\n");
+                int buckets[48] = {0};
+                for (int i = 0; i < total && i < 270; i++) {
+                    uint64_t off = readback[6 + i] - ktext;
+                    int b = (int)(off >> 18);
+                    if (b >= 0 && b < 48) buckets[b]++;
+                }
+                for (int b = 0; b < 48; b++) {
+                    if (buckets[b] > 0)
+                        printf("  ktext+%#08x..%#08x: %d ptrs\n",
+                               b << 18, ((b + 1) << 18) - 1, buckets[b]);
+                }
+
+                /* Highlight pointers near cpu_switch */
+                printf("\n  --- Pointers near cpu_switch (%#lx) ---\n", cpu_sw);
+                for (int i = 0; i < total && i < 270; i++) {
+                    uint64_t ptr = readback[6 + i];
+                    int64_t dist = (int64_t)(ptr - cpu_sw);
+                    if (dist >= -0x2000 && dist <= 0x4000) {
+                        printf("  %#lx  cpu_switch%+d  (ktext+%#lx)\n",
+                               ptr, (int)dist, ptr - ktext);
+                    }
+                }
+            }
+
+            printf("\n  sentinel: %#lx [%s]\n", readback[279],
+                   readback[279] == 0xdeadbeefcafe0025ULL ? "OK" : "MISSING");
+
+            printf("\n=== END KDATA SCANNER ===\n");
         } else {
             /* Generic dump for other payloads */
             for (int i = 0; i < 64; i++) {
