@@ -32,33 +32,15 @@
  *   [0]   magic(lo32) | status(hi32)
  *   [1]   kdata_base
  *   [2]   ktext_base
- *   --- Direct MSR reads ---
- *   [10]  MSR LSTAR   (0xC0000082)
- *   [11]  MSR EFER    (0xC0000080)
- *   [12]  MSR STAR    (0xC0000081)
- *   [13]  MSR CSTAR   (0xC0000083)
- *   [14]  MSR SFMASK  (0xC0000084)
- *   [15]  MSR FSBASE  (0xC0000100)
- *   [16]  MSR GSBASE  (0xC0000101)
- *   [17]  MSR KGSBASE (0xC0000102)
- *   --- Control registers ---
- *   [20]  CR0
- *   [21]  CR3
- *   [22]  CR4
- *   --- Descriptor table registers ---
- *   [25]  GDT base
- *   [26]  GDT limit
- *   [27]  IDT base
- *   [28]  IDT limit
- *   --- Thread info ---
- *   [30]  curthread
- *   [31]  td_pcb
- *   --- td_pcb GPRs (8 qwords = first 0x40 bytes) ---
- *   [40..47]  td_pcb[0x00..0x3F] (r15,r14,r13,r12,rbp,rsp,rbx,rip)
+ *   [3]   lstar
+ *   [4]   cr3
+ *   [5]   gsbase
+ *   [6]   curthread
+ *   [7]   td_pcb
  *   --- Per-CPU structure (struct pcpu at GSBASE) ---
- *   [48]      gsbase value
- *   [50..113] 64 qwords from GSBASE (0x200 bytes of struct pcpu)
- *   [287] end marker
+ *   [8..63]  56 qwords from GSBASE (0x1C0 bytes of struct pcpu)
+ *            NOTE: debug readback limit = 64 qwords (0x200 bytes)
+ *   [287] end marker (beyond readback, but confirms execution)
  *
  * Mode 0x6 (DUMP):
  *   [0]   magic | status
@@ -152,62 +134,32 @@ int module_start(kproc_args *args)
          * Reads all MSRs and CRs directly via inline asm.
          * Dumps struct pcpu at GSBASE to map per-CPU infrastructure.
          * ============================================================ */
+        /* Pack into 64 qwords (debug readback limit = 0x200 bytes).
+         * Slots 0-7: header + key values
+         * Slots 8-63: per-CPU struct dump (56 qwords = 0x1C0 bytes)
+         */
         for (int i = 0; i < 288; i++) out[i] = 0;
 
         out[1] = kdata_base;
         out[2] = ktext_base;
+        out[3] = lstar;
+        out[4] = cr3;
 
-        /* Direct MSR reads */
-        out[10] = lstar;
-        out[11] = rdmsr(MSR_EFER);
-        out[12] = rdmsr(MSR_STAR);
-        out[13] = rdmsr(MSR_CSTAR);
-        out[14] = rdmsr(MSR_SFMASK);
-        out[15] = rdmsr(MSR_FSBASE);
-        out[16] = rdmsr(MSR_GSBASE);
-        out[17] = rdmsr(MSR_KGSBASE);
+        uint64_t gsbase = rdmsr(MSR_GSBASE);
+        out[5] = gsbase;
 
-        /* Control registers */
-        out[20] = read_cr0();
-        out[21] = cr3;
-        out[22] = read_cr4();
-
-        /* GDT and IDT */
-        dt_reg gdt_desc, idt_desc;
-        __asm__ volatile("sgdt %0" : "=m"(gdt_desc));
-        __asm__ volatile("sidt %0" : "=m"(idt_desc));
-        out[25] = gdt_desc.base;
-        out[26] = gdt_desc.limit;
-        out[27] = idt_desc.base;
-        out[28] = idt_desc.limit;
-
-        /* Thread info */
         uint64_t curthread;
         __asm__ volatile("movq %%gs:0, %0" : "=r"(curthread));
-        out[30] = curthread;
+        out[6] = curthread;
 
         uint64_t td_pcb = 0;
         if (curthread)
             td_pcb = read8(curthread + TD_PCB);
-        out[31] = td_pcb;
+        out[7] = td_pcb;
 
-        /* td_pcb GPRs: first 8 qwords (0x40 bytes, rest is always zero) */
-        if (td_pcb) {
-            for (int i = 0; i < 8; i++)
-                out[40 + i] = read8(td_pcb + i * 8);
-        }
-
-        /* Per-CPU structure dump (struct pcpu at GSBASE)
-         *
-         * Compact layout: starts at slot 48 so it's visible in the
-         * debug readback (which truncates around offset 0x400).
-         */
-        uint64_t gsbase = rdmsr(MSR_GSBASE);
-        out[48] = gsbase;
-
-        /* Dump 64 qwords (0x200 bytes) from GSBASE */
-        for (int i = 0; i < 64; i++)
-            out[50 + i] = read8(gsbase + i * 8);
+        /* Per-CPU structure: 56 qwords (0x1C0 bytes) from GSBASE */
+        for (int i = 0; i < 56; i++)
+            out[8 + i] = read8(gsbase + i * 8);
 
         out32[0] = MAGIC_SCAP;
         out32[1] = 0x0005;
