@@ -1,0 +1,3 @@
+[submodule "ps5-payload-sdk"]
+	path = ps5-payload-sdk
+	url = https://github.com/ps5-payload-dev/sdk.git
