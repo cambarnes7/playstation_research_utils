@@ -8,7 +8,6 @@ PHDRS
         code_seg PT_LOAD;
         rdata_seg PT_LOAD;
         data_seg PT_LOAD;
-        bss_seg PT_LOAD;
 }
 
 SECTIONS
@@ -21,8 +20,16 @@ SECTIONS
                 *(.rodata)
                 *(.rodata*)
         } : rdata_seg
-        .data : { *(.data) } : data_seg
-        .bss  : { *(.bss) } : bss_seg
+        .data : {
+                *(.data)
+                *(.data.*)
+                /* Merge BSS into data so objcopy includes it in the
+                 * flat binary.  The kernel malloc'd buffer must cover
+                 * these addresses — otherwise we corrupt the heap. */
+                *(.bss)
+                *(.bss.*)
+                . = ALIGN(8);
+        } : data_seg
         /DISCARD/ : {
                 *(.comment)
                 *(.note.GNU-stack)
