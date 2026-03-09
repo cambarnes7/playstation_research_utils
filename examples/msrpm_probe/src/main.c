@@ -61,6 +61,8 @@ static volatile uint64_t gp_recovery_rsp;
 static volatile int gp_faulted;
 static volatile uint64_t orig_gp_handler_addr;
 static volatile uint64_t msr_read_val;
+static volatile uint64_t exec_code_base;
+static volatile uint64_t exec_code_end;
 
 __attribute__((naked)) static void custom_gp_handler(void)
 {
@@ -79,8 +81,21 @@ __attribute__((naked)) static void custom_gp_handler(void)
          *   8(%rsp)   = error code
          *   16(%rsp)  = saved RIP
          *   ...
+         *
+         * CRITICAL: IDT is shared across all CPUs. We MUST verify the
+         * faulting RIP is within our exec_code before doing recovery.
+         * Otherwise we'd corrupt another CPU's #GP (kstuff syscall hook).
          */
         "pushq %rax\n\t"
+
+        /* Check faulting RIP is within our exec_code range */
+        "movq 16(%rsp), %rax\n\t"       /* saved RIP */
+        "cmpq exec_code_base(%rip), %rax\n\t"
+        "jb .Lchain_original\n\t"
+        "cmpq exec_code_end(%rip), %rax\n\t"
+        "jae .Lchain_original\n\t"
+
+        /* Check recovery is armed */
         "movq gp_recovery_rip(%rip), %rax\n\t"
         "testq %rax, %rax\n\t"
         "jz .Lchain_original\n\t"
@@ -272,6 +287,14 @@ int module_start(kproc_args* args)
 
     out[15] = hook_addr;
 
+    /* Set exec_code range for the handler's RIP check.
+     * Only #GP with faulting RIP inside our code gets recovery.
+     * Other CPUs' #GP (kstuff syscall hook etc.) chains to kelf. */
+    exec_code_base = (uint64_t)&module_start;
+    exec_code_end = exec_code_base + 0x1000;  /* generous upper bound */
+    out[16] = exec_code_base;
+    out[17] = exec_code_end;
+
     gp_recovery_rip = 0;
     gp_faulted = 0;
 
@@ -290,7 +313,7 @@ int module_start(kproc_args* args)
     int total_probed = 0;
     int total_read_ok = 0;
     int total_write_ok = 0;
-    int result_idx = 20;  /* start results at out[20] */
+    int result_idx = 24;  /* start results at out[24] */
 
     #define RECORD_RESULT(msr_num, rd_ok, wr_ok, rd_val) do { \
         if (result_idx < 280) { \
