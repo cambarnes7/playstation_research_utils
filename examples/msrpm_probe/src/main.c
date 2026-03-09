@@ -3,10 +3,10 @@
  *
  * Probes which MSRs the hypervisor intercepts vs. allows from guest ring 0.
  *
- * Uses LIDT to swap in a private IDT copy with a custom #GP handler.
- * pcb_onfault does NOT work for #GP — FreeBSD only checks it for #PF.
- * Direct IDT modification freezes the PS5 (HV protects IDT page via NPT).
- * LIDT loads a new IDT pointer without touching the protected page.
+ * Uses kstuff's int 179 (kmemcpy) to patch IDT entry #13 with our custom
+ * #GP handler. int 179 goes through the kelf's page tables where the IDT
+ * page is mapped RW. Direct writes to the IDT freeze because the page is
+ * RO in the standard guest page tables. LIDT is intercepted by the HV.
  *
  * CRITICAL TARGET: MSR 0xC0010020 (AMD PATCH_LOADER)
  *   If writable → EntrySign (CVE-2024-56161) is viable on PS5
@@ -31,18 +31,29 @@ struct idt_gate {
     uint32_t reserved;
 } __attribute__((packed));
 
-struct idtr {
-    uint16_t limit;
-    uint64_t base;
-} __attribute__((packed));
+/* ===================================================================
+ * kstuff_memcpy — write to memory via kelf's page tables (int 179)
+ *
+ * r0gdb/kstuff installs an int 179 handler that does rep movsb under
+ * the kelf's CR3, which maps the IDT page as RW.
+ * Calling convention: rdi=dst, rsi=src, rcx=count.
+ * rax is used to save/restore rbp across the interrupt.
+ * =================================================================== */
+
+static void kstuff_memcpy(void *dst, const void *src, uint64_t count)
+{
+    __asm__ volatile(
+        "movq %%rbp, %%rax\n\t"
+        "int $179\n\t"
+        "movq %%rax, %%rbp\n\t"
+        :
+        : "D"(dst), "S"(src), "c"(count)
+        : "rax", "rdx", "r8", "r9", "r10", "r11", "memory", "cc"
+    );
+}
 
 /* ===================================================================
- * #GP fault recovery via LIDT + custom handler
- *
- * We copy the entire IDT to a stack buffer, patch entry #13 (#GP)
- * with our custom handler, and LIDT to swap it in. After probing,
- * LIDT restores the original. This avoids writing to the HV-protected
- * IDT page.
+ * #GP fault recovery via custom IDT handler
  * =================================================================== */
 
 static volatile uint64_t gp_recovery_rip;
@@ -55,34 +66,31 @@ __attribute__((naked)) static void custom_gp_handler(void)
 {
     __asm__(
         /*
-         * Stack on #GP entry (CPU pushes error code):
+         * IST stack frame on #GP entry (error code pushed by CPU):
          *   (%rsp)    = error code
          *   8(%rsp)   = saved RIP
          *   16(%rsp)  = saved CS
          *   24(%rsp)  = saved RFLAGS
-         *   32(%rsp)  = saved RSP
+         *   32(%rsp)  = saved RSP  (our kthread stack)
          *   40(%rsp)  = saved SS
          *
-         * After our push rax:
+         * After push rax:
          *   (%rsp)    = saved rax
          *   8(%rsp)   = error code
          *   16(%rsp)  = saved RIP
-         *   24(%rsp)  = saved CS
-         *   32(%rsp)  = saved RFLAGS
-         *   40(%rsp)  = saved RSP
-         *   48(%rsp)  = saved SS
+         *   ...
          */
         "pushq %rax\n\t"
         "movq gp_recovery_rip(%rip), %rax\n\t"
         "testq %rax, %rax\n\t"
         "jz .Lchain_original\n\t"
 
-        /* Recovery: overwrite saved RIP with recovery address */
+        /* Recovery: redirect iretq to our recovery label */
         "movq %rax, 16(%rsp)\n\t"
         "movq $0, gp_recovery_rip(%rip)\n\t"
         "movl $1, gp_faulted(%rip)\n\t"
 
-        /* Restore RSP in the iret frame */
+        /* Restore RSP in the iret frame (back to kthread stack) */
         "movq gp_recovery_rsp(%rip), %rax\n\t"
         "movq %rax, 40(%rsp)\n\t"
 
@@ -90,7 +98,7 @@ __attribute__((naked)) static void custom_gp_handler(void)
         "addq $8, %rsp\n\t"       /* skip error code */
         "iretq\n\t"
 
-        /* Chain to original handler */
+        /* Chain to kstuff's kelf handler for unrelated #GP */
         ".Lchain_original:\n\t"
         "popq %rax\n\t"
         "jmpq *orig_gp_handler_addr(%rip)\n\t"
@@ -101,18 +109,11 @@ __attribute__((naked)) static void custom_gp_handler(void)
  * IDT helpers
  * =================================================================== */
 
-static inline uint64_t idt_gate_get_addr(struct idt_gate *g)
+static inline uint64_t idt_gate_get_addr(volatile struct idt_gate *g)
 {
     return (uint64_t)g->off_lo |
            ((uint64_t)g->off_mid << 16) |
            ((uint64_t)g->off_hi << 32);
-}
-
-static inline void idt_gate_set_addr(struct idt_gate *g, uint64_t addr)
-{
-    g->off_lo  = (uint16_t)(addr);
-    g->off_mid = (uint16_t)(addr >> 16);
-    g->off_hi  = (uint32_t)(addr >> 32);
 }
 
 /* ===================================================================
@@ -200,50 +201,87 @@ int module_start(kproc_args* args)
     out[2] = curthread;
 
     /* =========================================================
-     * LIDT approach: copy IDT, patch #GP, swap in, probe, swap back
+     * Read IDT via sidt (always readable)
      * ========================================================= */
 
-    struct idtr orig_idtr;
-    __asm__ volatile("sidt %0" : "=m"(orig_idtr));
+    uint16_t idt_limit;
+    uint64_t idt_base;
+    {
+        struct { uint16_t limit; uint64_t base; } __attribute__((packed)) idtr;
+        __asm__ volatile("sidt %0" : "=m"(idtr));
+        idt_limit = idtr.limit;
+        idt_base = idtr.base;
+    }
 
-    out[3] = orig_idtr.base;
-    out[9] = (uint64_t)orig_idtr.limit;
+    out[3] = idt_base;
+    out[9] = (uint64_t)idt_limit;
 
-    /* Stack-allocate a copy of the full IDT (256 entries × 16 bytes = 4KB) */
-    struct idt_gate new_idt[256] __attribute__((aligned(16)));
+    /* =========================================================
+     * Test int 179 (kstuff_memcpy) with a safe copy first
+     * ========================================================= */
 
-    uint64_t copy_size = orig_idtr.limit + 1;
-    if (copy_size > sizeof(new_idt))
-        copy_size = sizeof(new_idt);
+    /* Read IDT entry 179 to verify it has a handler */
+    volatile struct idt_gate *idt179 = (volatile struct idt_gate *)(idt_base + 179 * 16);
+    uint64_t int179_handler = idt_gate_get_addr(idt179);
+    out[10] = int179_handler;
+    out[11] = (uint64_t)idt179->type_attr;
 
-    /* Copy original IDT */
-    volatile uint8_t *dst = (volatile uint8_t *)new_idt;
-    volatile uint8_t *src = (volatile uint8_t *)orig_idtr.base;
-    for (uint64_t i = 0; i < copy_size; i++)
-        dst[i] = src[i];
+    /* If IDT entry 179 is not present (P bit = bit 7 of type_attr), skip */
+    if (!(idt179->type_attr & 0x80)) {
+        out32[1] = 0xDEAD;  /* int 179 not present */
+        out[287] = 0xdeadbeefcafe0099ULL;
+        return 0;
+    }
 
-    /* Save original #GP handler address */
-    orig_gp_handler_addr = idt_gate_get_addr(&new_idt[13]);
-    out[10] = orig_gp_handler_addr;
+    /* Safe test: copy a known value within our output buffer */
+    uint64_t test_val = 0x494E5431373921ULL;  /* "INT179!" */
+    kstuff_memcpy(&out[12], &test_val, 8);
 
-    /* Patch entry #13 in our copy */
+    /* Verify the copy worked */
+    if (out[12] != test_val) {
+        out32[1] = 0xBEEF;  /* int 179 copy failed */
+        out[287] = 0xdeadbeefcafe0099ULL;
+        return 0;
+    }
+
+    /* =========================================================
+     * Patch IDT entry #13 using int 179 (kelf page tables)
+     * ========================================================= */
+
+    volatile struct idt_gate *idt13 = (volatile struct idt_gate *)(idt_base + 13 * 16);
+
+    /* Save current IDT entry 13 (kstuff's kelf handler) */
+    struct idt_gate saved_idt13;
+    {
+        volatile uint8_t *s = (volatile uint8_t *)idt13;
+        uint8_t *d = (uint8_t *)&saved_idt13;
+        for (int i = 0; i < 16; i++)
+            d[i] = s[i];
+    }
+
+    orig_gp_handler_addr = idt_gate_get_addr(&saved_idt13);
+    out[13] = orig_gp_handler_addr;
+    out[14] = (uint64_t)saved_idt13.ist;
+
+    /* Build our replacement entry: same selector/type/IST, our handler addr */
+    struct idt_gate new_idt13 = saved_idt13;
     uint64_t hook_addr = (uint64_t)&custom_gp_handler;
-    idt_gate_set_addr(&new_idt[13], hook_addr);
-    out[11] = hook_addr;
+    new_idt13.off_lo  = (uint16_t)(hook_addr);
+    new_idt13.off_mid = (uint16_t)(hook_addr >> 16);
+    new_idt13.off_hi  = (uint32_t)(hook_addr >> 32);
 
-    /* Prepare new IDTR pointing to our copy */
-    struct idtr new_idtr;
-    new_idtr.limit = orig_idtr.limit;
-    new_idtr.base = (uint64_t)new_idt;
-
-    /* Swap IDT: cli → lidt new → sti */
-    __asm__ volatile("cli; lidt %0; sti" : : "m"(new_idtr) : "memory");
-
-    /* Mark that IDT swap succeeded */
-    out[12] = 0x4C494454;  /* "LIDT" — marker that we got past lidt */
+    out[15] = hook_addr;
 
     gp_recovery_rip = 0;
     gp_faulted = 0;
+
+    /* Disable interrupts, patch IDT via int 179 */
+    __asm__ volatile("cli" ::: "memory");
+    kstuff_memcpy((void *)idt13, &new_idt13, 16);
+    __asm__ volatile("sti" ::: "memory");
+
+    /* Marker: IDT patch succeeded */
+    out[12] = 0x50415443;  /* "PATC" */
 
     /* =========================================================
      * MSR probing
@@ -252,7 +290,7 @@ int module_start(kproc_args* args)
     int total_probed = 0;
     int total_read_ok = 0;
     int total_write_ok = 0;
-    int result_idx = 16;
+    int result_idx = 20;  /* start results at out[20] */
 
     #define RECORD_RESULT(msr_num, rd_ok, wr_ok, rd_val) do { \
         if (result_idx < 280) { \
@@ -370,10 +408,12 @@ int module_start(kproc_args* args)
     }
 
     /* =========================================================
-     * Restore original IDT
+     * Restore IDT entry #13 (kstuff's kelf handler) via int 179
      * ========================================================= */
 
-    __asm__ volatile("cli; lidt %0; sti" : : "m"(orig_idtr) : "memory");
+    __asm__ volatile("cli" ::: "memory");
+    kstuff_memcpy((void *)idt13, &saved_idt13, 16);
+    __asm__ volatile("sti" ::: "memory");
 
     /* =========================================================
      * Write summary
