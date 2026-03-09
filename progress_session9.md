@@ -462,3 +462,72 @@ If neither GPU DMA nor HV bypass yields ktext access:
 - Accept that full ktext dump may not be achievable on 4.03 without flatz's exploit
 
 ---
+
+## Session 10: EntrySign Discovery + MSRPM Probe
+
+**Date:** March 9, 2026
+
+### Major Discovery: EntrySign (CVE-2024-56161)
+
+AMD's microcode signature verification uses AES-CMAC with NIST example key. Google's zentool allows loading custom microcode on Zen 1-4 from ring 0. PS5 is Zen 2 — confirmed affected on psdevwiki.
+
+**Why this changes everything**: Microcode operates BELOW the hypervisor. Custom microcode could:
+- Modify VMRUN behavior (disable NPT enforcement)
+- Neuter GMET (prevent execute traps)
+- Change how EFER bit 16 (xotext) works
+- Make VMEXIT handlers no-op
+
+**The critical gate**: MSR 0xC0010020 (PATCH_LOADER). Writing this MSR triggers microcode load. If the HV's MSRPM doesn't intercept it → EntrySign works → total HV defeat.
+
+**Sources**:
+- Google Security Advisory: GHSA-4xq7-4mgh-gp6w
+- zentool: google/security-research/blob/master/pocs/cpus/entrysign/zentool
+- 39c3 Talk: "The Angry Path to Zen"
+- psdevwiki PS5 Vulnerabilities page confirms affected
+
+### IBS MSRs (Project Zero KVM Escape Precedent)
+
+IBS (Instruction-Based Sampling) MSRs 0xC0011030-0xC001103B don't respect virtualization — they return host physical addresses, not guest. Project Zero used this for a KVM escape. If these MSRs are unintercepted on PS5, they could leak HV memory layout.
+
+**Source**: googleprojectzero.blogspot.com/2021/06/an-epyc-escape-case-study-of-kvm.html
+
+### MSRPM Probe Payload Created
+
+Built `examples/msrpm_probe/` — kldload kernel module that safely probes MSR access permissions using pcb_onfault for #GP recovery.
+
+**Priority probes**:
+1. MSR 0xC0010020 (PATCH_LOADER) — read + write test
+2. AMD-specific range 0xC0010000-0xC001003F
+3. IBS MSRs 0xC0011030-0xC001103B
+4. EFER 0xC0000080 (bit 16 xotext flip test)
+5. MTRRs, VM_HSAVE_PA, perf counters
+
+**Output format**: Structured results in kthread_args readback buffer (288 uint64_t slots).
+- Slot [7]: MSR 0xC0010020 result (read_ok<<32 | write_ok)
+- Slot [8]: MSR 0xC0010020 read value (if readable)
+
+**Build**: `make -C examples/msrpm_probe` → produces `msrpm_probe.bin` (1960 bytes)
+
+### Revised Strategy: Both Tracks in Parallel
+
+**Track A: MSRPM Probe → EntrySign** (fast, low-effort)
+1. Deploy msrpm_probe.bin → check MSR 0xC0010020
+2. If writable → zentool RDRAND PoC → confirm microcode loads on PS5
+3. If confirmed → craft NPT-neutering microcode → HV defeated
+
+**Track B: GPU DMA** (parallel, more complex)
+1. GNM API probe (Phase 0)
+2. GPU DMA kdata verification
+3. GPU DMA ktext read attempt
+
+**Convergence**: After ktext dump from either track → disassemble HV hypercall handlers → RE VMCLOSURE_INVOCATION (0xE) and IOMMU hypercalls for bugs
+
+### Files Created This Session
+
+| File | Purpose | Size |
+|------|---------|------|
+| `examples/msrpm_probe/src/main.c` | MSRPM probing payload | 442 lines |
+| `examples/msrpm_probe/Makefile` | Build configuration | 33 lines |
+| `examples/msrpm_probe/linker.x` | ELF linker script | 33 lines |
+
+---
