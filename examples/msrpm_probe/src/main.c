@@ -63,6 +63,9 @@ static volatile uint64_t orig_gp_handler_addr;
 static volatile uint64_t msr_read_val;
 static volatile uint64_t exec_code_base;
 static volatile uint64_t exec_code_end;
+static volatile uint64_t gp_handler_entries;   /* debug: times handler was entered */
+static volatile uint64_t gp_handler_recovered; /* debug: times recovery succeeded */
+static volatile uint64_t gp_handler_chained;   /* debug: times chained to kelf */
 
 __attribute__((naked)) static void custom_gp_handler(void)
 {
@@ -81,12 +84,11 @@ __attribute__((naked)) static void custom_gp_handler(void)
          *   8(%rsp)   = error code
          *   16(%rsp)  = saved RIP
          *   ...
-         *
-         * CRITICAL: IDT is shared across all CPUs. We MUST verify the
-         * faulting RIP is within our exec_code before doing recovery.
-         * Otherwise we'd corrupt another CPU's #GP (kstuff syscall hook).
          */
         "pushq %rax\n\t"
+
+        /* Debug: count handler entries */
+        "incq gp_handler_entries(%rip)\n\t"
 
         /* Check faulting RIP is within our exec_code range */
         "movq 16(%rsp), %rax\n\t"       /* saved RIP */
@@ -104,6 +106,7 @@ __attribute__((naked)) static void custom_gp_handler(void)
         "movq %rax, 16(%rsp)\n\t"
         "movq $0, gp_recovery_rip(%rip)\n\t"
         "movl $1, gp_faulted(%rip)\n\t"
+        "incq gp_handler_recovered(%rip)\n\t"
 
         /* Restore RSP in the iret frame (back to kthread stack) */
         "movq gp_recovery_rsp(%rip), %rax\n\t"
@@ -115,6 +118,7 @@ __attribute__((naked)) static void custom_gp_handler(void)
 
         /* Chain to kstuff's kelf handler for unrelated #GP */
         ".Lchain_original:\n\t"
+        "incq gp_handler_chained(%rip)\n\t"
         "popq %rax\n\t"
         "jmpq *orig_gp_handler_addr(%rip)\n\t"
     );
@@ -336,7 +340,39 @@ int module_start(kproc_args* args)
         }
     }
 
-    out[4] = 6;  /* step 6: IDT verified, starting probes */
+    /* =========================================================
+     * Self-test: trigger a #GP with out-of-range MSR (0xDEAD0000)
+     * This MSR is outside the AMD MSRPM bitmap ranges, so rdmsr
+     * causes a direct #GP (no hypervisor interception).
+     * ========================================================= */
+
+    gp_handler_entries = 0;
+    gp_handler_recovered = 0;
+    gp_handler_chained = 0;
+
+    out[4] = 0x60;  /* step 0x60: starting #GP self-test */
+
+    int gp_test = safe_rdmsr(0xDEAD0000);
+    /* gp_test should be 0 (faulted) if handler works */
+
+    out[4] = 0x61;  /* step 0x61: #GP self-test returned */
+    out[5] = (uint64_t)gp_test;
+    out[6] = gp_handler_entries;
+    out[7] = gp_handler_recovered;
+
+    if (!gp_faulted || gp_handler_recovered == 0) {
+        /* Handler didn't fire or didn't recover → something's wrong.
+         * Restore IDT and abort. */
+        __asm__ volatile("cli" ::: "memory");
+        kstuff_memcpy((void *)idt13, &saved_idt13, 16);
+        __asm__ volatile("sti" ::: "memory");
+
+        out32[1] = 0xFA17;  /* "FAIL" - #GP handler test failed */
+        out[287] = 0xdeadbeefcafe0099ULL;
+        return 0;
+    }
+
+    out[4] = 6;  /* step 6: #GP handler verified, starting probes */
 
     /* =========================================================
      * MSR probing
