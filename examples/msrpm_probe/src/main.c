@@ -80,11 +80,11 @@ static int safe_rdmsr(uint32_t msr)
     __asm__ volatile(
         /* Arm pcb_onfault with recovery label */
         "movq onfault_ptr_msr(%%rip), %%r14\n\t"
-        "leaq 2f(%%rip), %%rcx\n\t"
-        "movq %%rcx, (%%r14)\n\t"           /* pcb_onfault = &recovery */
+        "leaq 2f(%%rip), %%rax\n\t"
+        "movq %%rax, (%%r14)\n\t"           /* pcb_onfault = &recovery */
         "movq %%rsp, saved_rsp_msr(%%rip)\n\t"
 
-        /* Attempt rdmsr (ecx already set by constraint) */
+        /* Attempt rdmsr (ecx preserved from input constraint) */
         "rdmsr\n\t"
 
         /* Success: combine edx:eax → 64-bit and store */
