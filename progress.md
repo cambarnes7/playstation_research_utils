@@ -2191,3 +2191,143 @@ DRs zeroed + PCB_DBREGS removed + sysent CFI + kdata NX post-resume.
 
 ---
 
+## Consolidated Assessment: What We Know, What's Dead, What's Left
+
+### What kldload Actually Gives Us (Current Capability)
+
+We have **full kernel code execution** inside the guest VM:
+- Allocate kernel memory, copy code, clear NX, launch kernel threads
+- Read/write all of kdata, kernel heap, DMAP
+- Call any kernel function (copyin, copyout, malloc, kproc_create, etc.)
+- Modify IDT entries, TSS IST pointers, apic_ops vtable
+- Set/read debug registers (DR0-DR7)
+- Read MSRs (LSTAR, EFER, STAR, etc.) and CRs (CR0, CR3, CR4)
+- Modifications to kdata, IDT, TSS, and apic_ops all **persist through rest mode**
+
+### What the Hypervisor Blocks (Proven Walls)
+
+Every one of these has been tested and confirmed blocked:
+
+| Attack | How Blocked | Evidence |
+|--------|------------|---------|
+| Read ktext bytes (VA) | NPT XOM — execute-only pages | v8a/v8c/v8c2 all crash, pcb_onfault can't catch NPT violation |
+| Read ktext bytes (DMAP) | PTEs zeroed — ktext pages removed from DMAP entirely | pivot_scan_safe v5: PTE=0 for ktext physical pages |
+| Read ktext bytes (Spectre) | NPT enforced on speculative access | Flush+Reload attack failed |
+| Write ktext | NPT read-only + XOM | Never attempted directly, but XOM + no write confirmed |
+| Execute non-ktext during suspend | NPT NX on all non-ktext pages during cpususpend_handler | `mov eax,1; ret` in kdata panics during suspend |
+| Write CR0 (clear WP) | VMEXIT interception | PCB hijack v3: CR0.WP write intercepted, HV active at cpu_switch |
+| Write MSRs (LSTAR etc.) | VMEXIT interception | HV intercepts wrmsr — confirmed by CR0.WP test (same mechanism) |
+| INT3 during LAPIC resume | Broken — system never resumes | v7 mode 0x2, v9a: both armed correctly, both fail to resume |
+| nop_ret as apic_ops[2] | Must return non-zero | System enters rest, never resumes (LAPIC mode detection fails) |
+| savectx as apic_ops[2] | RDI invalid during resume | R8 gamble confirmed RDI not controllable |
+| Modify ktext PTEs | HV integrity monitor | XOTEXT bit clearing triggered HV, blocked rest mode entry |
+
+### Confirmed Dead Ends (Do Not Revisit)
+
+1. **DMAP reading ktext** — tested 5+ times across multiple strategies. PTEs are literally zeroed. The physical pages backing ktext are not mapped in DMAP at all. This is NOT a page fault we can catch — the pages simply don't exist in the guest's DMAP view.
+
+2. **INT3-based approaches during resume** — the CPU/system state during early LAPIC resume cannot handle INT3 trap delivery. Both doreti_iret bounce (v9a) and IST+pop_all_iret chain (v3) fail identically. The IDT may not be loaded yet, or the CPU is in a special mode where traps are fatal.
+
+3. **PCB hijack for pre-HV access** — cpu_switch runs too late. HV is already active. v3 proved code execution works but CR0.WP write was intercepted.
+
+4. **susppcbs manipulation** — exhaustive search (44MB kdata BSS + 11MB DMAP low memory + broad pointer scan + all 4 candidate follows) found nothing. Sony either replaced FreeBSD's ACPI suspend or uses a non-standard allocation.
+
+5. **Blind ktext byte scanning via read** — XOM is hardware-enforced via NPT. No guest-accessible path can read ktext bytes. Only execution-based probing works, and it's dangerous (one crash per bad byte).
+
+6. **Stack pivot gadget via apic_ops epilogues** — Sony Clang consistently emits `?? 48 C3` epilogues (REX.W ret). No `C9 C3` (leave;ret) found in any of the 28 apic_ops entries at fn-1, fn-2, or fn-3.
+
+### The Fundamental Problem
+
+The hypervisor is a **hardware-enforced boundary**. Every approach tried so far operates within the guest VM — using guest page tables, guest IDT, guest MSR access. The HV controls:
+- **NPT (Nested Page Tables)**: determines what physical memory the guest can read/write/execute
+- **MSR intercept bitmap**: determines which MSR writes trigger VMEXITs
+- **CR access intercept**: determines which CR writes trigger VMEXITs
+- **VMCB (Virtual Machine Control Block)**: the HV's own configuration, inaccessible from guest
+
+No amount of clever kernel tricks inside the guest changes these hardware controls. The guest cannot modify NPT entries because they're in host-physical memory the guest can't address. The guest cannot disable MSR intercepts because that's in the VMCB.
+
+### What Could Actually Work (Honest Assessment)
+
+#### 1. GPU DMA (Different Attack Class)
+
+**Why it's fundamentally different from everything tried so far:**
+
+The CPU path: `Guest VA → Guest PT → Guest PA → NPT → Host PA`
+The GPU DMA path: `GPU command → IOMMU → Host PA` (or directly to PA if IOMMU is permissive)
+
+GPU DMA does NOT go through NPT. It goes through the IOMMU (AMD's IOMMU, separate from AMD-V's NPT). If the IOMMU is misconfigured or can be reprogrammed from the kernel, GPU DMA can access physical memory that the CPU cannot — including potentially:
+- Reading ktext physical pages (bypassing XOM)
+- Writing to arbitrary physical memory
+- Accessing HV memory / NPT tables / VMCB
+
+**Why it might NOT work:**
+- Sony may have configured the IOMMU correctly (locked down GPU DMA range)
+- IOMMU configuration registers may be trapped by the HV
+- The GPU command processor setup is complex (need to understand AMD's GFX ring buffer protocol)
+- flatz's PS5 6.00+ GPU DMA work targeted a different firmware — IOMMU config may differ on 4.03
+- We'd need to reverse-engineer the GPU driver's MMIO register layout from kdata (since we can't read ktext)
+
+**Honest question: does GPU DMA give us more than kldload?**
+
+If IOMMU is locked down: **NO.** We'd spend weeks setting up GPU commands and hit another wall.
+
+If IOMMU is permissive or reconfigurable: **YES, dramatically.** GPU DMA would let us:
+- Read ALL of ktext (every gadget, every function, full disassembly)
+- Write to NPT entries (disable XOM, disable NX, make ktext writable)
+- Potentially write to VMCB (disable MSR/CR interception entirely)
+- Potentially access HV code/data
+
+The difference is binary: it either works or it doesn't. There's no partial success scenario.
+
+#### 2. VMMCALL Hypercall Probing (Low Effort, High Uncertainty)
+
+17 untested hypercalls. Some may be IOMMU-related (AMD IOMMU uses hypercalls for some operations). A bug in any hypercall handler could give HV-level access.
+
+**Effort**: Low (each probe is a single VMMCALL instruction with different arguments)
+**Risk**: Each bad call is a potential crash
+**Reward**: If a hypercall has a vulnerability, it's game over — direct HV compromise
+
+#### 3. IOMMU Reconfiguration from Kernel (Medium Effort)
+
+Instead of GPU DMA, directly reprogram the IOMMU via its MMIO registers. The kernel has an IOMMU driver that configures DMA mappings. If those MMIO registers are accessible:
+- Add a DMA mapping for our own buffer → ktext physical address
+- Use any DMA-capable device (USB, network, etc.) to read/write through the mapping
+
+**Risk**: HV may trap IOMMU MMIO accesses
+**Prerequisite**: Find IOMMU base address (probably discoverable from PCI config space, which is readable)
+
+#### 4. Sysent Persistence (Different Goal)
+
+If the goal is just **persistent kernel code execution** (survives rest mode, no need to re-run webkit/BD-J exploit):
+- Replace a rarely-used sysent handler pointer with kdata function address
+- After rest mode, sysent table persists (it's kdata)
+- Re-exploit via webkit/BD-J, call the hijacked syscall → instant kernel code execution without kstuff reload
+
+This doesn't bypass the HV, but it gives persistence. Combined with kldload's existing capabilities, it means every boot after the first only needs a userland exploit to regain full kernel access.
+
+**Does NOT help with**: reading ktext, writing ktext, modifying protected MSRs/CRs
+
+#### 5. Hardware Attacks (Highest Effort, Guaranteed Results)
+
+- SPI flash dumping → read the HV binary, find vulnerabilities offline
+- UART → debug output during boot, potential command injection
+- Voltage glitching → fault the HV's integrity checks during boot
+
+These bypass the software boundary entirely but require physical equipment.
+
+### Bottom Line
+
+**The user's question — "How is GPU DMA going to truly get more attack surface than kldload?" — is the right question.**
+
+The honest answer: GPU DMA is a **completely different DMA path** that bypasses the CPU's NPT enforcement. It's not "maybe Sony didn't think of X within the hypervisor" — it's "can we go around the hypervisor entirely via a peripheral's DMA engine." If the IOMMU is locked down, it gives us nothing. If it's not, it gives us everything.
+
+But we don't know which it is without trying, and the setup cost is significant. VMMCALL probing (approach 2) is lower effort and should be tried first — a single vulnerable hypercall could be more impactful than weeks of GPU driver reverse engineering.
+
+**Recommended order:**
+1. VMMCALL probing (hours of work, could find HV bug)
+2. IOMMU register discovery (find if MMIO is accessible or trapped)
+3. GPU DMA (only if IOMMU looks promising)
+4. Hardware (if all software paths are exhausted)
+
+---
+
