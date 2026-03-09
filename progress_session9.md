@@ -380,7 +380,85 @@ This is a viable path even if IOMMU blocks ktext access.
 | Phase 1 (PA self-test) | Very Low | Low | Debug translation code |
 | Phase 2 (address map) | Very Low | None | Safe, information only |
 | Phase 3 (GPU kdata) | Medium | Medium | Debug PM4 format |
-| Phase 4 (GPU ktext) | **HIGH** | **HIGH** | Byepervisor path |
+| Phase 4 (GPU ktext) | **HIGH** | **HIGH** | HV bypass path |
 | Phase 5 (PCI/MMIO) | Low | Medium | Known AMD register map |
+
+---
+
+## Hypervisor Bypass Research (≤FW 4.51)
+
+### What Exists
+
+The psdevwiki lists an unnamed "Hypervisor bypass vulnerability (≤FW 4.51)" — separate from Byepervisor (≤2.70). This is **flatz's private exploit**. Key facts:
+
+- **NOT Byepervisor** — flatz explicitly confirmed a different exploit
+- **Entry chain**: PS4 savegame → kernel exploit → HV exploit → PSP dump
+- **Patched in FW 5.00** (same release that killed dlsym, MAP_SELF)
+- **Not released**: flatz won't publish unless original discoverer goes first
+- **No technical details** have ever been made public
+
+### Why Byepervisor Doesn't Work on 4.03
+
+Byepervisor (≤2.70) used two bugs, both patched by FW 3.00:
+
+1. **QA flags shared with guest kernel** — HV init checked QA SL debug flag when building NPT. If set, NPT wouldn't apply xotext to ktext pages. Flag survived rest mode even though HV reinitializes. PATCHED: QA flags no longer accessible from guest.
+
+2. **HV jump tables in kdata** — hypercall vtable stored in kernel .data, writable by guest. Hijack VMMCALL_HV_SET_CPUID_PS4 entry → ROP chain in HV → disable NPT + GMET → xotext gone. PATCHED: HV separated from kernel binary at FW 3.00.
+
+### What Changed at FW 3.00 (HV Hardening)
+
+- HV separated into its own binary (no longer part of kernel)
+- QA flags isolated from guest kernel
+- 3 new hypercalls added:
+  - `VMCLOSURE_INVOCATION` (0xe) — purpose unknown, potential attack surface
+  - `STARTUP_MP` (0xf) — multiprocessor startup
+  - `DISABLE_STARTUP_MP` (0x10)
+
+### HV Attack Surface on FW 4.03
+
+Even without flatz's exploit, the HV exposes these interfaces:
+
+**IOMMU hypercalls (7 total, 0x6-0xC)**:
+- `IOMMU_SET_GUEST_BUFFERS` (0x6) — configure IOMMU page tables?
+- `IOMMU_ENABLE_DEVICE` (0x7) — enable DMA for a device
+- `IOMMU_BIND_PASID` (0x8) — bind process address space ID
+- `IOMMU_UNBIND_PASID` (0x9)
+- `IOMMU_CHECK_CMD_COMPLETION` (0xa)
+- `IOMMU_CHECK_EVLOG_REGS` (0xb)
+- `IOMMU_READ_DEVICE_TABLE` (0xc)
+
+Any bug in these hypercall handlers could give IOMMU control → GPU DMA to anything.
+
+**Key HV architectural facts**:
+- EFER bit 16 (xotext/NDA) — guest can't modify, silently dropped
+- GMET — traps execution from lower-priv pages in higher-priv context
+- CR0.WP, CR4.SMAP, CR4.SMEP — all intercepted, can't disable
+- HV's own page tables map ktext as **read/write** (needs it for intercept handlers)
+- NPT maps ktext as execute-only (no read, no write from guest CPU)
+
+**VMCLOSURE_INVOCATION** (0xe) — added in FW 3.00, purpose unknown.
+If this hypercall has a vulnerability, it would be in the exact FW range of flatz's exploit (3.00-4.51). Worth investigating what arguments it takes and what it does.
+
+### Strategy: GPU DMA First, HV Bypass Second
+
+Since flatz's exploit is private, we pursue two parallel tracks:
+
+**Track A: GPU DMA (immediate)**
+1. Get GPU DMA working (Phases 0-3)
+2. If GPU can read ktext through IOMMU → XOM bypassed without HV exploit
+3. If GPU can write ktext → persistence solved without HV exploit
+4. If IOMMU blocks ktext → Track B
+
+**Track B: HV bypass research (longer term)**
+1. Reverse engineer IOMMU hypercall handlers from ktext dump (needs Track A success)
+2. Investigate VMCLOSURE_INVOCATION behavior
+3. Probe IOMMU_SET_GUEST_BUFFERS with crafted arguments
+4. If any HV hypercall handler has a bug → code exec in HV → disable NPT/GMET → game over
+
+**Track C: Data-only persistence (fallback)**
+If neither GPU DMA nor HV bypass yields ktext access:
+- Focus on data-only attacks (function pointer manipulation)
+- Use existing kdata gadgets (if any exist in mapped executable regions)
+- Accept that full ktext dump may not be achievable on 4.03 without flatz's exploit
 
 ---
