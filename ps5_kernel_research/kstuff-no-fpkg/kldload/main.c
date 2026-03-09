@@ -120,7 +120,7 @@ static void _kldload(void* data, size_t data_size)
         uint64_t first_page = exec_code & page_mask;
         uint64_t last_page  = (exec_code + data_size - 1) & page_mask;
         for (uint64_t page = first_page; page <= last_page; page += 0x1000) {
-            uint64_t pte = kekcall_make_exec(page, 1);
+            uint64_t pte = kekcall_make_exec(page, 2);
             printf("[debug] kekcall_make_exec(%#lx) returned %#lx\n", page, pte);
         }
     }
