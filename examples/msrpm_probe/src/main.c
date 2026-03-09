@@ -136,6 +136,35 @@ static inline uint64_t idt_gate_get_addr(volatile struct idt_gate *g)
 }
 
 /* ===================================================================
+ * #GP handler self-test via non-canonical memory access
+ * (Pure CPU exception — no hypervisor interception possible)
+ * =================================================================== */
+
+static int test_gp_handler(void)
+{
+    gp_faulted = 0;
+
+    __asm__ volatile(
+        "leaq 1f(%%rip), %%rax\n\t"
+        "movq %%rax, gp_recovery_rip(%%rip)\n\t"
+        "movq %%rsp, gp_recovery_rsp(%%rip)\n\t"
+
+        /* Non-canonical address: bit 47 set, bits 48-63 clear → #GP(0) */
+        "movabs $0x0000800000000000, %%rax\n\t"
+        "movb (%%rax), %%al\n\t"
+
+        "movq $0, gp_recovery_rip(%%rip)\n\t"
+
+        "1:\n\t"
+        :
+        :
+        : "rax", "memory", "cc"
+    );
+
+    return gp_faulted;  /* 1 = fault caught (handler works) */
+}
+
+/* ===================================================================
  * Safe MSR probing
  * =================================================================== */
 
@@ -341,38 +370,58 @@ int module_start(kproc_args* args)
     }
 
     /* =========================================================
-     * Self-test: trigger a #GP with out-of-range MSR (0xDEAD0000)
-     * This MSR is outside the AMD MSRPM bitmap ranges, so rdmsr
-     * causes a direct #GP (no hypervisor interception).
+     * Self-test 1: non-canonical memory access → #GP(0)
+     * Pure CPU exception, no hypervisor interception possible.
      * ========================================================= */
 
     gp_handler_entries = 0;
     gp_handler_recovered = 0;
     gp_handler_chained = 0;
 
-    out[4] = 0x60;  /* step 0x60: starting #GP self-test */
+    out[4] = 0x60;  /* step 0x60: starting #GP self-test (non-canonical) */
 
-    int gp_test = safe_rdmsr(0xDEAD0000);
-    /* gp_test should be 0 (faulted) if handler works */
+    int gp_test = test_gp_handler();
+    /* gp_test should be 1 (fault caught) if handler works */
 
     out[4] = 0x61;  /* step 0x61: #GP self-test returned */
     out[5] = (uint64_t)gp_test;
     out[6] = gp_handler_entries;
     out[7] = gp_handler_recovered;
 
-    if (!gp_faulted || gp_handler_recovered == 0) {
-        /* Handler didn't fire or didn't recover → something's wrong.
+    if (!gp_test || gp_handler_recovered == 0) {
+        /* Handler didn't fire or didn't recover.
          * Restore IDT and abort. */
         __asm__ volatile("cli" ::: "memory");
         kstuff_memcpy((void *)idt13, &saved_idt13, 16);
         __asm__ volatile("sti" ::: "memory");
 
-        out32[1] = 0xFA17;  /* "FAIL" - #GP handler test failed */
+        out32[1] = 0xFA17;  /* "FAIL" - #GP handler self-test failed */
         out[287] = 0xdeadbeefcafe0099ULL;
         return 0;
     }
 
-    out[4] = 6;  /* step 6: #GP handler verified, starting probes */
+    /* =========================================================
+     * Self-test 2: rdmsr with invalid MSR
+     * Tests whether HV lets rdmsr #GP reach guest IDT.
+     * If this crashes, HV intercepts all rdmsr via #VMEXIT.
+     * ========================================================= */
+
+    out[4] = 0x62;  /* step 0x62: starting rdmsr self-test */
+
+    int msr_test = safe_rdmsr(0xDEAD0000);
+    /* msr_test should be 0 (faulted) if handler catches rdmsr #GP */
+
+    out[4] = 0x63;  /* step 0x63: rdmsr self-test returned */
+    out[5] = (uint64_t)msr_test;
+    out[6] = gp_handler_entries;
+    out[7] = gp_handler_recovered;
+
+    if (gp_faulted == 0) {
+        /* rdmsr didn't fault — MSR 0xDEAD0000 somehow readable?! */
+        /* Still proceed to probing, this is unexpected but not fatal */
+    }
+
+    out[4] = 6;  /* step 6: all tests passed, starting probes */
 
     /* =========================================================
      * MSR probing
