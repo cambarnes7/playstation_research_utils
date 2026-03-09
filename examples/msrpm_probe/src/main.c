@@ -113,70 +113,17 @@ int module_start(kproc_args* args)
     TRY_RDMSR(0x0000001B);  /* APIC_BASE */
 
     /* =========================================================
-     * TIER 2: AMD MSRs read by state_capture module
+     * TIER 2: THE TARGET — PATCH_LOADER (EntrySign)
+     * Try immediately after safe MSRs. SYSCFG (0xC0010010) kills
+     * the VM, so all 0xC001xxxx MSRs may be blocked. But
+     * PATCH_LOADER is the one we care about most.
      * ========================================================= */
 
-    TRY_RDMSR(0xC0010010);  /* SYSCFG */
-    TRY_RDMSR(0xC001001D);  /* TOP_MEM */
-    TRY_RDMSR(0xC001001E);  /* TOP_MEM2 */
-    TRY_RDMSR(0xC0010114);  /* VM_CR */
-    TRY_RDMSR(0xC0010117);  /* VM_HSAVE_PA */
-
-    /* =========================================================
-     * TIER 3: Common AMD MSRs (might work, might kill VM)
-     * ========================================================= */
-
-    TRY_RDMSR(0xC0010015);  /* HWCR */
-    TRY_RDMSR(0xC0010111);  /* SMM_BASE */
-    TRY_RDMSR(0xC0010112);  /* SMM_ADDR */
-    TRY_RDMSR(0xC0010113);  /* SMM_MASK */
-    TRY_RDMSR(0xC0010140);  /* OSVW_ID_LEN */
-    TRY_RDMSR(0xC0010141);  /* OSVW_STATUS */
-
-    /* Microcode version (read-only, should be safe) */
+    /* Try PATCH_LEVEL first (read-only, less sensitive) */
     TRY_RDMSR(0xC0010021);  /* PATCH_LEVEL — microcode revision */
 
-    /* =========================================================
-     * TIER 4: MTRR and other architectural MSRs
-     * ========================================================= */
-
-    TRY_RDMSR(0x00000277);  /* PAT */
-    TRY_RDMSR(0x000002FF);  /* MTRR_DEF_TYPE */
-    TRY_RDMSR(0x000000FE);  /* MTRR_CAP */
-    TRY_RDMSR(0x00000200);  /* MTRR_PHYS_BASE0 */
-    TRY_RDMSR(0x00000201);  /* MTRR_PHYS_MASK0 */
-    TRY_RDMSR(0x00000250);  /* MTRR_FIX64K */
-    TRY_RDMSR(0x00000174);  /* SYSENTER_CS */
-    TRY_RDMSR(0x00000175);  /* SYSENTER_ESP */
-    TRY_RDMSR(0x00000176);  /* SYSENTER_EIP */
-
-    /* =========================================================
-     * TIER 5: Performance counters (likely intercepted)
-     * ========================================================= */
-
-    TRY_RDMSR(0xC0010200);  /* PERF_CTL0 */
-    TRY_RDMSR(0xC0010201);  /* PERF_CTR0 */
-    TRY_RDMSR(0xC0010202);  /* PERF_CTL1 */
-    TRY_RDMSR(0xC0010203);  /* PERF_CTR1 */
-
-    /* =========================================================
-     * TIER 6: IBS MSRs (Instruction-Based Sampling)
-     * ========================================================= */
-
-    TRY_RDMSR(0xC0011030);  /* IBS_FETCH_CTL */
-    TRY_RDMSR(0xC0011031);  /* IBS_FETCH_LINADDR */
-    TRY_RDMSR(0xC0011032);  /* IBS_FETCH_PHYSADDR */
-    TRY_RDMSR(0xC0011033);  /* IBS_OP_CTL */
-    TRY_RDMSR(0xC0011034);  /* IBS_OP_RIP */
-    TRY_RDMSR(0xC0011035);  /* IBS_OP_DATA */
-
-    /* =========================================================
-     * TIER 7: THE TARGET — PATCH_LOADER (EntrySign)
-     * This is LAST because it's most likely to kill the VM.
-     * If we get here, out[3] already has all tier 1-6 results.
-     * ========================================================= */
-
-    out[4] = 0xC0010020;  /* mark: attempting PATCH_LOADER */
+    /* Now the big one */
+    out[4] = 0xC0010020;  /* mark: attempting PATCH_LOADER rdmsr */
 
     uint64_t patch_loader_val = rdmsr(0xC0010020);
 
@@ -206,6 +153,26 @@ int module_start(kproc_args* args)
         out[result_idx++] = ((uint64_t)0xC0010020 << 32) | 0x03;
         out[result_idx++] = readback_val;
     }
+
+    /* =========================================================
+     * TIER 3: Other architectural MSRs (bonus data if we survive)
+     * ========================================================= */
+
+    TRY_RDMSR(0x00000277);  /* PAT */
+    TRY_RDMSR(0x000002FF);  /* MTRR_DEF_TYPE */
+    TRY_RDMSR(0x000000FE);  /* MTRR_CAP */
+    TRY_RDMSR(0x00000174);  /* SYSENTER_CS */
+    TRY_RDMSR(0x00000175);  /* SYSENTER_ESP */
+    TRY_RDMSR(0x00000176);  /* SYSENTER_EIP */
+
+    /* =========================================================
+     * TIER 4: AMD MSRs (SYSCFG killed VM last run, try others)
+     * ========================================================= */
+
+    TRY_RDMSR(0xC0010114);  /* VM_CR */
+    TRY_RDMSR(0xC0010117);  /* VM_HSAVE_PA */
+    TRY_RDMSR(0xC0010015);  /* HWCR */
+    TRY_RDMSR(0xC0010010);  /* SYSCFG — known killer, last in tier */
 
     /* =========================================================
      * Done
