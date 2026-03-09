@@ -231,6 +231,17 @@ int module_start(kproc_args* args)
     out[3] = idt_base;
     out[9] = (uint64_t)idt_limit;
 
+    /*
+     * out[4] = progress step counter (visible in generic readback)
+     * out[5] = last diagnostic value for current step
+     * out[6] = secondary diagnostic
+     * out[7] = PATCH_LOADER result (written during probing)
+     *
+     * Steps: 1=sidt, 2=idt179_read, 3=int179_test, 4=idt13_saved,
+     *        5=idt_patched, 6=probing, 7=idt_restored, 8=done
+     */
+    out[4] = 1;  /* step 1: sidt done */
+
     /* =========================================================
      * Test int 179 (kstuff_memcpy) with a safe copy first
      * ========================================================= */
@@ -240,6 +251,8 @@ int module_start(kproc_args* args)
     uint64_t int179_handler = idt_gate_get_addr(idt179);
     out[10] = int179_handler;
     out[11] = (uint64_t)idt179->type_attr;
+    out[4] = 2;  /* step 2: idt179 read */
+    out[5] = int179_handler;
 
     /* If IDT entry 179 is not present (P bit = bit 7 of type_attr), skip */
     if (!(idt179->type_attr & 0x80)) {
@@ -255,9 +268,11 @@ int module_start(kproc_args* args)
     /* Verify the copy worked */
     if (out[12] != test_val) {
         out32[1] = 0xBEEF;  /* int 179 copy failed */
+        out[5] = out[12];   /* what we got instead */
         out[287] = 0xdeadbeefcafe0099ULL;
         return 0;
     }
+    out[4] = 3;  /* step 3: int179 test passed */
 
     /* =========================================================
      * Patch IDT entry #13 using int 179 (kelf page tables)
@@ -277,6 +292,8 @@ int module_start(kproc_args* args)
     orig_gp_handler_addr = idt_gate_get_addr(&saved_idt13);
     out[13] = orig_gp_handler_addr;
     out[14] = (uint64_t)saved_idt13.ist;
+    out[4] = 4;  /* step 4: idt13 saved */
+    out[5] = orig_gp_handler_addr;
 
     /* Build our replacement entry: same selector/type/IST, our handler addr */
     struct idt_gate new_idt13 = saved_idt13;
@@ -303,8 +320,23 @@ int module_start(kproc_args* args)
     kstuff_memcpy((void *)idt13, &new_idt13, 16);
     __asm__ volatile("sti" ::: "memory");
 
-    /* Marker: IDT patch succeeded */
-    out[12] = 0x50415443;  /* "PATC" */
+    out[4] = 5;  /* step 5: IDT patched */
+    out[5] = hook_addr;
+
+    /* Verify IDT patch took effect by reading back */
+    {
+        uint64_t readback_addr = idt_gate_get_addr(idt13);
+        out[6] = readback_addr;
+        if (readback_addr != hook_addr) {
+            /* IDT write didn't stick — HV may protect IDT writes.
+             * DO NOT probe MSRs (would send #GP to kelf without recovery). */
+            out32[1] = 0xF00D;  /* IDT patch failed */
+            out[287] = 0xdeadbeefcafe0099ULL;
+            return 0;
+        }
+    }
+
+    out[4] = 6;  /* step 6: IDT verified, starting probes */
 
     /* =========================================================
      * MSR probing
@@ -339,8 +371,8 @@ int module_start(kproc_args* args)
         uint64_t rd_val = rd ? msr_read_val : 0;
         int wr = safe_wrmsr(msr, 0);
 
-        out[7] = ((uint64_t)rd << 32) | (uint64_t)wr;
-        out[8] = rd_val;
+        out[21] = ((uint64_t)rd << 32) | (uint64_t)wr;
+        out[22] = rd_val;
         RECORD_RESULT(msr, rd, wr, rd_val);
     }
 
@@ -434,6 +466,8 @@ int module_start(kproc_args* args)
      * Restore IDT entry #13 (kstuff's kelf handler) via int 179
      * ========================================================= */
 
+    out[4] = 7;  /* step 7: probing done, restoring IDT */
+
     __asm__ volatile("cli" ::: "memory");
     kstuff_memcpy((void *)idt13, &saved_idt13, 16);
     __asm__ volatile("sti" ::: "memory");
@@ -442,9 +476,14 @@ int module_start(kproc_args* args)
      * Write summary
      * ========================================================= */
 
-    out[4] = (uint64_t)total_probed;
-    out[5] = (uint64_t)total_read_ok;
-    out[6] = (uint64_t)total_write_ok;
+    out[18] = (uint64_t)total_probed;
+    out[19] = (uint64_t)total_read_ok;
+    out[20] = (uint64_t)total_write_ok;
+
+    out[4] = 8;  /* step 8: complete */
+    out[5] = (uint64_t)total_probed;
+    out[6] = (uint64_t)total_read_ok;
+    out[7] = (uint64_t)total_write_ok;
 
     out32[1] = 0x0001;  /* success */
     out[287] = 0xdeadbeefcafe0099ULL;
