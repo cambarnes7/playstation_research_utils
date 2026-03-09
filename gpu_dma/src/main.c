@@ -244,12 +244,9 @@ static void phase0_gnm_probe(void) {
         "/system/common/lib/libSceGnm.sprx",
     };
 
-    const char *key_syms[] = {
+    const char *extra_syms[] = {
         "sceGnmSubmitCommandBuffers",
         "sceGnmSubmitDone",
-    };
-
-    const char *extra_syms[] = {
         "sceGnmSubmitAndFlipCommandBuffers",
         "sceGnmMapComputeQueue",
         "sceGnmUnmapComputeQueue",
