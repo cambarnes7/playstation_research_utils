@@ -56,6 +56,11 @@
  *   [17]  trap frame base (kdata+0x2D8)
  *   [18]  sentinel address
  *   [19]  sentinel value
+ *   [20]  kstuff DR0 (saved before clearing)
+ *   [21]  kstuff DR1
+ *   [22]  kstuff DR2
+ *   [23]  kstuff DR3
+ *   [24]  kstuff DR7
  *   [100] sentinel 0xdeadbeefcafe0040
  *
  * Output layout for Mode 0x2 (READBACK):
@@ -206,7 +211,29 @@ static void mode1_arm(uint64_t kdata_base, volatile uint64_t* out, volatile uint
     out[3] = idt_base;
     out[4] = tss_base;
 
-    /* === IDT[1] (#DB handler) === */
+    /* === STEP 1: Save and disable ALL debug breakpoints FIRST ===
+     * kstuff uses DR breakpoints + IDT[1]. If we modify IDT[1] while
+     * kstuff's DRs are live, kstuff's breakpoints fire into our
+     * doreti_iret handler and panic. Disable DR7 before touching IDT. */
+    uint64_t orig_dr0, orig_dr1, orig_dr2, orig_dr3, orig_dr7;
+    __asm__ volatile("mov %%dr0, %0" : "=r"(orig_dr0));
+    __asm__ volatile("mov %%dr1, %0" : "=r"(orig_dr1));
+    __asm__ volatile("mov %%dr2, %0" : "=r"(orig_dr2));
+    __asm__ volatile("mov %%dr3, %0" : "=r"(orig_dr3));
+    __asm__ volatile("mov %%dr7, %0" : "=r"(orig_dr7));
+
+    /* Save kstuff's DR state for reporting */
+    save[4] = orig_dr0;
+    save[5] = orig_dr1;
+    save[6] = orig_dr2;
+    save[7] = orig_dr3;
+    save[8] = orig_dr7;
+
+    /* Disable ALL breakpoints — makes IDT[1] modification safe */
+    uint64_t zero = 0;
+    __asm__ volatile("mov %0, %%dr7" :: "r"(zero));
+
+    /* === STEP 2: Modify IDT[1] (#DB handler) — safe now, DRs disabled === */
     uint64_t orig_lo, orig_hi;
     read_idt_gate(idt_base, 1, &orig_lo, &orig_hi);
     save[0] = orig_lo;
@@ -224,7 +251,7 @@ static void mode1_arm(uint64_t kdata_base, volatile uint64_t* out, volatile uint
     out[7] = new_lo;
     out[8] = new_hi;
 
-    /* === TSS IST5 for all CPUs === */
+    /* === STEP 3: TSS IST5 for all CPUs === */
     uint64_t orig_ist5 = read8(tss_base + TSS_IST_OFF(OUR_IST_NUM));
     save[2] = orig_ist5;
     out[9] = orig_ist5;
@@ -246,10 +273,22 @@ static void mode1_arm(uint64_t kdata_base, volatile uint64_t* out, volatile uint
     out[11] = cpus_patched;
     out[12] = doreti_iret;
 
-    /* === DR0 = get_timer_freq (execution breakpoint) === */
+    /* === STEP 4: Report kstuff's saved DR state === */
     out[13] = get_timer_freq;
+    out[20] = orig_dr0;   /* kstuff DR0 */
+    out[21] = orig_dr1;   /* kstuff DR1 */
+    out[22] = orig_dr2;   /* kstuff DR2 */
+    out[23] = orig_dr3;   /* kstuff DR3 */
+    out[24] = orig_dr7;   /* kstuff DR7 */
 
+    /* === STEP 5: Set DR0 = get_timer_freq, enable ONLY DR0 ===
+     * DR7 is the LAST thing we write — arms the breakpoint. */
     __asm__ volatile("mov %0, %%dr0" :: "r"(get_timer_freq));
+    /* Clear DR1-3 so no stale kstuff breakpoints fire */
+    __asm__ volatile("mov %0, %%dr1" :: "r"(zero));
+    __asm__ volatile("mov %0, %%dr2" :: "r"(zero));
+    __asm__ volatile("mov %0, %%dr3" :: "r"(zero));
+    /* Enable DR0 only — this is the point of no return */
     __asm__ volatile("mov %0, %%dr7" :: "r"(DR7_ENABLE_DR0_EXEC));
 
     out[14] = DR7_ENABLE_DR0_EXEC;
