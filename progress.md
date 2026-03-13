@@ -332,6 +332,10 @@ Shifted focus from gadget scanning to exploiting the suspend/resume path. The hy
 | **EntrySign not viable** | PATCH_LOADER inaccessible | HV MSRPM blocks entire AMD MSR range from guest |
 | **QA flags patched at FW 3.00** | Not accessible from guest | progress_session9.md + Byepervisor research |
 | **Flatz private HV exploit ≤4.51** | Different from Byepervisor, unpublished | psdevwiki + wololo.net |
+| **INT3 is VMCB-intercepted** | Causes VMEXIT (not IDT issue) | Explains ALL resume INT3 failures; kstuff proves #DB is NOT intercepted |
+| **#DB via DR not intercepted** | Goes directly to guest IDT | kstuff uses DR breakpoints successfully; no VMEXIT for #DB |
+| **kstuff persists through rest mode** | DRs + hooks survive suspend/resume | User confirmed; implies DR0-DR7 survive rest mode |
+| **IDT is global, DRs per-CPU** | Can't replace IDT[1] while kstuff active | dr_db_resume_test v1/v2: instant panic from cross-CPU #DB race |
 
 ### Thread Structure Layout (v16, FW 4.03)
 
@@ -2221,7 +2225,8 @@ Every one of these has been tested and confirmed blocked:
 | Execute non-ktext during suspend | NPT NX on all non-ktext pages during cpususpend_handler | `mov eax,1; ret` in kdata panics during suspend |
 | Write CR0 (clear WP) | VMEXIT interception | PCB hijack v3: CR0.WP write intercepted, HV active at cpu_switch |
 | Write MSRs (LSTAR etc.) | VMEXIT interception | HV intercepts wrmsr — confirmed by CR0.WP test (same mechanism) |
-| INT3 during LAPIC resume | Broken — system never resumes | v7 mode 0x2, v9a: both armed correctly, both fail to resume |
+| INT3 during LAPIC resume | VMCB-intercepted → VMEXIT → crash (HV not ready) | v7, v9a fail; root cause: INT3 is in VMCB exception intercept bitmap |
+| Replacing IDT[1] while kstuff active | kstuff DR breakpoints on other CPUs crash | IDT global but DRs per-CPU; dr_db_resume_test v1/v2 panicked instantly |
 | nop_ret as apic_ops[2] | Must return non-zero | System enters rest, never resumes (LAPIC mode detection fails) |
 | savectx as apic_ops[2] | RDI invalid during resume | R8 gamble confirmed RDI not controllable |
 | Modify ktext PTEs | HV integrity monitor | XOTEXT bit clearing triggered HV, blocked rest mode entry |
@@ -2231,7 +2236,7 @@ Every one of these has been tested and confirmed blocked:
 
 1. **DMAP reading ktext** — tested 5+ times across multiple strategies. PTEs are literally zeroed. The physical pages backing ktext are not mapped in DMAP at all. This is NOT a page fault we can catch — the pages simply don't exist in the guest's DMAP view.
 
-2. **INT3-based approaches during resume** — the CPU/system state during early LAPIC resume cannot handle INT3 trap delivery. Both doreti_iret bounce (v9a) and IST+pop_all_iret chain (v3) fail identically. The IDT may not be loaded yet, or the CPU is in a special mode where traps are fatal.
+2. **INT3-based approaches during resume** — INT3 (#BP, vector 3) is VMCB-intercepted. During resume, the HV VMEXIT handlers are not yet initialized, so INT3 causes a fatal VMEXIT crash. This is NOT because the IDT isn't loaded — it's because INT3 always triggers a VMEXIT regardless of IDT state. Both doreti_iret bounce (v9a) and IST+pop_all_iret chain (v3) fail identically for this reason. **#DB (vector 1) via DR breakpoints is NOT intercepted** — proven by kstuff using DR breakpoints successfully. See Phase 19.
 
 3. **PCB hijack for pre-HV access** — cpu_switch runs too late. HV is already active. v3 proved code execution works but CR0.WP write was intercepted.
 
@@ -2450,6 +2455,104 @@ Netflix-N-Hack and Y2JB (YouTube JailBreak) are userland entry points only — t
 | GPU DMA ktext READ via IOMMU | Medium-High | 30-40% | IOMMU may not replicate NPT XOM for reads |
 | CR3 page table walk → MMIO/IOMMU discovery | Low | 99% (info gathering) | Feeds into GPU DMA approach |
 | Hardware (SPI, UART, glitching) | High | High | Bypasses software entirely |
+
+---
+
+## Phase 19: #DB Resume Test via DR Breakpoints (dr_db_resume_test)
+
+**Status: IN PROGRESS (v3 deployed, awaiting results)**
+
+### The Breakthrough: Why INT3 Fails and #DB Should Work
+
+After exhaustive testing of INT3-based resume interception (v3 IST chain, v7 doreti_iret bounce, v9a CC bounce — all failed identically), the root cause was identified:
+
+**INT3 (#BP, vector 3) is in the VMCB exception intercept bitmap.** Every INT3 triggers a mandatory VMEXIT regardless of guest IDT state. During the pre-HV resume window (when apic_ops[2] is called), the HV VMEXIT handlers are not yet initialized. So INT3 → VMEXIT → uninitialized handler → crash. This is a hardware-level interception that cannot be bypassed from the guest.
+
+**#DB (vector 1) via DR hardware breakpoints is NOT in the VMCB intercept bitmap.** This is proven by kstuff: ps5-kstuff uses DR0-DR3 execution breakpoints to hook kernel functions, and these hooks work correctly — meaning #DB goes directly to the guest IDT without any VMEXIT. The HV never sees #DB events.
+
+The key evidence:
+- kstuff uses `mov %0, %%dr0` / `mov %0, %%dr7` to set execution breakpoints
+- kstuff's #DB handler in IDT[1] fires and redirects execution
+- kstuff **persists through rest mode** (user confirmed) — proving DRs survive suspend/resume
+- If DRs survive and #DB isn't intercepted, #DB WILL fire in the pre-HV window
+
+### Strategy: DR2 Execution Breakpoint on get_timer_freq
+
+Set a hardware execution breakpoint (DR2) on the `get_timer_freq` function. During resume, `apic_ops[2]` is called (confirmed by flatz), which executes `get_timer_freq`. DR2 matches RIP → #DB fires → guest IDT[1] handler runs → bounces back via iretq. The CPU automatically sets the RF (Resume Flag) in the pushed RFLAGS, preventing DR2 from re-triggering on return.
+
+### Implementation Iterations
+
+#### v1: Replace IDT[1] + Set DR0 — INSTANT PANIC
+
+First attempt: replaced IDT[1] with doreti_iret handler using IST5, set DR0=get_timer_freq, enabled DR7.
+
+**Crash cause**: IDT is shared across ALL CPUs, but DR registers are per-CPU. kstuff has DR breakpoints active on all CPUs. Replacing IDT[1] with our simple doreti_iret caused kstuff's breakpoints on OTHER CPUs to fire into our handler. Multiple CPUs hitting the same IST5 stack (kdata+0x300) simultaneously = stack corruption = panic.
+
+#### v2: Clear DR7 First — STILL INSTANT PANIC
+
+Second attempt: clear DR7 before modifying IDT[1] to disable breakpoints.
+
+**Crash cause**: `mov %0, %%dr7` only affects the CURRENT CPU. Other CPUs still have kstuff's DR breakpoints active. When we modified IDT[1] (global), other CPUs' #DB events went to our doreti_iret handler instead of kstuff's handler. Same cross-CPU race condition.
+
+**Key learning**: Any modification to IDT[1] while kstuff is active on a multi-CPU system will crash. IDT modifications require either (a) disabling interrupts on ALL CPUs simultaneously (IPI + cli), or (b) not modifying IDT at all.
+
+#### v3: Don't Touch IDT/TSS — Use DR2 + Preserve kstuff's DR7 (CURRENT)
+
+Third attempt: completely different approach.
+
+- **Do NOT modify IDT[1] or TSS** — let kstuff own the #DB handler
+- **Use DR2** (not DR0/DR1 which kstuff uses) for our execution breakpoint
+- **Preserve kstuff's DR7**: read current DR7, OR in DR2 enable bit, clear R/W2+LEN2 for execution BP
+- kstuff's #DB handler sees unexpected DR2 match, has no registered hook for it, bounces back via iretq
+- During resume: kstuff's handler is in ktext (executable), handles #DB correctly
+
+**Proof mechanism**: If the system resumes successfully with DR2=get_timer_freq armed and apic_ops[2] calling get_timer_freq, then #DB MUST have fired and been handled. If #DB wasn't handled (no working IDT[1] handler), the system would triple-fault. System alive = proof.
+
+### Payload Details (examples/dr_db_resume_test/)
+
+**Size**: 960 bytes
+
+**Mode 0x1 (ARM):**
+1. Read kstuff's full DR state (DR0-DR3, DR7) — report in output
+2. Set DR2 = get_timer_freq address
+3. Build new DR7 = (kstuff's DR7 | L2 bit) with R/W2+LEN2 cleared for exec BP
+4. Set apic_ops[2] = get_timer_freq
+5. Write sentinel to kdata+0x200
+6. Report IDT[1] state (kstuff's handler address + IST field) without modifying it
+
+**Mode 0x2 (READBACK):**
+1. Read all DR registers — check if DR2 and DR7 persisted through rest mode
+2. Read sentinel — check kdata persistence
+3. Read apic_ops[2] — check if still get_timer_freq
+4. Report system_alive=1 (if readback runs, resume worked)
+5. Restore: DR2 to kstuff's original, DR7 to kstuff's original, apic_ops[2] via set_tpr-8 trick
+
+### What Success Means
+
+If v3 READBACK shows:
+- DR2 survived = get_timer_freq → DRs persist through rest mode (independently confirmed)
+- DR7 has L2 bit → DR7 persists
+- System is alive → #DB fired during resume and was handled
+- apic_ops[2] still = get_timer_freq → function pointer persists
+
+This proves we can **intercept execution in the pre-HV resume window via #DB**. The next step would be replacing kstuff's IDT[1] handler with our own (doreti_iret or pop_all_iret) at a safe time — either via IPI to disable interrupts on all CPUs, or by deploying without kstuff (using a minimal #DB handler from scratch).
+
+### What Failure Means
+
+If v3 causes panic:
+- kstuff's #DB handler may not gracefully handle unknown DR2 breakpoints
+- Would need to examine kstuff's handler behavior (which DRs it expects)
+- Alternative: use DR3 instead, or find kstuff's unused DR slot
+
+If system resumes but DR2/DR7 are reset:
+- DRs might be cleared during resume (VMCB.SAVE area reload)
+- Would need alternative approach (persist breakpoint via other mechanism)
+
+### Next Steps After v3 Results
+
+1. **If #DB confirmed**: Build full ROP chain using pop_all_iret via IDT[1] replacement (done safely by disabling kstuff first or deploying without it)
+2. **IDT[1] swap strategy**: Either (a) IPI all CPUs to cli, swap IDT[1], sti, or (b) run without kstuff using our own minimal kldload that doesn't use DR breakpoints
+3. **Full chain**: DR0 = gadget address → #DB fires → pop_all_iret pops controlled registers from IST stack → IRET to arbitrary RIP/RSP with full register control → ktext ROP chain to read/patch kernel
 
 ---
 
