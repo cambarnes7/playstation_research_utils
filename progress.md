@@ -328,6 +328,8 @@ Shifted focus from gadget scanning to exploiting the suspend/resume path. The hy
 | **NPT NX during suspend** | Blocks non-ktext exec | Even `mov eax,1; ret` in kdata panics during suspend |
 | **apic_ops[2] persists** | Overwrite survives rest mode | Confirmed across 8+ sessions |
 | **No CFI on apic_ops** | Indirect calls unchecked | Can point at any ktext address |
+| **All 0xC001xxxx MSRs blocked** | VM killed (not #GP) | msrpm_probe: PATCH_LEVEL (0xC0010021) terminated VM |
+| **EntrySign not viable** | PATCH_LOADER inaccessible | HV MSRPM blocks entire AMD MSR range from guest |
 
 ### Thread Structure Layout (v16, FW 4.03)
 
@@ -2236,6 +2238,8 @@ Every one of these has been tested and confirmed blocked:
 
 6. **Stack pivot gadget via apic_ops epilogues** — Sony Clang consistently emits `?? 48 C3` epilogues (REX.W ret). No `C9 C3` (leave;ret) found in any of the 28 apic_ops entries at fn-1, fn-2, or fn-3.
 
+7. **EntrySign / PATCH_LOADER MSR** — HV blocks entire 0xC001xxxx MSR range. VM terminated on first attempt (PATCH_LEVEL 0xC0010021). PATCH_LOADER (0xC0010020) never reached. All AMD-specific MSRs are inaccessible from guest ring 0. EntrySign (CVE-2024-56161) is not viable on PS5 FW 4.03.
+
 ### The Fundamental Problem
 
 The hypervisor is a **hardware-enforced boundary**. Every approach tried so far operates within the guest VM — using guest page tables, guest IDT, guest MSR access. The HV controls:
@@ -2328,6 +2332,61 @@ But we don't know which it is without trying, and the setup cost is significant.
 2. IOMMU register discovery (find if MMIO is accessible or trapped)
 3. GPU DMA (only if IOMMU looks promising)
 4. Hardware (if all software paths are exhausted)
+
+**NOTE (updated):** MSR-based approaches (EntrySign, SYSCFG, VM_CR, HWCR) are confirmed dead — see Phase 17. The HV blocks ALL 0xC001xxxx MSRs. Only 9 standard MSRs (EFER, STAR, LSTAR, CSTAR, SFMASK, FSBASE, GSBASE, KGSBASE, APIC_BASE) are accessible from guest ring 0.
+
+---
+
+## Phase 17: MSR Accessibility Probe (msrpm_probe)
+
+**Status: COMPLETE**
+
+### Design
+
+Deployed `msrpm_probe` kmod via kldload. Reads MSRs directly via `rdmsr` in kernel context (ring 0). The PS5 HV intercepts all `rdmsr` via VMEXIT — emulated MSRs return values, blocked MSRs terminate the VM (no #GP injected). Payload writes progress markers after each successful read so partial results survive VM termination.
+
+### Results
+
+9 tier-1 MSRs succeeded. First 0xC001xxxx MSR (PATCH_LEVEL, 0xC0010021) terminated the VM.
+
+### Accessible MSRs (Tier 1 — kernel-standard)
+
+| MSR | Name | Status |
+|-----|------|--------|
+| 0xC0000080 | EFER | Readable |
+| 0xC0000081 | STAR | Readable |
+| 0xC0000082 | LSTAR | Readable |
+| 0xC0000083 | CSTAR | Readable |
+| 0xC0000084 | SFMASK | Readable |
+| 0xC0000100 | FSBASE | Readable |
+| 0xC0000101 | GSBASE | Readable |
+| 0xC0000102 | KGSBASE | Readable |
+| 0x0000001B | APIC_BASE | Readable |
+
+### Blocked MSRs (VM terminated — no #GP, instant kill)
+
+| MSR | Name | Status |
+|-----|------|--------|
+| 0xC0010021 | PATCH_LEVEL | VM killed |
+| 0xC0010020 | PATCH_LOADER | Not reached (killed on 0xC0010021 first) |
+| 0xC0010010+ | All AMD-specific | Blocked (entire 0xC001xxxx range) |
+
+### Analysis
+
+The HV's MSRPM (MSR Permission Map) bitmap has intercept bits set for the entire 0xC0010000-0xC0011FFF range. The HV's VMEXIT handler for these MSRs does not inject #GP back to the guest — it terminates the VM outright. This is the same pattern seen with CR0.WP writes (HV intercepts and kills rather than allowing or emulating).
+
+### EntrySign (CVE-2024-56161) Verdict
+
+**Not viable from guest ring 0 on PS5 FW 4.03.** PATCH_LOADER (0xC0010020) cannot be read or written. Custom microcode loading is impossible from within the guest VM. EntrySign would require either:
+1. HV-level access (to bypass MSRPM) — which is what we're trying to achieve
+2. Physical access (SPI flash / voltage glitch during boot)
+
+### Implications
+
+- All MSR-based HV bypass approaches are dead from guest ring 0
+- The accessible MSRs (EFER, STAR, LSTAR, etc.) are already known and provide no new attack surface
+- WRMSR to LSTAR/STAR is also intercepted (confirmed by CR0.WP interception pattern — HV intercepts ALL security-relevant writes)
+- Remaining software vectors: VMMCALL probing, IOMMU/GPU DMA, CR3 page table walk for MMIO discovery
 
 ---
 
