@@ -334,8 +334,10 @@ Shifted focus from gadget scanning to exploiting the suspend/resume path. The hy
 | **Flatz private HV exploit ≤4.51** | Different from Byepervisor, unpublished | psdevwiki + wololo.net |
 | **INT3 is VMCB-intercepted** | Causes VMEXIT (not IDT issue) | Explains ALL resume INT3 failures; kstuff proves #DB is NOT intercepted |
 | **#DB via DR not intercepted** | Goes directly to guest IDT | kstuff uses DR breakpoints successfully; no VMEXIT for #DB |
-| **kstuff persists through rest mode** | DRs + hooks survive suspend/resume | User confirmed; implies DR0-DR7 survive rest mode |
+| **kstuff persists through rest mode** | kdata/IDT hooks survive, DRs re-armed on demand | kstuff rebuilds DR state after resume, not hardware persistence |
 | **IDT is global, DRs per-CPU** | Can't replace IDT[1] while kstuff active | dr_db_resume_test v1/v2: instant panic from cross-CPU #DB race |
+| **DR0-DR7 do NOT survive rest mode** | All reset (S3 power-off clears CPU state) | dr_db_resume_test v3: DR2=0, DR7=0x400 (default) after resume |
+| **Only RAM-mapped state persists** | kdata, IDT, TSS, apic_ops survive; no CPU regs | DR test + prior idt_safe_test + sentinel tests confirm |
 
 ### Thread Structure Layout (v16, FW 4.03)
 
@@ -2227,6 +2229,7 @@ Every one of these has been tested and confirmed blocked:
 | Write MSRs (LSTAR etc.) | VMEXIT interception | HV intercepts wrmsr — confirmed by CR0.WP test (same mechanism) |
 | INT3 during LAPIC resume | VMCB-intercepted → VMEXIT → crash (HV not ready) | v7, v9a fail; root cause: INT3 is in VMCB exception intercept bitmap |
 | Replacing IDT[1] while kstuff active | kstuff DR breakpoints on other CPUs crash | IDT global but DRs per-CPU; dr_db_resume_test v1/v2 panicked instantly |
+| #DB via DR during resume | DRs reset by S3 power-off (CPU state lost) | dr_db_resume_test v3: DR2=0, DR7=0x400 after rest mode |
 | nop_ret as apic_ops[2] | Must return non-zero | System enters rest, never resumes (LAPIC mode detection fails) |
 | savectx as apic_ops[2] | RDI invalid during resume | R8 gamble confirmed RDI not controllable |
 | Modify ktext PTEs | HV integrity monitor | XOTEXT bit clearing triggered HV, blocked rest mode entry |
@@ -2460,7 +2463,7 @@ Netflix-N-Hack and Y2JB (YouTube JailBreak) are userland entry points only — t
 
 ## Phase 19: #DB Resume Test via DR Breakpoints (dr_db_resume_test)
 
-**Status: IN PROGRESS (v3 deployed, awaiting results)**
+**Status: COMPLETE — DRs do NOT survive rest mode (S3 power-off resets all CPU register state)**
 
 ### The Breakthrough: Why INT3 Fails and #DB Should Work
 
@@ -2470,11 +2473,10 @@ After exhaustive testing of INT3-based resume interception (v3 IST chain, v7 dor
 
 **#DB (vector 1) via DR hardware breakpoints is NOT in the VMCB intercept bitmap.** This is proven by kstuff: ps5-kstuff uses DR0-DR3 execution breakpoints to hook kernel functions, and these hooks work correctly — meaning #DB goes directly to the guest IDT without any VMEXIT. The HV never sees #DB events.
 
-The key evidence:
+The key evidence that #DB is not intercepted:
 - kstuff uses `mov %0, %%dr0` / `mov %0, %%dr7` to set execution breakpoints
-- kstuff's #DB handler in IDT[1] fires and redirects execution
-- kstuff **persists through rest mode** (user confirmed) — proving DRs survive suspend/resume
-- If DRs survive and #DB isn't intercepted, #DB WILL fire in the pre-HV window
+- kstuff's #DB handler in IDT[1] fires and redirects execution during normal operation
+- kstuff **persists through rest mode** — but this means its kdata/IDT hooks persist, NOT the DR registers themselves (see results below)
 
 ### Strategy: DR2 Execution Breakpoint on get_timer_freq
 
@@ -2527,32 +2529,74 @@ Third attempt: completely different approach.
 4. Report system_alive=1 (if readback runs, resume worked)
 5. Restore: DR2 to kstuff's original, DR7 to kstuff's original, apic_ops[2] via set_tpr-8 trick
 
-### What Success Means
+### v3 Results: DRs Do NOT Survive Rest Mode
 
-If v3 READBACK shows:
-- DR2 survived = get_timer_freq → DRs persist through rest mode (independently confirmed)
-- DR7 has L2 bit → DR7 persists
-- System is alive → #DB fired during resume and was handled
-- apic_ops[2] still = get_timer_freq → function pointer persists
+v3 ARM completed successfully (status 0x0001). System entered rest mode and resumed. Readback results:
 
-This proves we can **intercept execution in the pre-HV resume window via #DB**. The next step would be replacing kstuff's IDT[1] handler with our own (doreti_iret or pop_all_iret) at a safe time — either via IPI to disable interrupts on all CPUs, or by deploying without kstuff (using a minimal #DB handler from scratch).
+**ARM output (mode 0x1):**
+| Slot | Field | Value |
+|------|-------|-------|
+| [0] | magic+status | `0x0000000144524442` (DRDB, success) |
+| [1] | kdata_base | `0xffffffffcae20000` |
+| [2] | ktext_base | `0xffffffffca220000` |
+| [3] | get_timer_freq | `0xffffffffca4b4320` |
+| [4] | original apic_ops[2] | `0xffffffffca4b4340` (xapic_mode) |
+| [5] | apic_ops[2] set to | `0xffffffffca4b4320` (get_timer_freq ✓) |
+| [6] | kstuff DR0 | `0x0` (not armed on this CPU) |
+| [7] | kstuff DR1 | `0x0` (not armed on this CPU) |
 
-### What Failure Means
+**READBACK output (mode 0x2):**
+| Slot | Field | Value | Meaning |
+|------|-------|-------|---------|
+| [0] | magic+status | `0x0000000144524442` | DRDB, success |
+| [1] | kdata_base | `0xffffffffcae20000` | Same ✓ |
+| [2] | ktext_base | `0xffffffffca220000` | Same ✓ |
+| [3] | DR0 | `0x0` | Reset to zero |
+| [4] | DR1 | `0x0` | Reset to zero |
+| [5] | **DR2** | **`0x0`** | **RESET — was `0xffffffffca4b4320`** |
+| [6] | DR3 | `0x0` | Reset to zero |
+| [7] | **DR7** | **`0x0000000000000400`** | **Hardware default (GE bit only)** |
 
-If v3 causes panic:
-- kstuff's #DB handler may not gracefully handle unknown DR2 breakpoints
-- Would need to examine kstuff's handler behavior (which DRs it expects)
-- Alternative: use DR3 instead, or find kstuff's unused DR slot
+(Display truncated to first 8 entries; higher indices including sentinel and apic_ops[2] readback not shown in debug output.)
 
-If system resumes but DR2/DR7 are reset:
-- DRs might be cleared during resume (VMCB.SAVE area reload)
-- Would need alternative approach (persist breakpoint via other mechanism)
+### Analysis: Why DRs Don't Survive
 
-### Next Steps After v3 Results
+**DR0-DR3 are NOT part of the VMCB save area.** During S3 suspend, the CPU fully powers off. On resume, hardware reset clears all general-purpose and debug registers to zero. The HV then does VMRUN with a fresh (or restored) VMCB:
 
-1. **If #DB confirmed**: Build full ROP chain using pop_all_iret via IDT[1] replacement (done safely by disabling kstuff first or deploying without it)
-2. **IDT[1] swap strategy**: Either (a) IPI all CPUs to cli, swap IDT[1], sti, or (b) run without kstuff using our own minimal kldload that doesn't use DR breakpoints
-3. **Full chain**: DR0 = gadget address → #DB fires → pop_all_iret pops controlled registers from IST stack → IRET to arbitrary RIP/RSP with full register control → ktext ROP chain to read/patch kernel
+- **DR6, DR7**: Part of VMCB save area. HV initializes DR7 to `0x400` (hardware default: GE bit set, no breakpoints enabled). Our L2 bit is gone.
+- **DR0-DR3**: Not in VMCB. CPU hardware reset clears them to zero. Our get_timer_freq address is gone.
+
+**How kstuff actually persists**: kstuff's kdata modifications (IDT entries, sysent hooks, other memory-mapped state) survive rest mode because kdata is in RAM. After resume, when the guest kernel runs and hits one of kstuff's IDT/sysent hooks, kstuff re-arms its DR breakpoints from the hook handler. The DRs themselves are transient — kstuff rebuilds them on demand.
+
+**Additional observation**: kstuff DR0/DR1 were ZERO during ARM mode too (slots [6]-[7]). This means kstuff either (a) doesn't use DRs on the CPU that ran our kproc, or (b) arms DRs lazily only when specific code paths trigger kstuff's IDT/sysent hooks.
+
+### What This Rules Out
+
+- **#DB via DR breakpoints during resume**: Cannot work. DRs are reset before the guest starts. No breakpoint is armed when apic_ops[2] fires.
+- **Any CPU register-based persistence**: CR registers, DR registers, MSRs — all reset during S3. Only RAM-mapped state survives.
+
+### What Still Works (Confirmed Persistent State)
+
+| State | Survives Rest Mode | Evidence |
+|-------|-------------------|----------|
+| kdata writes | ✅ Yes | Confirmed across 10+ sessions (sentinels, markers) |
+| IDT entries | ✅ Yes | idt_safe_test: IST field modification persisted |
+| TSS entries | ✅ Yes | idt_safe_test: IST5 value persisted |
+| apic_ops[2] override | ✅ Yes | Confirmed across 8+ sessions |
+| DR0-DR3 | ❌ No | dr_db_resume_test v3: all reset to zero |
+| DR7 | ❌ No | dr_db_resume_test v3: reset to 0x400 (default) |
+
+### Revised Attack Surface for Pre-HV Resume Window
+
+Since DRs don't survive, we cannot use #DB to intercept execution during resume. The available primitives are:
+
+1. **apic_ops[2] → ktext function**: We control which ktext function runs during resume. It must return non-zero. We need to find a function that either (a) has a useful side effect, or (b) is a gadget that gives us more control.
+
+2. **IDT + TSS persist**: We can set up custom interrupt handlers with IST stack switching. But we need a way to TRIGGER the interrupt during resume without DRs or INT3.
+
+3. **kdata writes persist**: We can pre-write ROP chains, IRET frames, or any data structures to kdata before rest mode. The challenge is getting RIP to reach them (kdata is NX during resume).
+
+4. **Stack pivot via apic_ops[2] epilogue**: If we find the right ktext function whose epilogue reads from a location we control (e.g., `pop rbp; ret` where RSP points to kdata we've written), we could redirect execution. This requires knowing RSP during the apic_ops[2] call — the suspend_stackprobe payload was designed for this.
 
 ---
 
