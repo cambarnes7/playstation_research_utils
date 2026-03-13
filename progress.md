@@ -330,6 +330,8 @@ Shifted focus from gadget scanning to exploiting the suspend/resume path. The hy
 | **No CFI on apic_ops** | Indirect calls unchecked | Can point at any ktext address |
 | **All 0xC001xxxx MSRs blocked** | VM killed (not #GP) | msrpm_probe: PATCH_LEVEL (0xC0010021) terminated VM |
 | **EntrySign not viable** | PATCH_LOADER inaccessible | HV MSRPM blocks entire AMD MSR range from guest |
+| **QA flags patched at FW 3.00** | Not accessible from guest | progress_session9.md + Byepervisor research |
+| **Flatz private HV exploit ≤4.51** | Different from Byepervisor, unpublished | psdevwiki + wololo.net |
 
 ### Thread Structure Layout (v16, FW 4.03)
 
@@ -2223,6 +2225,7 @@ Every one of these has been tested and confirmed blocked:
 | nop_ret as apic_ops[2] | Must return non-zero | System enters rest, never resumes (LAPIC mode detection fails) |
 | savectx as apic_ops[2] | RDI invalid during resume | R8 gamble confirmed RDI not controllable |
 | Modify ktext PTEs | HV integrity monitor | XOTEXT bit clearing triggered HV, blocked rest mode entry |
+| Set QA/SL debug flag | QA flags isolated from guest at FW 3.00 | Byepervisor bugs patched; confirmed in progress_session9.md |
 
 ### Confirmed Dead Ends (Do Not Revisit)
 
@@ -2239,6 +2242,8 @@ Every one of these has been tested and confirmed blocked:
 6. **Stack pivot gadget via apic_ops epilogues** — Sony Clang consistently emits `?? 48 C3` epilogues (REX.W ret). No `C9 C3` (leave;ret) found in any of the 28 apic_ops entries at fn-1, fn-2, or fn-3.
 
 7. **EntrySign / PATCH_LOADER MSR** — HV blocks entire 0xC001xxxx MSR range. VM terminated on first attempt (PATCH_LEVEL 0xC0010021). PATCH_LOADER (0xC0010020) never reached. All AMD-specific MSRs are inaccessible from guest ring 0. EntrySign (CVE-2024-56161) is not viable on PS5 FW 4.03.
+
+8. **Byepervisor QA flags (SL debug flag)** — Both Byepervisor bugs patched at FW 3.00. Bug #1: QA flags isolated from guest kernel (guest can no longer set SL flag to disable xotext in NPT). Bug #2: HV jump tables moved out of kdata (HV separated into own binary). Flatz holds a private, different HV exploit for ≤4.51 (patched 5.00) but no technical details published. QA flags approach is not viable on FW 4.03.
 
 ### The Fundamental Problem
 
@@ -2387,6 +2392,64 @@ The HV's MSRPM (MSR Permission Map) bitmap has intercept bits set for the entire
 - The accessible MSRs (EFER, STAR, LSTAR, etc.) are already known and provide no new attack surface
 - WRMSR to LSTAR/STAR is also intercepted (confirmed by CR0.WP interception pattern — HV intercepts ALL security-relevant writes)
 - Remaining software vectors: VMMCALL probing, IOMMU/GPU DMA, CR3 page table walk for MMIO discovery
+
+---
+
+## Phase 18: Byepervisor QA Flags Investigation
+
+**Status: DEAD END**
+
+### Research Summary
+
+Investigated Byepervisor's QA flags approach (bug #2) as potential path to disable XOM on FW 4.03. The mechanism: set SL (System Level) debug flag in kdata → rest mode → HV reinitializes without resetting flag → NPT constructed without xotext bit → ktext becomes readable/writable.
+
+### Why It Doesn't Work on 4.03
+
+Both Byepervisor bugs were patched at FW 3.00 (confirmed in progress_session9.md):
+
+1. **QA flags (bug #2)**: QA flags isolated from guest kernel. Guest can no longer read or write the SL debug flag. The flag may still exist in HV memory but is not in any guest-accessible memory region (kdata, kernel heap, DMAP).
+
+2. **HV jump tables (bug #1)**: HV separated into own binary at FW 3.00. Hypercall vtable no longer in kernel .data segment.
+
+### Flatz's Private HV Exploit (≤4.51)
+
+psdevwiki lists an unnamed "Hypervisor bypass vulnerability (≤FW 4.51)" — this is flatz's private exploit, confirmed as different from Byepervisor. Key facts:
+- NOT the QA flags approach
+- Entry chain: PS4 savegame → kernel exploit → HV exploit → PSP dump
+- Patched in FW 5.00
+- No technical details published
+- flatz won't release unless original discoverer goes first
+
+### What Changed at FW 3.00 (HV Hardening)
+
+- HV separated into its own binary
+- QA flags isolated from guest kernel
+- 3 new hypercalls added (potential attack surface):
+  - VMCLOSURE_INVOCATION (0xe)
+  - STARTUP_MP (0xf)
+  - IOMMU-related hypercall(s)
+
+### Netflix JB / Y2JB Context
+
+Netflix-N-Hack and Y2JB (YouTube JailBreak) are userland entry points only — they provide JavaScript execution via MITM on the PS5's Netflix/YouTube apps. They chain into kernel exploits (UMTX UaF, Lapse) for kernel R/W. On FW 6.00+, GPU DMA is used to bypass kdata write protection (SMAP). Neither provides new HV bypass techniques — they use existing exploit chains.
+
+### GPU DMA on PS5 (from psdevwiki)
+
+- GPU DMA to kernel .data: proven technique (flatz, FW 6.00+)
+- GPU DMA does NOT bypass XOM for ktext writes (IOMMU enforces same restrictions for writes)
+- GPU DMA CAN write to kdata → used to trigger Byepervisor bug #2 on ≤2.70
+- Unknown whether GPU DMA can READ ktext (IOMMU read permissions may differ from write)
+- Implementations: Java (flatz BD-JB), Lua (Znullptr), WebKit (Specter)
+- APIs: sceGnmSubmitCommandBuffers + sceGnmSubmitDone from libSceGnmDriverForNeoMode.sprx
+
+### Remaining Software Attack Vectors (Post-QA-Flags)
+
+| Vector | Effort | Chance | Notes |
+|--------|--------|--------|-------|
+| VMMCALL probing (3 new FW 3.00 hypercalls) | Low | Low-Medium | Bug in handler = HV access |
+| GPU DMA ktext READ via IOMMU | Medium-High | 30-40% | IOMMU may not replicate NPT XOM for reads |
+| CR3 page table walk → MMIO/IOMMU discovery | Low | 99% (info gathering) | Feeds into GPU DMA approach |
+| Hardware (SPI, UART, glitching) | High | High | Bypasses software entirely |
 
 ---
 
