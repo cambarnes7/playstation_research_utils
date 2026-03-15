@@ -2600,3 +2600,229 @@ Since DRs don't survive, we cannot use #DB to intercept execution during resume.
 
 ---
 
+## Phase 20: MP4 DECI5S Memory Access Analysis + IOMMU Architecture
+
+**Status: IN PROGRESS — A53 cannot directly reach HV region; IOMMU reprogramming required**
+
+### Background: Alternative Attack Vector via A53 Coprocessor
+
+The PS5's Aeolia SoC contains an ARM Cortex-A53 coprocessor (the "MP4" or "MM controller") that runs its own firmware. During development/QA, the DECI5S debug protocol provides read/write access to memory through this coprocessor. The question: can the A53 reach system PA `0x70000000` (the HV region) via DECI5S PA reads?
+
+### DECI5S Read Memory Handler (0x1112A4)
+
+`deci5s_sdbgp_context_handle_read_memory_mp4` supports 4 read types based on `type & 0x7F000000`:
+
+| Type | Name | Translation Function | Meaning |
+|------|------|---------------------|---------|
+| `0x02000000` | PA read | `pa_to_el3_va_with_flags` | A53 bus address (physical) |
+| `0x40000000` | EL0 VA read | `el0_va_to_el3_va` | EL0 virtual address |
+| `0x43000000` | EL3 VA read | `el3_va_to_el3_va` | EL3 virtual address |
+| `0x48000000` | PA read (alt) | `pa_to_el3_va_with_flags` | Same as 0x02 |
+
+The actual memory read is a raw pointer dereference — no filtering at the read site. Supports byte/word/dword/qword/128-bit access sizes based on `type & 0xF`.
+
+### PA Translator: pa_to_el3_va_with_flags (0x10DED8)
+
+```
+if (pa <= 0xFFF)
+    return pa | 0x4200000;     // Remap to SRAM base
+else {
+    va = pa;                   // Identity map — NO address filtering
+    if (pa >= 0xC0000 && (pa & 0xFFFFFFFFFC000000) != 0x88000000)
+        printf("not SRAM - try check VA==PA map");  // WARNING ONLY, not a block
+}
+// Then: AT S1E3R, va   (ARM address translation check at EL3)
+// If EL3 MMU fault → return 0 (blocked)
+// If PA mismatch → return 0
+// Otherwise → return va (access allowed)
+```
+
+No address range filtering. The only gate is `AT S1E3R` — the EL3 MMU page table.
+
+### EL3 MMU Page Table (from mmu_init_phase1)
+
+4 × 1GB blocks (identity-mapped), then two regions unmapped:
+
+| Address Range | Status |
+|---------------|--------|
+| `0x00000000-0x3FFFFFFF` | MAPPED (SRAM, MMIO, etc.) |
+| `0x40000000-0x7FFFFFFF` | MAPPED ← includes `0x70000000` |
+| `0x80000000-0xBFFFFFFF` | MAPPED (G6 SYSHUB at `0x88000000`) |
+| `0xC0000000-0xC3FFFFFF` | UNMAPPED |
+| `0xC4000000-0xCFFFFFFF` | MAPPED |
+| `0xD0000000-0xEFFFFFFF` | UNMAPPED |
+| `0xF0000000-0xFFFFFFFF` | MAPPED (IOMMU MMIO at `0xFDD88000`) |
+
+**`0x70000000` passes the EL3 MMU check** — AT S1E3R succeeds.
+
+### Exception Guard Wrapping the Read
+
+The read is wrapped in setjmp/longjmp:
+
+```
+saved = sub_108104(jmpbuf);       // setjmp — saves qword_123180
+if (sub_10813C(jmpbuf)) {         // Check if exception occurred
+    printf("Exception in access %p", ptr);
+    error = 1;                    // Mark failed, continue
+} else {
+    *dest = *ptr;                 // Actual read — raw dereference
+}
+sub_108144(jmpbuf, saved);        // Restore previous handler
+```
+
+### SYSHUB Violation — The Real Gatekeeper
+
+From `el3_exception_dispatch`: when GIC interrupt 33 fires, it's a SYSHUB Violation:
+
+```
+case 33:  // GICC_IAR == 33
+    printf("Error:SYSHUB Violation");
+    printf("Error:mmMP4_SYSHUB_INT_STATUS=0x%08x", MEMORY[0x32305D0]);
+    // Reads SYSHUB_RD_INT_ADDR or SYSHUB_WR_INT_ADDR for fault address
+    // Checks qword_123180 (exception guard)
+    if (qword_123180) {
+        longjmp(qword_123180 + 8, 1);  // Returns to read handler
+    }
+```
+
+This is what happens when accessing unmapped SYSHUB addresses like `0x70000000` — the SYSHUB fabric rejects the access, fires interrupt 33, the exception handler catches it via longjmp, and the read returns error 32 (access error). The firmware doesn't crash.
+
+### A53 Memory Access Architecture
+
+```
+A53 VA → [EL3 MMU] → A53 bus addr → [SYSHUB TLB] → IOMMU addr → [IOMMU page table] → System PA
+                                          ↓
+                                     [BYPASS] entries skip IOMMU, go direct to system PA
+```
+
+### SYSHUB TLB Entries (from boot strings)
+
+| Entry | Mode | Purpose |
+|-------|------|---------|
+| TLB10 | IOMMU | Kernel IOMMU VA space |
+| TLB11 | IOMMU | Kernel IOMMU VA space |
+| TLB12 | IOMMU | Kernel IOMMU VA space |
+| TLB15 | BYPASS | Direct PA (SRAM/local) |
+| TLB16 | BYPASS | Direct PA |
+| TLB17 | BYPASS | Direct PA |
+
+### What the A53 Can Actually Reach
+
+| Region | System PA | Notes |
+|--------|-----------|-------|
+| SRAM | `0x00000000-0x000BFFFF` | Local |
+| MMIO regs | `0x02000000-0x032A0000` | MP4 registers via SYSHUB |
+| MSI window | `0xF6E00000` | x86 LAPIC, 2MB |
+| DRAM (MM) | ~`0x18000000` | Small private window |
+| DRAM (IO) | ~`0x1C000000` | Small private window |
+| NVMe buffers | ~`0x14000000` | IO core, 50MB |
+| G6 SYSHUB | `0x88000000-0x887FFFFF` | Firmware image, page tables, MDSR |
+| IOMMU MMIO | `0xFDD88000` | IOMMU control registers |
+
+### Result: 0x70000000 Read Path
+
+**DECI5S PA read will NOT reach system PA `0x70000000`:**
+
+1. `pa_to_el3_va_with_flags(0x70000000)` → passes (identity map, EL3 MMU OK)
+2. A53 issues bus read to `0x70000000`
+3. SYSHUB has no TLB entry for this range → **SYSHUB Violation (IRQ 33)**
+4. Exception guard catches it → returns error 32
+
+**The A53 does not have direct system DRAM access.** It sees the world through the SYSHUB TLB + IOMMU, which restricts it to specific mapped regions.
+
+---
+
+### IOMMU Architecture Deep Dive
+
+#### Key IOMMU Parameters (from boot config)
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `mm4p_mapper_page_table_ioma` | `0x54000000` | IOMMU page table location |
+| `mm4p_iommu_command_buffer_pa` | `0x01470000` | Command buffer in system memory |
+| `mm4p_iommu_command_buffer_size` | `0x2000` | 8KB command buffer |
+| `mm4p_iommu_mmio` (system PA) | `0xFDD88000` | IOMMU MMIO registers |
+| `mm4p_iommu_mmio` (IOMMU addr) | `0x50E00000` | IOMMU MMIO via IOMMU translation |
+| `m_sysvaKernelStart4K` | `0x50000` → IOMMU VA `0x50000000` | Kernel VA range start |
+| `m_sysvaKernelEnd4K` | `0x4FFFFF` → IOMMU VA `0x4FFFFF000` | Kernel VA range end (wraps 4GB) |
+| `m_pasidKernel` | `0x0001` | Kernel PASID |
+
+#### How Existing Mappings Are Created
+
+**g6_fix: IOMMU `0x50000000` → System PA `0x60000000` (8MB)**
+
+Not set up through the command buffer. IOMMU page table entries are written directly to memory during EL3 boot:
+
+1. EL3 boot code writes IOMMU page table entries at the page table base (system PA backing IOMMU VA `0x54000000`)
+2. Each PTE maps a 4K page: IOMMU VA → System PA with permission bits
+3. For g6_fix: PTEs map IOMMU VA `0x50000000-0x507FFFFF` → System PA `0x60000000-0x607FFFFF`
+4. Then `INVALIDATE_IOTLB_PAGES` command sent to IOMMU to flush stale TLB entries
+
+`MmController_init_iommu_page_tables` (0x64011A4) configures the runtime page table structure using boot config parameters.
+
+#### IOMMU Command Buffer Format
+
+`iommu_submit_invalidate_iotlb` (0x6442024) builds **256-bit (32-byte)** command entries:
+
+```c
+// 32-byte command entry (4 × qword)
+struct iommu_cmd {
+    uint64_t word0;  // bits[3:0]=type, bits[15:8]=queue_id, bits[63:32]=param
+    uint64_t word1;  // extra data
+    uint64_t word2;  // extra data
+    uint64_t word3;  // extra data
+};
+```
+
+Write to command buffer via `iommu_cmd_buffer_write_entry` (0x501BF20):
+```c
+dest = cmd_buf_base + (entry_index << entry_shift);
+dest[0] = cmd->word0;
+dest[1] = cmd->word1;
+dest[2] = cmd->word2;
+dest[3] = cmd->word3;
+```
+
+**Command type 4** = `INVALIDATE_IOTLB_PAGES` (called during MmController startup with DeviceID=0, all zeros — full flush).
+
+**Note**: 32-byte entries, not 16-byte. Either AMD IOMMU v2 extension or Sony-custom format.
+
+#### Can IOMMU Page Tables Be Modified via DECI5S?
+
+**Yes, in principle:**
+
+1. **Page tables are in IOMMU-addressable memory** — at IOMMU VA `0x54000000`. The A53 can read/write IOMMU addresses through the [IOMMU] SYSHUB TLB entries. The MM controller does exactly this during normal operation.
+
+2. **DECI5S WRITE_MEMORY can reach the page tables** — the write_memory handler at 0x1116DC uses the same address translation as read_memory. If PA type routes through SYSHUB to IOMMU page table region, PTEs can be modified.
+
+3. **Catch: need the A53 bus address** — the A53 bus address mapping to IOMMU VA `0x54000000` depends on SYSHUB TLB configuration. From EL0 page table maps: `MAP: 0x04001000+0x050000 → PA 0x48800000` (SYSHUB space, Device memory). Whether `0x48800000` covers the page table region depends on SYSHUB TLB translation.
+
+#### Three Attack Options for IOMMU Reprogramming
+
+**Option A: Direct page table modification via DECI5S**
+1. Read IOMMU Device Table Entry to find page table root pointer
+2. Walk IOMMU page table hierarchy to find the right PTE level
+3. Write new PTE mapping: IOMMU VA X → System PA `0x70000000`
+4. Send `INVALIDATE_IOTLB_PAGES` command via the command buffer
+5. Read IOMMU VA X through DECI5S PA read (if SYSHUB TLB covers it)
+
+**Option B: Inject ring buffer command to MM controller**
+The MM controller processes map/unmap commands from 26 input ring buffers. Ring buffer base at IOMMU addr `0x50C00000` (from `mm4p_mm_rings_ioma`). Write a "map page" command into a ring buffer and trigger processing — creates IOMMU mapping through the normal code path.
+
+**Option C: Use IOMMU MMIO directly**
+IOMMU MMIO at system PA `0xFDD88000` (IOMMU addr `0x50E00000`). A53 can access through SYSHUB. IOMMU MMIO has registers for page table base, command buffer head/tail. Could potentially reconfigure IOMMU directly.
+
+#### Key Unknowns to Resolve
+
+1. **SYSHUB TLB dump** — need exact TLB entries to know which A53 bus addresses reach which IOMMU VAs. EL3 boot code configures these but string xrefs are in `.reset.text` without IDA cross-references.
+
+2. **IOMMU page table format** — standard AMD (4-level, 512 entries/level, 8-byte PTEs) or custom? The 32-byte command entries suggest some customization.
+
+3. **IOMMU page table system PA** — the page table root's system PA. Readable from IOMMU Device Table Entry or MMIO registers.
+
+#### Next Step: IOMMU Analysis
+
+Need to either dump SYSHUB TLB entries from boot code, or read IOMMU MMIO registers to get page table root — determines which attack option is viable.
+
+---
+
