@@ -2812,17 +2812,89 @@ The MM controller processes map/unmap commands from 26 input ring buffers. Ring 
 **Option C: Use IOMMU MMIO directly**
 IOMMU MMIO at system PA `0xFDD88000` (IOMMU addr `0x50E00000`). A53 can access through SYSHUB. IOMMU MMIO has registers for page table base, command buffer head/tail. Could potentially reconfigure IOMMU directly.
 
-#### Key Unknowns to Resolve
+#### Key Unknowns ~~to Resolve~~ (RESOLVED — see Phase 20a below)
 
-1. **SYSHUB TLB dump** — need exact TLB entries to know which A53 bus addresses reach which IOMMU VAs. EL3 boot code configures these but string xrefs are in `.reset.text` without IDA cross-references.
+1. ~~**SYSHUB TLB dump**~~ → **RESOLVED**: TLB10 and TLB15 entries fully decoded from `deci5s_sdbgp_context_handle_test`
+2. ~~**IOMMU page table format**~~ → Presumed standard AMD 4-level (to be confirmed by reading page table entries)
+3. ~~**IOMMU page table system PA**~~ → Readable from IOMMU MMIO `DEV_TAB_BASE` at PA `0x28200000`
 
-2. **IOMMU page table format** — standard AMD (4-level, 512 entries/level, 8-byte PTEs) or custom? The 32-byte command entries suggest some customization.
+---
 
-3. **IOMMU page table system PA** — the page table root's system PA. Readable from IOMMU Device Table Entry or MMIO registers.
+### Phase 20a: SYSHUB TLB Dump + Concrete IOMMU Exploitation Path
 
-#### Next Step: IOMMU Analysis
+**Status: ANALYSIS COMPLETE — Ready for live verification**
 
-Need to either dump SYSHUB TLB entries from boot code, or read IOMMU MMIO registers to get page table root — determines which attack option is viable.
+#### SYSHUB TLB Configuration (from deci5s_sdbgp_context_handle_test at 0x1127A0)
+
+The decompiled test function reveals the exact SYSHUB TLB entries. The firmware itself reads through both paths to verify IOMMU register access:
+
+| Entry | Mode | A53 Bus Address | Translation | Destination |
+|-------|------|----------------|-------------|-------------|
+| TLB10 | IOMMU | `0x28000000+` | `bus_addr + 0x28C00000` | IOMMU VA `0x50C00000+` |
+| TLB15 | BYPASS | `0x3C000000+` | `bus_addr + 0xC0000000` | Direct system PA |
+
+**TLB10 [IOMMU]**: A53 bus address `0x28000000+` → IOMMU VA `0x50C00000+`
+- Offset formula: `IOMMU_addr = bus_addr + 0x28C00000`
+- Covers the MM controller's entire IOMMU working space (rings, page tables, IOMMU MMIO)
+
+**TLB15 [BYPASS]**: A53 bus address `0x3C000000+` → system PA `bus_addr + 0xC0000000`
+- Direct system PA access without IOMMU translation
+
+**Both paths reach the IOMMU MMIO** (system PA `0xFDD88000`):
+- Via IOMMU: DECI5S PA `0x28200000` → TLB10 → IOMMU `0x50E00000` → system PA `0xFDD88000`
+- Via BYPASS: DECI5S PA `0x3DD88000` → TLB15 → system PA `0xFDD88000`
+
+Confirmed by firmware: the test function reads `*(_DWORD *)0x28200018` and `*(_DWORD *)0x3DD88018` (IOMMU Control Register at offset 0x18) through both paths.
+
+#### Concrete 5-Step Exploitation Path
+
+**Step 1: Read IOMMU registers via DECI5S PA type 0x02**
+
+| DECI5S PA | IOMMU Register | Purpose |
+|-----------|---------------|---------|
+| `0x28200000` | `DEV_TAB_BASE` | Device Table system PA + size |
+| `0x28200008` | `CMD_BUF_BASE` | Should confirm PA `0x01470000` |
+| `0x28200018` | `IOMMU_CTRL` | Verify IOMMU is enabled |
+| `0x28200030` | `EXT_FEAT` | IOMMU capabilities |
+
+**Step 2: Walk the IOMMU page table**
+
+DECI5S PA `0x2B400000` → reads mapper page table root (IOMMU VA `0x54000000`). Walk the AMD IOMMU 4-level page table from here. Should see existing g6_fix mapping (IOMMU `0x50000000` → system PA `0x60000000`) and find unused PTE slots.
+
+**Step 3: Modify a PTE via DECI5S WRITE_MEMORY**
+
+Write a new PTE at an unused IOMMU VA mapping to system PA `0x70000000`. Standard AMD IOMMU PTE format:
+```
+bits[0]     = Present (1)
+bits[1]     = Next Level / Page Size
+bits[51:12] = System PA >> 12
+bits[61:59] = Permission (read/write)
+```
+
+**Step 4: Invalidate IOTLB**
+
+Write an `INVALIDATE_IOTLB_PAGES` command to the command buffer (via DECI5S write to command buffer area) and advance the tail pointer.
+
+**Step 5: Read the HV region**
+
+The new IOMMU VA now maps to system PA `0x70000000`. Access through TLB10 path by computing the corresponding A53 bus address:
+```
+bus_addr = IOMMU_VA - 0x28C00000
+```
+
+#### Key Caveat
+
+The TLB10 offset formula (`bus + 0x28C00000 = IOMMU addr`) needs verification with live reads. Derivation from the test function's constants looks solid, but reading PA `0x28200018` first and confirming a valid IOMMU Control Register value would validate the formula before attempting writes.
+
+#### Address Cheat Sheet
+
+| What | DECI5S PA (type 0x02) | Via | Destination |
+|------|----------------------|-----|-------------|
+| IOMMU MMIO base | `0x28200000` | TLB10→IOMMU | System PA `0xFDD88000` |
+| IOMMU MMIO base (alt) | `0x3DD88000` | TLB15→BYPASS | System PA `0xFDD88000` |
+| Page table root | `0x2B400000` | TLB10→IOMMU | IOMMU VA `0x54000000` |
+| MM ring buffers | `0x28000000` | TLB10→IOMMU | IOMMU VA `0x50C00000` |
+| Command buffer | via `CMD_BUF_BASE` | Need to read register first | System PA `0x01470000` (expected) |
 
 ---
 
