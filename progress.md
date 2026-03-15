@@ -2898,3 +2898,110 @@ The TLB10 offset formula (`bus + 0x28C00000 = IOMMU addr`) needs verification wi
 
 ---
 
+### Phase 20b: A53 ELF Deep Analysis — PTDMA Architecture Discovery
+
+**Status: ANALYSIS COMPLETE — Revises exploitation model**
+
+#### Key Discovery: PTDMA Engine, Not Direct IOMMU Commands
+
+The A53 MM controller does NOT directly read/write IOMMU page tables. Instead, it programs a **PTDMA (Page Table DMA) engine** which has its own system memory DMA access independent of the SYSHUB TLB. The 32-byte ring buffer entries written by `sub_501A000` are PTDMA commands, not AMD IOMMU commands.
+
+**Revised architecture:**
+```
+x86 kernel → ring buffer command → A53 MM controller (state machine)
+    → PTDMA engine (MMIO at PA 0x3060000+)
+        → DMA to system memory (page table modification)
+        → IOMMU IOTLB invalidation (cmd buffer at system PA 0x01470000)
+    → result back to x86 via output ring + MSI
+```
+
+#### MmController State Machine (sub_6401AF0)
+
+| State | Action |
+|-------|--------|
+| 1 | Queue PTDMA map/unmap command via `sub_501A000` |
+| 2 | Execute PTDMA via `sub_5022E48` (or `sub_6441080` with error handler) |
+| 3 | Process PTDMA results, IOTLB invalidation |
+| 4-5 | Completion, status polling |
+| 6 | Full reset: clear PTDMA channels, clear SDMA, reinit MmController |
+
+PTDMA command parameters (from state 1):
+```c
+sub_501A000(controller + 1048,        // PTDMA command ring
+            0x20,                     // device ID
+            pa | 0x1000000000000,     // source PA (flag bit 48 set)
+            (boot_params + 88) & 0xFFFFF,  // page table offset
+            pasid, 1, 1);            // PASID, queue, type
+```
+
+The AMD IOMMU command buffer (system PA `0x01470000`) is only used AFTER PTDMA completes, specifically for `INVALIDATE_IOTLB_PAGES` commands.
+
+#### PTDMA Engine MMIO Map
+
+| EL0 VA | Bus PA | Function |
+|--------|--------|----------|
+| `0x2060000` | `0x3060000` | PTDMA control/command |
+| `0x20C0000+` | `0x30C0000+` | Per-channel PTDMA registers |
+| `0x20C7000` | `0x30C7000` | PTDMA global status |
+| `0x2001000` | `0x3001000` | PTDMA/SDMA status |
+| `0x2290000` | `0x3290000` | SDMA registers |
+
+#### EL3 Page Table Analysis
+
+The L3 page table at VA `0x106000` has static entries in the ELF:
+- `0x743` descriptor: AttrIndx=0 → MAIR[0]=0x00 → Device-nGnRnE, AP=RW, SH=Inner, AF
+- `0x753` descriptor: AttrIndx=4 → MAIR[4]=0xFF → Normal WB, AP=RW, SH=Inner, AF
+- First 8KB mapped as Device memory, remainder as Normal WB
+
+**Critical finding**: EL3 `mmu_init_phase1` identity-maps the first GB with L2 block descriptors at runtime. Therefore **PA `0x2100000` (SMN base) IS mapped at EL3**. Memory attributes for the L2 blocks are runtime-generated and not in the static ELF, but SMN access is architecturally possible at EL3.
+
+#### Boot Config — SMN/SYSHUB Offsets
+
+| Field | Value | Meaning |
+|-------|-------|---------|
+| `m_offsetSmnIfSystemMmioIommu4K` | `0x00A` | IOMMU at SMN base + `0xA000` |
+| `m_offsetSmnIfSystemMmioSdma4B` | `0x041343` | SDMA at SMN + `0x01104D0C` |
+| `m_useSmnIfForSdma` | `0x1` | Use SMN interface for SDMA |
+| `m_offsetSyshubIfSystemMmioMsi4K` | `0x87F00` | MSI window via SYSHUB |
+| `m_offsetSyshubIf64K` | `0x1000` | Titania SYSHUB offset |
+| `m_offsetSyshubIfSystemMmio4K` | `0x30200` | System MMIO via SYSHUB |
+| `m_offsetSyshubIfDramPrivate4K` | `0x18000` | DRAM private region |
+| `m_offsetSyshubIfDramPrivateReadOnly4K` | `0x00000` | DRAM private RO |
+| `m_sysvaKernelStart4K` | `0x50000` | IOMMU VA `0x50000000` |
+| `m_sysvaKernelEnd4K` | `0x4FFFFF` | IOMMU VA ~4GB |
+| `m_sysvaRings` | `0x50C00000` | Ring buffers IOMMU VA |
+
+#### Device Table
+
+No string references to "DeviceTable", "DEV_TAB", or "DTE" in the ELF. The PS5's IOMMU likely uses one of:
+- PTDMA engine embeds device table reference internally
+- Single-device model (one page table root, no multi-device table)
+- Custom Sony implementation that bypasses standard AMD device table walks
+
+The device table address should still be readable from IOMMU MMIO register `DEV_TAB_BASE` at DECI5S PA `0x28200000`.
+
+#### Revised Exploitation Strategy
+
+The PTDMA discovery changes the attack surface. Three options remain viable:
+
+**Option A: Read IOMMU state via TLB10/TLB15 (unchanged, still first step)**
+- DECI5S PA `0x28200000+` reads IOMMU MMIO → get `DEV_TAB_BASE`, `CMD_BUF_BASE`, page table root
+- Tells us WHERE page tables live in system memory
+- Caveat: page table contents may be at system PAs the A53 can't reach via existing TLB entries
+
+**Option B: Use PTDMA through DECI5S (new possibility)**
+- PTDMA channel registers at bus PA `0x30C0000+`
+- If EL3 maps these PAs (likely — within first GB identity map), DECI5S can program PTDMA
+- Could submit PTDMA commands to create arbitrary page table entries
+- Risk: PTDMA state machine is complex, wrong commands could corrupt active page tables
+
+**Option C: Direct IOMMU command buffer manipulation (refined)**
+- IOMMU command buffer at system PA `0x01470000`
+- Need to determine which DECI5S path reaches this PA
+- Write custom IOMMU commands (INVALIDATE_IOTLB or potentially MAP commands)
+- Less risky than PTDMA but may have limited capability (IOTLB invalidation only, no mapping creation)
+
+**Recommended first step (all options)**: Read IOMMU MMIO registers via DECI5S to get device table and page table root addresses. This is pure read, zero risk, and informs all three options.
+
+---
+
