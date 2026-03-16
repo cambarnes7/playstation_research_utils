@@ -176,6 +176,9 @@ int prosperous_run(void)
     struct phys_rw_ctx ctx;
     int ret;
 
+    /* Disable stdout buffering so all diagnostics are visible */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     printf("========================================\n");
     printf(" prosperous_port - PS5 HV Bypass\n");
     printf(" FW 4.03 (CEX)\n");
