@@ -37,10 +37,6 @@ static uint32_t tmr_read32(struct phys_rw_ctx *ctx, uint32_t addr)
     uint64_t ind_data_kva = ctx->dmap_base + PCI_B0D18F2 + TMR_IND_DATA_OFF;
     uint32_t val;
 
-    kernel_copyout(ind_index_kva, &addr, sizeof(addr));  /* dummy: sets index */
-    /* Actually: write addr to index reg, then read data reg */
-    /* Using kekcall-based physical memory access: */
-
     /* Write index register */
     kernel_copyin(&addr, ind_index_kva, sizeof(addr));
 

@@ -172,7 +172,6 @@ int mp4_send_command(struct phys_rw_ctx *ctx, uint32_t cmd,
                      uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t ack)
 {
     uint64_t bar2_kva = ctx->dmap_base + MP4_BAR2_PA;
-    uint32_t zero = 0;
     uint32_t val;
     int timeout = MP4_CMD_TIMEOUT;
 

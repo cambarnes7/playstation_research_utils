@@ -64,21 +64,4 @@ int kpayload_inject(struct phys_rw_ctx *ctx);
 /* Main exploit orchestrator */
 int prosperous_run(void);
 
-/* Physical memory helpers */
-static inline uint32_t phys_read32(struct phys_rw_ctx *ctx, uint64_t pa)
-{
-    uint32_t val;
-    /* Read via kernel DMAP: dmap_base + PA = kernel VA for physical page */
-    volatile uint32_t *ptr = (volatile uint32_t *)(ctx->dmap_base + pa);
-    /* This is accessed via kekcall copyout in the actual implementation */
-    (void)ptr;
-    return val;
-}
-
-static inline void phys_write32(struct phys_rw_ctx *ctx, uint64_t pa, uint32_t val)
-{
-    volatile uint32_t *ptr = (volatile uint32_t *)(ctx->dmap_base + pa);
-    (void)ptr;
-}
-
 #endif
