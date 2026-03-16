@@ -212,87 +212,28 @@ int prosperous_run(void)
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
 
-    /* Phase 1.5: BAR2 indirect DRAM access search
+    /* Phase 1.5: Extended SysHub TLB table dump
      *
      * CONFIRMED:
      *   ACCESSIBLE: PA 0x605F0000-0x60FFFFFF (R/W works)
      *   BLOCKED:    PA 0x60000000-0x605EFFFF (nPT, rc=-1)
      *   GPU MMIO:   HV-trapped (all 0xFFFFFFFF despite correct config)
-     *   BAR2+0x200000 has functional registers (returned 0x00058184)
-     *   BAR2+0x000000/0x010000/0x100000 return 0xFFFFFFFF
-     *   Descriptor table at PA 0x607F0000 contains SysHub TLB entries
+     *   BAR2+0x200000 = 0x00058184 (functional register)
+     *   Descriptor table at PA 0x607F0000 has SysHub TLB entries
      *
-     * THIS ITERATION: Probe MP4 BAR2 for indirect memory access.
-     *   A. Read BAR2+0x200000 region at 0x100-byte stride (safe, read-only)
-     *      Looking for address/data register pairs for indirect DRAM access
-     *   B. Decode SysHub TLB descriptor table more carefully (512 bytes)
-     *   C. Try PCI B0:D18:F2 indirect register mechanism (SMN) to
-     *      access MP4 DRAM controller registers (NOT raw DRAM addrs)
-     *
-     * SAFETY NOTES:
-     *   - Part A: 512 reads at 0x100 stride from BAR2+0x200000 to +0x208000
-     *     AVOIDING BAR2+0x20042C area (caused panic at 4-byte stride)
-     *     Using 0x100 stride which worked before. Read-only.
-     *   - Part B: reads from PA 0x607F0000 (accessible DRAM, proven safe)
-     *   - Part C: SMN indirect reads targeting MP4 controller regs only
-     *     (NOT DRAM addresses 0x60xxxxxx which caused MCE before)
-     *     Targets: 0x15000 area (MP4 config), 0x16000 (PTDMA?)
+     * THIS ITERATION: Minimal safe diagnostics only.
+     *   A. Dump 512 bytes of SysHub TLB table at PA 0x607F0000
+     *   B. Verify accessible DRAM still works (single read)
+     *   All reads from proven-accessible DRAM. Zero MMIO reads.
      */
-    printf("\n[*] Phase 1.5: BAR2 indirect DRAM access search...\n");
+    printf("\n[*] Phase 1.5: SysHub TLB table analysis...\n");
     {
         uint64_t dmap = ctx.dmap_base;
-        uint64_t bar2 = dmap + MP4_BAR2_PA;
 
-        /* === Part A: BAR2+0x200000 register sweep ===
-         * Previous run: +0x200000 = 0x00058184. Scan at 0x100 stride
-         * from +0x200000 to +0x208000 (128 reads). Skip +0x200400-0x200500
-         * range that caused the earlier panic at 4-byte stride.
-         *
-         * SAFE: 128 reads. The 0x1000-stride scan covered this range
-         * without issues. 0x100 stride is 4x denser but still 64x
-         * coarser than the 4-byte stride that crashed. */
-        printf("[*] Part A: BAR2+0x200000 register sweep (0x100 stride)...\n");
-        {
-            for (int i = 0; i < 128; i++) {
-                uint32_t off = 0x200000 + i * 0x100;
-
-                /* Skip the danger zone around +0x20042C */
-                if (off >= 0x200400 && off < 0x200500)
-                    continue;
-
-                uint32_t val = 0xDEADDEAD;
-                int32_t rc = kernel_copyout(bar2 + off, &val, 4);
-                if (val != 0xFFFFFFFF && val != 0x00000000 && rc == 0) {
-                    printf("[BAR2] +0x%06x = 0x%08x\n", off, val);
-                }
-            }
-            printf("[BAR2] Sweep done (non-zero/non-FF values shown)\n");
-
-            /* Also read specific known-interesting offsets */
-            uint32_t interesting_offsets[] = {
-                0x200000, 0x200004, 0x200008, 0x20000C,
-                0x200010, 0x200014, 0x200018, 0x20001C,
-                0x200020, 0x200024, 0x200028, 0x20002C,
-                0x200030, 0x200034, 0x200038, 0x20003C,
-            };
-            printf("[BAR2] First 64 bytes at +0x200000:\n");
-            for (int i = 0; i < 16; i++) {
-                uint32_t val;
-                kernel_copyout(bar2 + interesting_offsets[i], &val, 4);
-                if (i % 4 == 0)
-                    printf("[BAR2] +%03x:", interesting_offsets[i] & 0xFFF);
-                printf(" %08x", val);
-                if (i % 4 == 3)
-                    printf("\n");
-            }
-        }
-
-        /* === Part B: Extended SysHub TLB descriptor table ===
-         * 512 bytes from PA 0x607F0000 to get the full picture.
-         * Entries appear to be (src_pa_lo, src_pa_hi, size_lo, size_hi,
-         * syshub_va_lo, syshub_va_hi) — 24 bytes each.
-         * SAFE: accessible DRAM, read-only. */
-        printf("\n[*] Part B: SysHub TLB table (PA 0x607F0000, 512 bytes)...\n");
+        /* === Part A: SysHub TLB descriptor table ===
+         * 512 bytes from PA 0x607F0000.
+         * SAFE: PD[0x103] range, proven accessible in all runs. */
+        printf("[*] Part A: SysHub TLB table (512 bytes)...\n");
         {
             uint32_t buf[128]; /* 512 bytes */
             for (int w = 0; w < 128; w++)
@@ -304,99 +245,13 @@ int prosperous_run(void)
             }
         }
 
-        /* === Part C: SMN probe of MP4 controller registers ===
-         * Use PCI B0:D18:F2 indirect mechanism (SMN) to read
-         * MP4 peripheral controller registers. We know:
-         *   - SMN addrs 0x60xxxxxx = raw DRAM (causes MCE, DO NOT USE)
-         *   - SMN addrs 0x15xxx/0x16xxx = MP4 controller space (should be safe)
-         *
-         * Looking for PTDMA engine registers or indirect DRAM access regs.
-         *
-         * The PCI indirect mechanism:
-         *   Write addr to B0:D18:F2 offset 0x64 (SMN addr register)
-         *   Read data from B0:D18:F2 offset 0x68 (SMN data register)
-         *
-         * SAFE: Only targeting controller registers, not DRAM.
-         * Previous TMR reads via this mechanism worked fine. */
-        printf("\n[*] Part C: SMN controller register probe...\n");
+        /* === Part B: Quick sanity check ===
+         * Single read from PA 0x60700000 to confirm DRAM access. */
+        printf("\n[*] Part B: DRAM sanity check...\n");
         {
-            uint64_t df_ecam = dmap + MMCFG_BASE +
-                (0ULL << 20) + (18ULL << 15) + (2ULL << 12);
-
-            /* MP4 related SMN register ranges to probe:
-             * 0x0001_5000 - MP4 config registers (speculation)
-             * 0x0001_6000 - MP4/PTDMA controller (speculation)
-             * 0x0003_E000 - SysHub TLB control registers
-             * 0x0003_F000 - SysHub TLB control registers
-             *
-             * These are controller regs, NOT DRAM addresses.
-             * SMN reads to non-existent regs return 0 or 0xFFFFFFFF safely.
-             */
-            uint32_t smn_ranges[] = {
-                0x00015000, 0x00015100, 0x00015200, 0x00015300,
-                0x00016000, 0x00016100, 0x00016200, 0x00016300,
-                0x0003E000, 0x0003E100, 0x0003E200, 0x0003E300,
-                0x0003F000, 0x0003F100, 0x0003F200, 0x0003F300,
-            };
-
-            for (int i = 0; i < 16; i++) {
-                uint32_t addr = smn_ranges[i];
-
-                /* Write SMN address */
-                kernel_copyin(&addr, df_ecam + 0x64, 4);
-
-                /* Read first 4 registers at this base */
-                uint32_t vals[4];
-                for (int r = 0; r < 4; r++) {
-                    uint32_t a = addr + r * 4;
-                    kernel_copyin(&a, df_ecam + 0x64, 4);
-                    kernel_copyout(df_ecam + 0x68, &vals[r], 4);
-                }
-                /* Only print if any value is non-zero and non-FF */
-                int has_data = 0;
-                for (int r = 0; r < 4; r++)
-                    if (vals[r] != 0 && vals[r] != 0xFFFFFFFF)
-                        has_data = 1;
-                if (has_data) {
-                    printf("[SMN] 0x%08x: %08x %08x %08x %08x\n",
-                           addr, vals[0], vals[1], vals[2], vals[3]);
-                }
-            }
-
-            /* Also probe the known MP4 BAR2 base in SMN space.
-             * BAR2 PA = 0xE0400000. In SMN, this maps to some
-             * internal address. Try reading MP4 device config space
-             * via SMN to find internal controller base addresses.
-             *
-             * AMD Aeolia/Belize: MP4 internal registers are typically
-             * at SMN 0x15C00000 area or 0x15800000 area.
-             * Probe conservatively at 0x1000 stride. */
-            printf("[SMN] Probing MP4 internal register space...\n");
-            uint32_t mp4_smn_bases[] = {
-                0x15800000, 0x15801000, 0x15802000, 0x15803000,
-                0x15C00000, 0x15C01000, 0x15C02000, 0x15C03000,
-                0x15C10000, 0x15C11000, 0x15C12000, 0x15C13000,
-                0x15C20000, 0x15C21000, 0x15C22000, 0x15C23000,
-            };
-            for (int i = 0; i < 16; i++) {
-                uint32_t addr = mp4_smn_bases[i];
-                kernel_copyin(&addr, df_ecam + 0x64, 4);
-                uint32_t val;
-                kernel_copyout(df_ecam + 0x68, &val, 4);
-                if (val != 0 && val != 0xFFFFFFFF) {
-                    printf("[SMN] 0x%08x = 0x%08x\n", addr, val);
-                    /* Read next 15 regs if we found something */
-                    for (int r = 1; r < 16; r++) {
-                        uint32_t a = addr + r * 4;
-                        kernel_copyin(&a, df_ecam + 0x64, 4);
-                        kernel_copyout(df_ecam + 0x68, &val, 4);
-                        if (val != 0 && val != 0xFFFFFFFF) {
-                            printf("[SMN] 0x%08x = 0x%08x\n", a, val);
-                        }
-                    }
-                }
-            }
-            printf("[SMN] Probe done\n");
+            uint32_t val = 0xDEADDEAD;
+            int32_t rc = kernel_copyout(dmap + 0x60700000ULL, &val, 4);
+            printf("[DRAM] PA 0x60700000 = 0x%08x (rc=%d)\n", val, rc);
         }
     }
 
