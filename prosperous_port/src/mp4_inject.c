@@ -128,15 +128,16 @@ int mp4_inject_payload(struct phys_rw_ctx *ctx)
     int32_t bl_offset;
     uint32_t diag;
 
-    /* Diagnostic: Read DRAM[0x0] to determine address mapping.
-     * If ELF magic (0x7F454C46) → x86 PA 0x60000000 = ELF start (VA 0x100000)
-     * If not → x86 PA 0x60000000 = start of A53 memory (VA 0x000000) */
-    kernel_copyout(dram_base_kva, &diag, sizeof(diag));
-    printf("[DIAG] DRAM[0x0] = 0x%08x %s\n", diag,
+    /* Diagnostic: Read DRAM[0x0] to determine address mapping. */
+    int32_t rc;
+    diag = 0xDEAD0001;
+    rc = kernel_copyout(dram_base_kva, &diag, sizeof(diag));
+    printf("[DIAG] DRAM[0x0] = 0x%08x (rc=%d) %s\n", diag, rc,
            diag == 0x464C457F ? "(ELF magic!)" : "");
 
-    kernel_copyout(dram_base_kva + 0x100000, &diag, sizeof(diag));
-    printf("[DIAG] DRAM[0x100000] = 0x%08x %s\n", diag,
+    diag = 0xDEAD0002;
+    rc = kernel_copyout(dram_base_kva + 0x100000, &diag, sizeof(diag));
+    printf("[DIAG] DRAM[0x100000] = 0x%08x (rc=%d) %s\n", diag, rc,
            diag == 0x464C457F ? "(ELF magic!)" : "");
 
     /* Read original BL at both candidate offsets */
