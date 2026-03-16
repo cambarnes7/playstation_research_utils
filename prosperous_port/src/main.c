@@ -212,145 +212,193 @@ int prosperous_run(void)
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
 
-    /* Phase 1.5: Find DRAM access path via BAR2 MMIO scan
+    /* Phase 1.5: Explore DRAM access mechanisms
      *
-     * CRITICAL: We CANNOT create page table entries for PA 0x60000000.
-     * The HV's nested page tables don't map this guest-PA. Creating a
-     * PDE causes instant kernel panic.
+     * RESULTS SO FAR:
+     *   - nPT blocks PA 0x60000000-0x605FFFFF (instant kernel panic)
+     *   - SMN reads to DRAM addresses cause machine check (instant panic)
+     *   - BAR2 has NO DRAM window (full 16MB scan found only registers)
+     *   - PA 0x60600000-0x607FFFFF accessible via existing DMAP (PD[0x103])
      *
-     * ACCESSIBLE via existing DMAP:  PA 0x60600000-0x607FFFFF (PD[0x103])
-     * BLOCKED by nested page tables: PA 0x60000000-0x605FFFFF (PD[0x100-0x102])
+     * REMAINING APPROACHES:
+     *   A. BAR2+0x200000 "register bus" has PCI device IDs (0x13F01022)
+     *      and 0xDEADBEEF sentinel — might be indirect access mechanism
+     *   B. GPU SDMA can DMA between arbitrary PAs, bypassing nPT
+     *      GPU is likely on PCI bus 1+ behind bridge B0:D1:F0
+     *   C. The nested page tables themselves may be at accessible PAs
      *
-     * Strategy: Scan BAR2 MMIO space densely for a DRAM access window.
-     * AMD multimedia IPs typically provide SRAM/DRAM windows through
-     * register pairs in the BAR. The PS5 bootloader uses BAR2 to load
-     * the A53 firmware, so DRAM write access must exist somewhere.
-     *
-     * We look for:
-     *   1. ELF magic (0x464C457F) at DRAM offset 0x100000 relative to
-     *      candidate BAR2 window bases
-     *   2. Known DRAM content (0xe90c2dd7 from PA 0x60600000) at any offset
-     *   3. Non-0xFFFFFFFF regions that might be indirect access registers
-     *
-     * BAR2 reads are safe (proven: c2p regs, previous probes worked fine).
-     * NO writes to unknown BAR2 registers (avoid corrupting A53 state).
+     * SAFETY: No c2p register reads (0xF6000-0xFB000) — previous run
+     * showed repeated reads corrupt A53 command state → panic.
      */
-    printf("\n[*] Phase 1.5: Dense BAR2 scan for DRAM window...\n");
+    printf("\n[*] Phase 1.5: Exploring DRAM access mechanisms...\n");
     {
         uint64_t dmap = ctx.dmap_base;
         uint64_t bar2_kva = dmap + MP4_BAR2_PA;
         uint32_t probe;
-        int32_t rc;
 
-        /* First, get reference values from accessible DMAP DRAM reads
-         * so we can match them against BAR2 scan results. */
-        uint32_t dram_ref_600000 = 0, dram_ref_700000 = 0;
-        kernel_copyout(dmap + 0x60600000ULL, &dram_ref_600000, 4);
-        kernel_copyout(dmap + 0x60700000ULL, &dram_ref_700000, 4);
-        printf("[REF] DMAP PA 0x60600000 = 0x%08x\n", dram_ref_600000);
-        printf("[REF] DMAP PA 0x60700000 = 0x%08x\n", dram_ref_700000);
-
-        /* Phase A: Coarse scan — every 0x10000 (64KB), 0 to 0x1000000 (16MB)
-         * This is 256 reads. Report only non-0xFFFFFFFF values and
-         * flag any ELF magic or DRAM content matches. */
-        printf("\n[*] Phase A: Coarse BAR2 scan (64KB stride, 16MB range)...\n");
-        uint32_t interesting_regions[32];
-        int n_interesting = 0;
-
-        for (uint32_t off = 0; off < 0x1000000; off += 0x10000) {
-            probe = 0xFFFFFFFF;
-            rc = kernel_copyout(bar2_kva + off, &probe, 4);
-            if (probe == 0xFFFFFFFF && rc == 0)
-                continue;
-
-            int is_elf = (probe == 0x464C457F);
-            int is_dram = (probe == dram_ref_600000 || probe == dram_ref_700000);
-
-            printf("[BAR2] +0x%07x = 0x%08x (rc=%d)%s%s\n",
-                   off, probe, rc,
-                   is_elf ? " <<< ELF MAGIC >>>" : "",
-                   is_dram ? " <<< DRAM MATCH >>>" : "");
-
-            if (n_interesting < 32)
-                interesting_regions[n_interesting++] = off;
+        /* === Part A: Dense scan of BAR2+0x200000 register bus ===
+         * Previous scan found: 0x21C000=0x13F01022 (PCI ID),
+         * 0x21D000=0x13F41022 (PCI ID), 0x21E000=0xDEADBEEF.
+         * These look like results of indirect PCI/register reads.
+         * Scan every 4 bytes from 0x200000-0x220000 to find
+         * the address/control registers for this mechanism. */
+        printf("[*] Part A: Dense BAR2+0x200000 register bus scan...\n");
+        for (uint32_t off = 0x200000; off < 0x220000; off += 4) {
+            probe = 0;
+            kernel_copyout(bar2_kva + off, &probe, 4);
+            /* Print non-zero, non-FFFF values (with 0x100 stride for
+             * density control, but always print interesting values) */
+            if (probe != 0 && probe != 0xFFFFFFFF) {
+                printf("[RB] +0x%06x = 0x%08x\n", off, probe);
+            }
         }
 
-        /* Phase B: For each interesting region, scan at 4KB granularity
-         * in a ±128KB window around it. Look for ELF magic especially
-         * at +0x100000 from the region start (where A53 ELF would be). */
-        printf("\n[*] Phase B: Fine scan around %d interesting regions...\n",
-               n_interesting);
-        for (int i = 0; i < n_interesting; i++) {
-            uint32_t base = interesting_regions[i];
-            uint32_t scan_start = (base >= 0x20000) ? base - 0x20000 : 0;
-            uint32_t scan_end = base + 0x20000;
-            if (scan_end > 0x1000000) scan_end = 0x1000000;
+        /* === Part B: Scan PCI buses 1-4 for GPU ===
+         * The integrated GPU has SDMA engines for DMA between arbitrary
+         * physical addresses. Find it by scanning beyond bus 0.
+         * AMD GPU device IDs: 0x73xx1002 (RDNA2), 0x163x1002, etc.
+         * ECAM: bus<<20 | dev<<15 | func<<12 | reg */
+        printf("\n[*] Part B: Scanning PCI buses 1-4 for GPU...\n");
+        for (uint32_t bus = 1; bus <= 4; bus++) {
+            for (uint32_t dev = 0; dev < 32; dev++) {
+                for (uint32_t func = 0; func < 8; func++) {
+                    uint64_t ecam = dmap + MMCFG_BASE +
+                        ((uint64_t)bus << 20) + ((uint64_t)dev << 15) +
+                        ((uint64_t)func << 12);
+                    uint32_t dev_id;
+                    kernel_copyout(ecam, &dev_id, 4);
+                    if (dev_id == 0xFFFFFFFF || dev_id == 0)
+                        continue;
 
-            for (uint32_t off = scan_start; off < scan_end; off += 0x1000) {
-                probe = 0xFFFFFFFF;
-                kernel_copyout(bar2_kva + off, &probe, 4);
-                if (probe != 0xFFFFFFFF) {
-                    printf("[BAR2] +0x%07x = 0x%08x%s%s\n",
-                           off, probe,
-                           probe == 0x464C457F ? " <<< ELF >>>" : "",
-                           (probe == dram_ref_600000 || probe == dram_ref_700000)
-                               ? " <<< DRAM >>>" : "");
-                }
-            }
+                    /* Read class code (offset 0x08, bits 31:8) */
+                    uint32_t class_reg;
+                    kernel_copyout(ecam + 0x08, &class_reg, 4);
+                    uint32_t class_code = class_reg >> 8;
 
-            /* Also try: if this region is a DRAM window base, check
-             * where the ELF would be at base + 0x100000. */
-            if (base + 0x100000 < 0x1000000) {
-                probe = 0;
-                kernel_copyout(bar2_kva + base + 0x100000, &probe, 4);
-                if (probe != 0xFFFFFFFF) {
-                    printf("[BAR2] +0x%07x = 0x%08x (ELF probe for window base 0x%x)%s\n",
-                           base + 0x100000, probe, base,
-                           probe == 0x464C457F ? " <<< ELF MAGIC! >>>" : "");
+                    printf("[PCI] B%u:D%u:F%u ID=0x%08x class=0x%06x",
+                           bus, dev, func, dev_id, class_code);
+
+                    /* Read BAR0-BAR5 */
+                    for (int bar = 0; bar < 6; bar++) {
+                        uint32_t bar_val;
+                        kernel_copyout(ecam + 0x10 + bar * 4, &bar_val, 4);
+                        if (bar_val != 0 && bar_val != 0xFFFFFFFF)
+                            printf(" BAR%d=0x%08x", bar, bar_val);
+                    }
+                    printf("\n");
                 }
             }
         }
 
-        /* Phase C: Targeted probes at known AMD SRAM/DRAM window register
-         * offsets. On AMD multimedia IPs, indirect access registers are
-         * typically at offsets like 0x10580/0x10584, 0x10500/0x10504,
-         * 0x10588/0x1058C, 0x30000+, etc.
+        /* Also scan bus 0 functions 1-7 for multi-function devices */
+        printf("[*] Scanning bus 0 multi-function devices...\n");
+        for (uint32_t dev = 0; dev < 32; dev++) {
+            for (uint32_t func = 1; func < 8; func++) {
+                uint64_t ecam = dmap + MMCFG_BASE +
+                    ((uint64_t)dev << 15) + ((uint64_t)func << 12);
+                uint32_t dev_id;
+                kernel_copyout(ecam, &dev_id, 4);
+                if (dev_id == 0xFFFFFFFF || dev_id == 0)
+                    continue;
+                uint32_t class_reg;
+                kernel_copyout(ecam + 0x08, &class_reg, 4);
+                printf("[PCI] B0:D%u:F%u ID=0x%08x class=0x%06x\n",
+                       dev, func, dev_id, class_reg >> 8);
+            }
+        }
+
+        /* === Part C: Walk the nested page table ===
+         * The nCR3 is in the VMCB, which we can't access directly.
+         * But we CAN find the nPT by looking at what the HV stores.
          *
-         * We read these to see if they look like address/data register
-         * pairs (one might contain an address-like value). */
-        printf("\n[*] Phase C: Probe known AMD indirect register offsets...\n");
-        uint32_t ind_offsets[] = {
-            0x10500, 0x10504, 0x10508, 0x1050C,
-            0x10510, 0x10514, 0x10518, 0x1051C,
-            0x10520, 0x10524, 0x10528, 0x1052C,
-            0x10580, 0x10584, 0x10588, 0x1058C,
-            0x10590, 0x10594, 0x10598, 0x1059C,
-            0x105A0, 0x105A4, 0x105A8, 0x105AC,
-            0x30000, 0x30004, 0x30008, 0x3000C,
-            0x30010, 0x30014, 0x30018, 0x3001C,
-        };
-        for (uint32_t i = 0; i < sizeof(ind_offsets)/sizeof(ind_offsets[0]); i++) {
-            probe = 0;
-            kernel_copyout(bar2_kva + ind_offsets[i], &probe, 4);
-            if (probe != 0xFFFFFFFF && probe != 0)
-                printf("[BAR2] +0x%06x = 0x%08x\n", ind_offsets[i], probe);
+         * Alternative: walk the GUEST PML4 to find PD[0x100] entry.
+         * If PD[0x100] exists but maps to a guest-PA that the nPT
+         * blocks, we need to find the nPT entry for that PA.
+         *
+         * First, let's read the full PD for the DMAP + 0x60000000 region
+         * to understand ALL the page directory entries (0x100-0x103+). */
+        printf("\n[*] Part C: Walking guest page tables for DMAP+0x60000000...\n");
+        {
+            uint64_t target_va = dmap + MP4_DRAM_BASE;
+            uint32_t pml4_idx = (target_va >> 39) & 0x1FF;
+            uint32_t pdpt_idx = (target_va >> 30) & 0x1FF;
+            uint32_t pd_idx   = (target_va >> 21) & 0x1FF;
+            uint64_t cr3 = ctx.proc_cr3;
+            uint64_t pml4e, pdpte, pd_pa;
+
+            kernel_copyout(dmap + cr3 + pml4_idx * 8, &pml4e, 8);
+            printf("[PT] PML4[0x%x] = 0x%016lx\n", pml4_idx, pml4e);
+
+            if (pml4e & 1) {
+                uint64_t pdpt_pa = pml4e & 0xFFFFFFFFFF000ULL;
+                kernel_copyout(dmap + pdpt_pa + pdpt_idx * 8, &pdpte, 8);
+                printf("[PT] PDPT[0x%x] = 0x%016lx\n", pdpt_idx, pdpte);
+
+                if ((pdpte & 1) && !(pdpte & (1 << 7))) {
+                    pd_pa = pdpte & 0xFFFFFFFFFF000ULL;
+                    printf("[PT] PD base PA = 0x%lx\n", pd_pa);
+
+                    /* Dump PD entries 0x100-0x107 (covers PA 0x60000000-0x60FFFFFF) */
+                    for (int i = 0; i < 8; i++) {
+                        uint64_t pde;
+                        kernel_copyout(dmap + pd_pa + (pd_idx + i) * 8, &pde, 8);
+                        if (pde & 1) {
+                            int is_2m = (pde >> 7) & 1;
+                            uint64_t pa = pde & 0xFFFFFFFFFF000ULL;
+                            if (is_2m) pa &= ~0x1FFFFFULL;
+                            printf("[PT] PD[0x%x] = 0x%016lx (%s PA=0x%lx)\n",
+                                   pd_idx + i, pde,
+                                   is_2m ? "2MB" : "4KB-PT", pa);
+                        } else {
+                            printf("[PT] PD[0x%x] = not present\n", pd_idx + i);
+                        }
+                    }
+                }
+            }
         }
 
-        /* Phase D: Read c2p registers to verify BAR2 access works,
-         * then try reading adjacent registers that might be for
-         * SRAM/DRAM window control. */
-        printf("\n[*] Phase D: Scan around c2p registers (BAR2+0xF6000)...\n");
-        for (uint32_t off = 0xF5000; off < 0xFC000; off += 0x1000) {
-            probe = 0;
-            kernel_copyout(bar2_kva + off, &probe, 4);
-            printf("[BAR2] +0x%06x = 0x%08x\n", off, probe);
-        }
-        /* Also check if there are registers between c2p slots */
-        for (uint32_t off = 0xF6000; off < 0xF6100; off += 4) {
-            probe = 0;
-            kernel_copyout(bar2_kva + off, &probe, 4);
-            if (probe != 0)
-                printf("[BAR2] +0x%06x = 0x%08x (near c2p[0][0])\n", off, probe);
+        /* === Part D: Probe the IOMMU for configuration ===
+         * AMD IOMMU at B0:D1:F0 (0x13E21022). Read its capability
+         * registers and find the IOMMU MMIO base address.
+         * IOMMU CAP is at PCI config offset 0x40+. The MMIO base
+         * is in the IOMMU Base Address Low/High registers. */
+        printf("\n[*] Part D: IOMMU configuration probe...\n");
+        {
+            uint64_t iommu_ecam = dmap + pci_cfg_addr(0, 1, 0, 0);
+            uint32_t dev_id;
+            kernel_copyout(iommu_ecam, &dev_id, 4);
+            printf("[IOMMU] B0:D1:F0 ID=0x%08x\n", dev_id);
+
+            /* Read capability pointer (offset 0x34) */
+            uint32_t cap_ptr;
+            kernel_copyout(iommu_ecam + 0x34, &cap_ptr, 4);
+            cap_ptr &= 0xFF;
+            printf("[IOMMU] Capability pointer: 0x%02x\n", cap_ptr);
+
+            /* Walk capability list to find IOMMU capability (ID=0x0F) */
+            for (int tries = 0; tries < 16 && cap_ptr >= 0x40; tries++) {
+                uint32_t cap_hdr;
+                kernel_copyout(iommu_ecam + cap_ptr, &cap_hdr, 4);
+                uint8_t cap_id = cap_hdr & 0xFF;
+                printf("[IOMMU] Cap @ 0x%02x: ID=0x%02x\n", cap_ptr, cap_id);
+
+                if (cap_id == 0x0F) {
+                    /* IOMMU capability found. Base address at cap+4 and cap+8 */
+                    uint32_t base_lo, base_hi;
+                    kernel_copyout(iommu_ecam + cap_ptr + 4, &base_lo, 4);
+                    kernel_copyout(iommu_ecam + cap_ptr + 8, &base_hi, 4);
+                    uint64_t iommu_base = ((uint64_t)base_hi << 32) |
+                                          (base_lo & 0xFFFFC000ULL);
+                    printf("[IOMMU] MMIO base PA = 0x%lx\n", iommu_base);
+
+                    /* Read DeviceTable base from IOMMU MMIO offset 0x00 */
+                    uint64_t dt_lo;
+                    kernel_copyout(dmap + iommu_base + 0x00, &dt_lo, 8);
+                    printf("[IOMMU] DeviceTable base reg = 0x%016lx\n", dt_lo);
+                    break;
+                }
+                cap_ptr = (cap_hdr >> 8) & 0xFF;
+            }
         }
     }
 
