@@ -114,6 +114,13 @@ int tmr_bypass_init(struct phys_rw_ctx *ctx)
     return 0;
 }
 
+/* Restore TMR 20 only (after MP4 injection, before HV bypass) */
+void tmr_restore_tmr20(struct phys_rw_ctx *ctx)
+{
+    if (saved_tmr20_cfg != 0)
+        tmr_write32(ctx, 20 * 0x10 + 8, saved_tmr20_cfg);
+}
+
 /*
  * Phase 2: Disable TMR protections on the HV memory region.
  *

@@ -66,7 +66,7 @@
 #define MP4_MEM_PHYS        (1 << 2)
 
 /* MP4 command send timeout (iterations) */
-#define MP4_CMD_TIMEOUT     200
+#define MP4_CMD_TIMEOUT     10000
 
 /* SysHub TLB configuration */
 #define SYSHUB_TLB_REG_BASE         0x03230000

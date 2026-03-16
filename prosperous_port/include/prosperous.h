@@ -34,13 +34,14 @@
 /* Physical memory R/W context */
 struct phys_rw_ctx {
     uint64_t dmap_base;     /* kernel DMAP base VA */
-    uint64_t ktext_base;    /* kernel .text base VA */
+    uint64_t ktext_base;    /* kernel .text base (DMAP VA) */
     uint64_t ktext_base_pa; /* kernel .text base PA */
     uint64_t kpml4_pa;      /* kernel PML4 physical address */
 };
 
 /* TMR operations */
 int tmr_bypass_init(struct phys_rw_ctx *ctx);
+void tmr_restore_tmr20(struct phys_rw_ctx *ctx);
 int tmr_disable_hv_regions(struct phys_rw_ctx *ctx);
 void tmr_restore_hv_regions(struct phys_rw_ctx *ctx);
 

