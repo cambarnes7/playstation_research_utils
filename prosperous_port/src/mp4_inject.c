@@ -21,6 +21,7 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <ps5/kernel.h>
 #include "prosperous.h"
@@ -125,6 +126,38 @@ int mp4_inject_payload(struct phys_rw_ctx *ctx)
     uint32_t branch_insn;
     uint32_t qaf_flag;
     int32_t bl_offset;
+    uint32_t diag;
+
+    /* Diagnostic: Read DRAM[0x0] to determine address mapping.
+     * If ELF magic (0x7F454C46) → x86 PA 0x60000000 = ELF start (VA 0x100000)
+     * If not → x86 PA 0x60000000 = start of A53 memory (VA 0x000000) */
+    kernel_copyout(dram_base_kva, &diag, sizeof(diag));
+    printf("[DIAG] DRAM[0x0] = 0x%08x %s\n", diag,
+           diag == 0x464C457F ? "(ELF magic!)" : "");
+
+    kernel_copyout(dram_base_kva + 0x100000, &diag, sizeof(diag));
+    printf("[DIAG] DRAM[0x100000] = 0x%08x %s\n", diag,
+           diag == 0x464C457F ? "(ELF magic!)" : "");
+
+    /* Read original BL at both candidate offsets */
+    kernel_copyout(dram_base_kva + (A53_HOOK_ADDR - A53_ELF_BASE), &diag,
+                   sizeof(diag));
+    printf("[DIAG] DRAM[0x%x] (hook_VA-ELF_BASE) = 0x%08x\n",
+           (uint32_t)(A53_HOOK_ADDR - A53_ELF_BASE), diag);
+
+    kernel_copyout(dram_base_kva + A53_HOOK_ADDR, &diag, sizeof(diag));
+    printf("[DIAG] DRAM[0x%x] (hook_VA direct) = 0x%08x\n",
+           (uint32_t)A53_HOOK_ADDR, diag);
+
+    /* Read QAF at both candidate offsets */
+    kernel_copyout(dram_base_kva + A53_QAF_FLAGS_OFF, &diag, sizeof(diag));
+    printf("[DIAG] DRAM[0x%x] (QAF direct) = 0x%08x\n",
+           (uint32_t)A53_QAF_FLAGS_OFF, diag);
+
+    kernel_copyout(dram_base_kva + (A53_QAF_FLAGS_OFF - A53_ELF_BASE), &diag,
+                   sizeof(diag));
+    printf("[DIAG] DRAM[0x%x] (QAF-ELF_BASE) = 0x%08x\n",
+           (uint32_t)(A53_QAF_FLAGS_OFF - A53_ELF_BASE), diag);
 
     /* Step 1: Write thunk at 0x600E0000 */
     kernel_copyin(mp4_thunk_bin, dram_base_kva + MP4_THUNK_OFFSET,
@@ -145,6 +178,9 @@ int mp4_inject_payload(struct phys_rw_ctx *ctx)
     bl_offset = ((int32_t)(A53_ELF_BASE + MP4_THUNK_OFFSET) -
                  (int32_t)A53_HOOK_ADDR) / 4;
     branch_insn = 0x94000000 | (bl_offset & 0x03FFFFFF);
+    printf("[*] BL insn: 0x%08x (offset %d words, thunk VA 0x%x -> hook VA 0x%x)\n",
+           branch_insn, bl_offset,
+           A53_ELF_BASE + MP4_THUNK_OFFSET, A53_HOOK_ADDR);
 
     /* Write the patched BL instruction in DRAM.
      * DRAM offset = hook_VA - ELF_base = 0x108BD4 - 0x100000 = 0x8BD4 */
@@ -156,6 +192,16 @@ int mp4_inject_payload(struct phys_rw_ctx *ctx)
     qaf_flag = 1;
     kernel_copyin(&qaf_flag, dram_base_kva + A53_QAF_FLAGS_OFF,
                   sizeof(qaf_flag));
+
+    /* Verify writes landed */
+    kernel_copyout(dram_base_kva + (A53_HOOK_ADDR - A53_ELF_BASE), &diag,
+                   sizeof(diag));
+    printf("[DIAG] After write: DRAM[0x%x] = 0x%08x (expect 0x%08x)\n",
+           (uint32_t)(A53_HOOK_ADDR - A53_ELF_BASE), diag, branch_insn);
+
+    kernel_copyout(dram_base_kva + A53_QAF_FLAGS_OFF, &diag, sizeof(diag));
+    printf("[DIAG] After write: DRAM[0x%x] = 0x%08x (expect 0x00000001)\n",
+           (uint32_t)A53_QAF_FLAGS_OFF, diag);
 
     return 0;
 }
