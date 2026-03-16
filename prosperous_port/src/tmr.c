@@ -19,6 +19,7 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <ps5/kernel.h>
 #include "prosperous.h"
@@ -96,16 +97,53 @@ static void tmr_add_for_all(struct phys_rw_ctx *ctx, int index,
  */
 int tmr_bypass_init(struct phys_rw_ctx *ctx)
 {
-    struct tmr_entry tmr16;
+    struct tmr_entry tmr16, tmr20;
+    uint32_t verify_cfg;
+
+    /* Diagnostic: Verify MMCFG access by reading PCI B0:D0:F0 vendor ID */
+    {
+        uint32_t pci_id;
+        uint64_t pci_root_kva = ctx->dmap_base + PCI_B0D0F0;
+        kernel_copyout(pci_root_kva, &pci_id, sizeof(pci_id));
+        printf("[DIAG] PCI B0:D0:F0 ID: 0x%08x (expect AMD 0x1022xxxx)\n", pci_id);
+
+        /* Also read B0:D18:F2 device ID */
+        uint32_t d18f2_id;
+        uint64_t d18f2_kva = ctx->dmap_base + PCI_B0D18F2;
+        kernel_copyout(d18f2_kva, &d18f2_id, sizeof(d18f2_id));
+        printf("[DIAG] PCI B0:D18:F2 ID: 0x%08x\n", d18f2_id);
+    }
+
+    /* Diagnostic: Read full TMR 20 entry before disabling */
+    tmr_read_entry(ctx, 20, &tmr20);
+    printf("[DIAG] TMR 20 before: base=0x%08x limit=0x%08x cfg=0x%08x req=0x%08x\n",
+           tmr20.base, tmr20.limit, tmr20.cfg, tmr20.requestors);
+    printf("[DIAG] TMR 20 PA range: 0x%llx - 0x%llx\n",
+           (unsigned long long)tmr20.base << 16,
+           (unsigned long long)tmr20.limit << 16);
 
     /* Save TMR 20 config for later restoration */
-    saved_tmr20_cfg = tmr_read32(ctx, 20 * 0x10 + 8);
+    saved_tmr20_cfg = tmr20.cfg;
 
     /* Disable TMR 20 so x86 can access MP4 DRAM (0x60000000-0x605f0000) */
     tmr_write32(ctx, 20 * 0x10 + 8, TMR_CFG_DISABLED);
 
+    /* Read back to verify the write took effect */
+    verify_cfg = tmr_read32(ctx, 20 * 0x10 + 8);
+    printf("[DIAG] TMR 20 cfg after disable: 0x%08x (expect 0x00000000)\n",
+           verify_cfg);
+    if (verify_cfg != 0) {
+        printf("[!] WARNING: TMR 20 disable did NOT take effect!\n");
+        printf("[!] PCI MMCFG writes may not be reaching hardware.\n");
+        printf("[!] MMCFG_BASE=0x%llx, TMR ind reg PA=0x%llx\n",
+               (unsigned long long)MMCFG_BASE,
+               (unsigned long long)(PCI_B0D18F2 + TMR_IND_INDEX_OFF));
+    }
+
     /* Read TMR 16 (kernel text / HV text+data protection) */
     tmr_read_entry(ctx, 16, &tmr16);
+    printf("[DIAG] TMR 16: base=0x%08x limit=0x%08x cfg=0x%08x\n",
+           tmr16.base, tmr16.limit, tmr16.cfg);
 
     /* Create TMR 21 covering the same region but allowing all access */
     tmr_add_for_all(ctx, 21, tmr16.base, tmr16.limit);
