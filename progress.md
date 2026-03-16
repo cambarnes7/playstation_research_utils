@@ -3005,3 +3005,127 @@ The PTDMA discovery changes the attack surface. Three options remain viable:
 
 ---
 
+### Phase 20c: Mode 8 Live Results + fail0verflow/prosperous Analysis
+
+**Status: ANALYSIS COMPLETE — Exploitation path now clear**
+
+#### Mode 8 Live Probe Results (PS5 FW 4.03)
+
+**PTDMA engine — ALL ACCESSIBLE:**
+
+| DECI5S PA | Value | Description |
+|-----------|-------|-------------|
+| `0x3001000` | `0x0008284000000029` | PTDMA/SDMA status — engine active |
+| `0x3060000` | `0x0000800000008000` | PTDMA control — configured |
+| `0x30C0000` | `0x00000000C0000000` | PTDMA chan[0] → system PA `0xC0000000` |
+| `0x30C1000` | `0x0000000080000000` | PTDMA chan[1] → system PA `0x80000000` |
+| `0x3290000` | `0x0000003f00008080` | SDMA registers — configured |
+
+**SMN interface — ACCESSIBLE but NOT routing to IOMMU:**
+
+| DECI5S PA | Value | Note |
+|-----------|-------|------|
+| `0x2100000` | `0x0000000e0000000e` | SMNIF controller register (not SMN target) |
+| `0x210A000` | `0x0000000e0000000e` | **SAME value** — confirms flat reads hit SMNIF controller, not SMN-translated IOMMU |
+| `0x210A008` | `0x0187000100000002` | SMNIF controller register at +0xA008 |
+| `0x210A018` | `0x0000e00e00000000` | SMNIF controller register at +0xA018 |
+
+**Key conclusion**: Reading PA `0x210A000` does NOT access IOMMU at SMN address `0xA000`. It reads the SMNIF controller's own MMIO register at offset `0xA000`. AMD SMN requires index/data register protocol.
+
+**IOMMU command buffer — NOT READABLE:**
+- PA `0x01470000` → FAIL (ret=0, not timeout — PA is reachable but returned no data)
+
+**Stall addresses (avoid):**
+- `0x1C000000` (DRAM IO window) → TIMEOUT, killed A53, caused kernel panic
+
+**EL0 VA→PA addresses (0x02000000, 0x02060000, 0x020C0000):**
+- All FAIL — these are EL0 virtual addresses, not real physical addresses
+
+#### fail0verflow/prosperous — Complete Architecture Revealed
+
+Repository: https://github.com/fail0verflow/prosperous (published March 15, 2026)
+
+This is fail0verflow's PS5 exploit chain. Four files reveal the complete hardware exploitation path:
+
+**1. SMN access uses PCIe config space index/data (iommu.lua):**
+```
+PCIe config: Bus 0, Dev 0, Func 0 (0xF0000000)
+SMN index register: PCI offset 0xa0
+SMN data register:  PCI offset 0xa4
+Write target SMN address to 0xa0, read/write data at 0xa4
+```
+This is from x86 kernel code, NOT from the A53.
+
+**2. IOMMU SMN address is `0x2400000` (iommu.lua):**
+The boot config `m_offsetSmnIfSystemMmioIommu4K = 0xA` is NOT the SMN address. The actual IOMMU base in SMN space is `0x2400000`. The entire IOMMU bypass is three SMN writes:
+```
+SMN write64(0x2400020, 0)              // EXCL_BASE = 0
+SMN write64(0x2400028, 0xFFFFFFFFFFFF) // EXCL_LIMIT = max
+SMN write64(0x2400020, 3)              // Enable + Allow
+```
+This sets the IOMMU exclusion zone to the entire 64-bit address space, effectively disabling all IOMMU translation.
+
+**3. SysHub TLB registers at PA `0x03230000` (mp4_payload.c):**
+The A53 payload can create new SysHub TLB entries to map arbitrary system PAs:
+```
+Entry format (16 bytes, at base + index*16):
+  tlb0 = target_system_PA >> 26    // 64MB-aligned target
+  tlb1 = segment_size << 1         // segment_size=9 → 2^9 sub-pages
+  tlb2 = 4                         // bypass mode flags
+  tlb3 = 4                         // bypass mode flags
+
+Sub-page RW permissions (at base + 0x3e0 + index*4):
+  0xFFFFFFFF = full RW
+
+Attributes (at base + 0x4d8 + index*4):
+  0xc0800003 = normal access attributes
+```
+
+Indices 1-61 are valid (stored as index-1 in register arrays).
+
+**4. Exploit chain order (pwn_mp4.lua):**
+1. Disable TMR20 (MP4 carveout `0x60000000-0x605F0000`) so x86 can write to it
+2. Inject thunk + payload binary into MP4 memory
+3. Patch `mDbg_intr` branch to call thunk → payload
+4. Enable QAF flag in `mm4p_flags` to trigger debug interrupt path
+5. Re-enable TMR20
+6. Use payload's SysHub TLB setup command to map VMCB system PAs
+7. Read VMCBs, set `GMET=0, NP_ENABLE=0` → disables hypervisor nested paging
+8. Patch kernel `cfi_check_fail` to NOP
+9. Load and execute arbitrary kernel payload
+
+**5. Bus address mapping for TLB entries (pwn_mp4.lua):**
+After setting up TLB entries 32/33, access is through bus VA `0x80000000+`:
+```
+sys_pa_to_mp4_va(sys_pa) = 0x80000000 + (sys_pa - aligned_base)
+```
+This means TLB entries 32+ map to bus address space starting at `0x80000000`.
+
+#### Revised Exploitation Strategy (Post fail0verflow Analysis)
+
+**Two viable paths:**
+
+**Path A: SysHub TLB write via DECI5S (A53 side, no x86 changes needed)**
+1. Dump existing SysHub TLB entries at PA `0x03230000` to understand current layout
+2. Write a new TLB entry (e.g., index 32) via DECI5S WRITE_MEMORY to map bus address → HV system PA `0x70000000`
+3. Write sub_page_rw and attrs for the new entry
+4. Read HV memory through the new mapping via DECI5S PA read to the mapped bus address
+5. Risk: must understand bus address routing per TLB index
+
+**Path B: PCIe config space SMN from x86 kernel (matches fail0verflow approach)**
+1. From kekcall/kmod, map PCIe config space at `0xF0000000`
+2. Use SMN index/data (B0D0F0 + 0xa0/0xa4) to set IOMMU exclusion zone
+3. IOMMU is now disabled — all DMA bypasses translation
+4. Read HV memory (but: HV may intercept PCIe config accesses via nested paging)
+
+**Path C: Full fail0verflow chain (A53 code exec + VMCB modification)**
+1. Use DECI5S write to inject payload at known PA in MP4 memory
+2. Set up SysHub TLB entry for VMCB access
+3. Modify VMCBs to disable NP → hypervisor nested paging off
+4. From x86 kernel, access PCIe config space → SMN → IOMMU exclusion zone
+5. Full system memory access
+
+**Recommended next step**: Dump SysHub TLB entries (Mode 9) to understand entry format and bus address routing. This is pure read, zero risk, and directly enables Path A.
+
+---
+
