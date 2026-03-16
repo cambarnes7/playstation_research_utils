@@ -76,10 +76,10 @@
 /* SysHub TLB sub-page RW cache (in MP4 VA space) */
 #define MP4_SYSHUB_SUB_PAGE_RW_CACHE  0x11F538
 
-/* Known firmware entry points (FW 4.03, Oberon 1.1.1.00 CEX) */
-#define A53_MDBG_INTR_ADDR   0x109854   /* BL mDbg_intr in serror handler */
+/* Known firmware entry points (FW 4.03, Oberon 1.1.1.00 CEX build 179926) */
+#define A53_HOOK_ADDR         0x108BD4   /* BL is_qaf in IRQ handler (GIC 83/78) */
 #define A53_ELF_BASE          0x100000   /* Base address of A53 ELF in DRAM */
-#define A53_QAF_FLAGS_OFF     0x1EC5C    /* mm4p_flags offset for QAF enable */
+#define A53_QAF_FLAGS_OFF     0x123B74   /* dword_123B74: mm4p QAF flag in .data */
 
 /* Payload placement addresses (in MP4 DRAM, relative to 0x60000000) */
 #define MP4_THUNK_OFFSET      0xE0000   /* Thunk code: 0x600E0000 */

