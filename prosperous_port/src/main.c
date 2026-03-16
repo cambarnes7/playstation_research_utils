@@ -212,181 +212,191 @@ int prosperous_run(void)
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
 
-    /* Phase 1.5: GPU SDMA path and DRAM analysis
+    /* Phase 1.5: BAR2 indirect DRAM access search
      *
-     * CONFIRMED (all previous runs):
-     *   ACCESSIBLE: PA 0x605F0000-0x60FFFFFF (64KB + 6MB) — R/W works
-     *   BLOCKED:    PA 0x60000000-0x605EFFFF — no PDE, rc=-1 safe
-     *   GPU at B32:D0:F0 (0x13FB1002) behind bridge B0:D8:F1
-     *   GPU MMIO at BAR2=0xE000000C returned all 0xFFFFFFFF
-     *   Write test passed (0xCAFEBABE at PA 0x60700000)
+     * CONFIRMED:
+     *   ACCESSIBLE: PA 0x605F0000-0x60FFFFFF (R/W works)
+     *   BLOCKED:    PA 0x60000000-0x605EFFFF (nPT, rc=-1)
+     *   GPU MMIO:   HV-trapped (all 0xFFFFFFFF despite correct config)
+     *   BAR2+0x200000 has functional registers (returned 0x00058184)
+     *   BAR2+0x000000/0x010000/0x100000 return 0xFFFFFFFF
+     *   Descriptor table at PA 0x607F0000 contains SysHub TLB entries
      *
-     * THIS ITERATION: Diagnose why GPU MMIO fails.
-     *   A. Read GPU PCI config (command reg, full BAR decode, status)
-     *   B. Read PCIe bridge memory forwarding windows
-     *   C. Dump more of the descriptor table at PA 0x607F0000
-     *   D. Dump the 64KB boundary region for A53 data structures
+     * THIS ITERATION: Probe MP4 BAR2 for indirect memory access.
+     *   A. Read BAR2+0x200000 region at 0x100-byte stride (safe, read-only)
+     *      Looking for address/data register pairs for indirect DRAM access
+     *   B. Decode SysHub TLB descriptor table more carefully (512 bytes)
+     *   C. Try PCI B0:D18:F2 indirect register mechanism (SMN) to
+     *      access MP4 DRAM controller registers (NOT raw DRAM addrs)
+     *
+     * SAFETY NOTES:
+     *   - Part A: 512 reads at 0x100 stride from BAR2+0x200000 to +0x208000
+     *     AVOIDING BAR2+0x20042C area (caused panic at 4-byte stride)
+     *     Using 0x100 stride which worked before. Read-only.
+     *   - Part B: reads from PA 0x607F0000 (accessible DRAM, proven safe)
+     *   - Part C: SMN indirect reads targeting MP4 controller regs only
+     *     (NOT DRAM addresses 0x60xxxxxx which caused MCE before)
+     *     Targets: 0x15000 area (MP4 config), 0x16000 (PTDMA?)
      */
-    printf("\n[*] Phase 1.5: GPU config and DRAM analysis...\n");
+    printf("\n[*] Phase 1.5: BAR2 indirect DRAM access search...\n");
     {
         uint64_t dmap = ctx.dmap_base;
+        uint64_t bar2 = dmap + MP4_BAR2_PA;
 
-        /* === Part A: Full GPU PCI config decode ===
-         * GPU at B32:D0:F0. Read command register, all BARs (including
-         * BAR1/BAR3 for 64-bit address upper halves), and status.
-         * SAFE: PCI config reads on bus 32 worked in previous runs. */
-        printf("[*] Part A: GPU PCI config (B32:D0:F0)...\n");
+        /* === Part A: BAR2+0x200000 register sweep ===
+         * Previous run: +0x200000 = 0x00058184. Scan at 0x100 stride
+         * from +0x200000 to +0x208000 (128 reads). Skip +0x200400-0x200500
+         * range that caused the earlier panic at 4-byte stride.
+         *
+         * SAFE: 128 reads. The 0x1000-stride scan covered this range
+         * without issues. 0x100 stride is 4x denser but still 64x
+         * coarser than the 4-byte stride that crashed. */
+        printf("[*] Part A: BAR2+0x200000 register sweep (0x100 stride)...\n");
         {
-            uint64_t gpu_ecam = dmap + MMCFG_BASE +
-                (32ULL << 20) + (0ULL << 15) + (0ULL << 12);
+            for (int i = 0; i < 128; i++) {
+                uint32_t off = 0x200000 + i * 0x100;
 
-            /* Read and decode all important registers */
-            uint32_t cmd_status, bars[6];
-            kernel_copyout(gpu_ecam + 0x04, &cmd_status, 4);
-            printf("[GPU] Command/Status: 0x%08x\n", cmd_status);
-            printf("[GPU]   MemSpace=%d IOSpace=%d BusMaster=%d\n",
-                   (cmd_status >> 1) & 1, cmd_status & 1,
-                   (cmd_status >> 2) & 1);
+                /* Skip the danger zone around +0x20042C */
+                if (off >= 0x200400 && off < 0x200500)
+                    continue;
 
-            for (int i = 0; i < 6; i++) {
-                kernel_copyout(gpu_ecam + 0x10 + i * 4, &bars[i], 4);
-                printf("[GPU] BAR%d = 0x%08x\n", i, bars[i]);
-            }
-
-            /* Decode 64-bit BARs */
-            uint64_t bar0_full = ((uint64_t)bars[1] << 32) |
-                                 (bars[0] & ~0xFULL);
-            uint64_t bar2_full = ((uint64_t)bars[3] << 32) |
-                                 (bars[2] & ~0xFULL);
-            printf("[GPU] BAR0 (VRAM) full 64-bit PA = 0x%llx\n",
-                   (unsigned long long)bar0_full);
-            printf("[GPU] BAR2 (MMIO) full 64-bit PA = 0x%llx\n",
-                   (unsigned long long)bar2_full);
-            printf("[GPU] BAR5 (Doorbell) PA = 0x%08x\n",
-                   bars[5] & ~0xFU);
-
-            /* Read subsystem ID and ROM BAR */
-            uint32_t subsys;
-            kernel_copyout(gpu_ecam + 0x2C, &subsys, 4);
-            printf("[GPU] Subsystem: 0x%08x\n", subsys);
-
-            /* Test read at the CORRECT GPU MMIO address */
-            if (bar2_full != 0 && bar2_full != 0xFFFFFFFF0ULL) {
-                printf("[GPU] Testing MMIO read at correct BAR2...\n");
-                uint32_t test_val = 0xDEADDEAD;
-                int32_t rc = kernel_copyout(dmap + bar2_full, &test_val, 4);
-                printf("[GPU] MMIO[0x%llx]+0 = 0x%08x (rc=%d)\n",
-                       (unsigned long long)bar2_full, test_val, rc);
-
-                /* Try a few more offsets */
-                uint32_t probe_offsets[] = {0x2000, 0x5000, 0xD000};
-                for (int i = 0; i < 3; i++) {
-                    test_val = 0xDEADDEAD;
-                    rc = kernel_copyout(dmap + bar2_full + probe_offsets[i],
-                                       &test_val, 4);
-                    printf("[GPU] MMIO+0x%x = 0x%08x (rc=%d)\n",
-                           probe_offsets[i], test_val, rc);
+                uint32_t val = 0xDEADDEAD;
+                int32_t rc = kernel_copyout(bar2 + off, &val, 4);
+                if (val != 0xFFFFFFFF && val != 0x00000000 && rc == 0) {
+                    printf("[BAR2] +0x%06x = 0x%08x\n", off, val);
                 }
             }
+            printf("[BAR2] Sweep done (non-zero/non-FF values shown)\n");
+
+            /* Also read specific known-interesting offsets */
+            uint32_t interesting_offsets[] = {
+                0x200000, 0x200004, 0x200008, 0x20000C,
+                0x200010, 0x200014, 0x200018, 0x20001C,
+                0x200020, 0x200024, 0x200028, 0x20002C,
+                0x200030, 0x200034, 0x200038, 0x20003C,
+            };
+            printf("[BAR2] First 64 bytes at +0x200000:\n");
+            for (int i = 0; i < 16; i++) {
+                uint32_t val;
+                kernel_copyout(bar2 + interesting_offsets[i], &val, 4);
+                if (i % 4 == 0)
+                    printf("[BAR2] +%03x:", interesting_offsets[i] & 0xFFF);
+                printf(" %08x", val);
+                if (i % 4 == 3)
+                    printf("\n");
+            }
         }
 
-        /* === Part B: PCIe bridge memory forwarding windows ===
-         * Bridge B0:D8:F1 forwards bus 32 traffic. Read its memory
-         * base/limit registers to understand which PA ranges it forwards.
-         * SAFE: PCI config reads. */
-        printf("\n[*] Part B: PCIe bridge forwarding config (B0:D8:F1)...\n");
+        /* === Part B: Extended SysHub TLB descriptor table ===
+         * 512 bytes from PA 0x607F0000 to get the full picture.
+         * Entries appear to be (src_pa_lo, src_pa_hi, size_lo, size_hi,
+         * syshub_va_lo, syshub_va_hi) — 24 bytes each.
+         * SAFE: accessible DRAM, read-only. */
+        printf("\n[*] Part B: SysHub TLB table (PA 0x607F0000, 512 bytes)...\n");
         {
-            uint64_t br_ecam = dmap + MMCFG_BASE +
-                (0ULL << 20) + (8ULL << 15) + (1ULL << 12);
-
-            uint32_t cmd_status;
-            kernel_copyout(br_ecam + 0x04, &cmd_status, 4);
-            printf("[BRIDGE] Command/Status: 0x%08x\n", cmd_status);
-            printf("[BRIDGE]   MemSpace=%d BusMaster=%d\n",
-                   (cmd_status >> 1) & 1, (cmd_status >> 2) & 1);
-
-            uint32_t bus_reg;
-            kernel_copyout(br_ecam + 0x18, &bus_reg, 4);
-            printf("[BRIDGE] Buses: pri=%u sec=%u sub=%u\n",
-                   bus_reg & 0xFF, (bus_reg >> 8) & 0xFF,
-                   (bus_reg >> 16) & 0xFF);
-
-            /* Memory window (non-prefetchable) */
-            uint32_t mem_reg;
-            kernel_copyout(br_ecam + 0x20, &mem_reg, 4);
-            uint32_t mem_base = (mem_reg & 0xFFF0) << 16;
-            uint32_t mem_limit = (mem_reg >> 16) << 16 | 0xFFFFF;
-            printf("[BRIDGE] Memory window: 0x%08x - 0x%08x\n",
-                   mem_base, mem_limit);
-
-            /* Prefetchable memory window */
-            uint32_t pref_reg;
-            kernel_copyout(br_ecam + 0x24, &pref_reg, 4);
-            uint32_t pref_base_lo = (pref_reg & 0xFFF0) << 16;
-            uint32_t pref_limit_lo = (pref_reg >> 16) << 16 | 0xFFFFF;
-
-            uint32_t pref_base_hi, pref_limit_hi;
-            kernel_copyout(br_ecam + 0x28, &pref_base_hi, 4);
-            kernel_copyout(br_ecam + 0x2C, &pref_limit_hi, 4);
-
-            uint64_t pref_base = ((uint64_t)pref_base_hi << 32) | pref_base_lo;
-            uint64_t pref_limit = ((uint64_t)pref_limit_hi << 32) |
-                                  pref_limit_lo;
-            printf("[BRIDGE] Prefetchable window: 0x%llx - 0x%llx\n",
-                   (unsigned long long)pref_base,
-                   (unsigned long long)pref_limit);
-        }
-
-        /* === Part C: Expanded descriptor table dump ===
-         * PA 0x607F0000 had interesting values (0x88000000, 0x005F0000).
-         * Dump 256 bytes to understand the full structure.
-         * SAFE: PD[0x103] range, proven accessible. */
-        printf("\n[*] Part C: Descriptor table at PA 0x607F0000...\n");
-        {
-            uint32_t buf[64]; /* 256 bytes */
-            for (int w = 0; w < 64; w++)
+            uint32_t buf[128]; /* 512 bytes */
+            for (int w = 0; w < 128; w++)
                 kernel_copyout(dmap + 0x607F0000ULL + w * 4, &buf[w], 4);
-            for (int row = 0; row < 16; row++) {
-                printf("[DESC] +%03x: %08x %08x %08x %08x\n",
+            for (int row = 0; row < 32; row++) {
+                printf("[TLB] +%03x: %08x %08x %08x %08x\n",
                        row * 16, buf[row*4], buf[row*4+1],
                        buf[row*4+2], buf[row*4+3]);
             }
         }
 
-        /* === Part D: Dump 64KB boundary region (PA 0x605F0000) ===
-         * This is the lowest accessible DRAM. Dump first 128 bytes
-         * of each page to look for function pointers, vtables,
-         * or other hookable data structures.
-         * SAFE: all 16 pages confirmed accessible in previous run. */
-        printf("\n[*] Part D: Boundary region dump (PA 0x605F0000)...\n");
+        /* === Part C: SMN probe of MP4 controller registers ===
+         * Use PCI B0:D18:F2 indirect mechanism (SMN) to read
+         * MP4 peripheral controller registers. We know:
+         *   - SMN addrs 0x60xxxxxx = raw DRAM (causes MCE, DO NOT USE)
+         *   - SMN addrs 0x15xxx/0x16xxx = MP4 controller space (should be safe)
+         *
+         * Looking for PTDMA engine registers or indirect DRAM access regs.
+         *
+         * The PCI indirect mechanism:
+         *   Write addr to B0:D18:F2 offset 0x64 (SMN addr register)
+         *   Read data from B0:D18:F2 offset 0x68 (SMN data register)
+         *
+         * SAFE: Only targeting controller registers, not DRAM.
+         * Previous TMR reads via this mechanism worked fine. */
+        printf("\n[*] Part C: SMN controller register probe...\n");
         {
-            /* Dump first 64 bytes of each of the 16 accessible pages */
-            for (int page = 0; page < 16; page++) {
-                uint64_t pa = 0x605F0000ULL + page * 0x1000;
-                uint32_t buf[16]; /* 64 bytes */
-                for (int w = 0; w < 16; w++)
-                    kernel_copyout(dmap + pa + w * 4, &buf[w], 4);
+            uint64_t df_ecam = dmap + MMCFG_BASE +
+                (0ULL << 20) + (18ULL << 15) + (2ULL << 12);
 
-                /* Check if page is all zeros or all same value */
-                int interesting = 0;
-                for (int w = 0; w < 16; w++) {
-                    if (buf[w] != 0 && buf[w] != buf[0]) {
-                        interesting = 1;
-                        break;
-                    }
+            /* MP4 related SMN register ranges to probe:
+             * 0x0001_5000 - MP4 config registers (speculation)
+             * 0x0001_6000 - MP4/PTDMA controller (speculation)
+             * 0x0003_E000 - SysHub TLB control registers
+             * 0x0003_F000 - SysHub TLB control registers
+             *
+             * These are controller regs, NOT DRAM addresses.
+             * SMN reads to non-existent regs return 0 or 0xFFFFFFFF safely.
+             */
+            uint32_t smn_ranges[] = {
+                0x00015000, 0x00015100, 0x00015200, 0x00015300,
+                0x00016000, 0x00016100, 0x00016200, 0x00016300,
+                0x0003E000, 0x0003E100, 0x0003E200, 0x0003E300,
+                0x0003F000, 0x0003F100, 0x0003F200, 0x0003F300,
+            };
+
+            for (int i = 0; i < 16; i++) {
+                uint32_t addr = smn_ranges[i];
+
+                /* Write SMN address */
+                kernel_copyin(&addr, df_ecam + 0x64, 4);
+
+                /* Read first 4 registers at this base */
+                uint32_t vals[4];
+                for (int r = 0; r < 4; r++) {
+                    uint32_t a = addr + r * 4;
+                    kernel_copyin(&a, df_ecam + 0x64, 4);
+                    kernel_copyout(df_ecam + 0x68, &vals[r], 4);
                 }
-                if (buf[0] != 0) interesting = 1;
+                /* Only print if any value is non-zero and non-FF */
+                int has_data = 0;
+                for (int r = 0; r < 4; r++)
+                    if (vals[r] != 0 && vals[r] != 0xFFFFFFFF)
+                        has_data = 1;
+                if (has_data) {
+                    printf("[SMN] 0x%08x: %08x %08x %08x %08x\n",
+                           addr, vals[0], vals[1], vals[2], vals[3]);
+                }
+            }
 
-                if (interesting) {
-                    printf("[BNDRY] PA 0x%llx (page %d):\n",
-                           (unsigned long long)pa, page);
-                    for (int row = 0; row < 4; row++) {
-                        printf("  +%02x: %08x %08x %08x %08x\n",
-                               row * 16, buf[row*4], buf[row*4+1],
-                               buf[row*4+2], buf[row*4+3]);
+            /* Also probe the known MP4 BAR2 base in SMN space.
+             * BAR2 PA = 0xE0400000. In SMN, this maps to some
+             * internal address. Try reading MP4 device config space
+             * via SMN to find internal controller base addresses.
+             *
+             * AMD Aeolia/Belize: MP4 internal registers are typically
+             * at SMN 0x15C00000 area or 0x15800000 area.
+             * Probe conservatively at 0x1000 stride. */
+            printf("[SMN] Probing MP4 internal register space...\n");
+            uint32_t mp4_smn_bases[] = {
+                0x15800000, 0x15801000, 0x15802000, 0x15803000,
+                0x15C00000, 0x15C01000, 0x15C02000, 0x15C03000,
+                0x15C10000, 0x15C11000, 0x15C12000, 0x15C13000,
+                0x15C20000, 0x15C21000, 0x15C22000, 0x15C23000,
+            };
+            for (int i = 0; i < 16; i++) {
+                uint32_t addr = mp4_smn_bases[i];
+                kernel_copyin(&addr, df_ecam + 0x64, 4);
+                uint32_t val;
+                kernel_copyout(df_ecam + 0x68, &val, 4);
+                if (val != 0 && val != 0xFFFFFFFF) {
+                    printf("[SMN] 0x%08x = 0x%08x\n", addr, val);
+                    /* Read next 15 regs if we found something */
+                    for (int r = 1; r < 16; r++) {
+                        uint32_t a = addr + r * 4;
+                        kernel_copyin(&a, df_ecam + 0x64, 4);
+                        kernel_copyout(df_ecam + 0x68, &val, 4);
+                        if (val != 0 && val != 0xFFFFFFFF) {
+                            printf("[SMN] 0x%08x = 0x%08x\n", a, val);
+                        }
                     }
                 }
             }
+            printf("[SMN] Probe done\n");
         }
     }
 
