@@ -212,7 +212,7 @@ int prosperous_run(void)
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
 
-    /* Phase 1.5: Find DRAM access path via SMN
+    /* Phase 1.5: Find DRAM access path via BAR2 MMIO scan
      *
      * CRITICAL: We CANNOT create page table entries for PA 0x60000000.
      * The HV's nested page tables don't map this guest-PA. Creating a
@@ -221,99 +221,137 @@ int prosperous_run(void)
      * ACCESSIBLE via existing DMAP:  PA 0x60600000-0x607FFFFF (PD[0x103])
      * BLOCKED by nested page tables: PA 0x60000000-0x605FFFFF (PD[0x100-0x102])
      *
-     * Strategy: Use SMN (System Management Network) indirect registers
-     * to access blocked DRAM. SMN goes through SoC fabric, bypassing
-     * x86 nested page tables entirely.
+     * Strategy: Scan BAR2 MMIO space densely for a DRAM access window.
+     * AMD multimedia IPs typically provide SRAM/DRAM windows through
+     * register pairs in the BAR. The PS5 bootloader uses BAR2 to load
+     * the A53 firmware, so DRAM write access must exist somewhere.
      *
-     * SMN access: write address to B0:D0:F0 offset 0x60, read/write
-     * data at offset 0x64. We scan multiple SMN address ranges for
-     * the A53 ELF magic to find where DRAM is mapped in SMN space.
+     * We look for:
+     *   1. ELF magic (0x464C457F) at DRAM offset 0x100000 relative to
+     *      candidate BAR2 window bases
+     *   2. Known DRAM content (0xe90c2dd7 from PA 0x60600000) at any offset
+     *   3. Non-0xFFFFFFFF regions that might be indirect access registers
+     *
+     * BAR2 reads are safe (proven: c2p regs, previous probes worked fine).
+     * NO writes to unknown BAR2 registers (avoid corrupting A53 state).
      */
-    printf("\n[*] Phase 1.5: Scanning SMN for DRAM access...\n");
+    printf("\n[*] Phase 1.5: Dense BAR2 scan for DRAM window...\n");
     {
         uint64_t dmap = ctx.dmap_base;
-        uint64_t smn_idx_kva = dmap + PCI_B0D0F0 + 0x60;
-        uint64_t smn_dat_kva = dmap + PCI_B0D0F0 + 0x64;
-        uint32_t smn_addr, smn_data;
+        uint64_t bar2_kva = dmap + MP4_BAR2_PA;
+        uint32_t probe;
+        int32_t rc;
 
-        /* Scan SMN address ranges where MP4 DRAM might be mapped.
-         * Look for ELF magic (0x464C457F) at the A53 ELF base offset.
-         *
-         * Candidate SMN bases (+ 0x100000 for ELF base):
-         *   0x60000000 - matching system PA
-         *   0x00000000 - DRAM at SMN 0
-         *   0x10000000 - multimedia IP range
-         *   0x16000000 - alternate multimedia range
-         *   0x04000000 - possible Belize range
-         */
-        uint32_t smn_bases[] = {
-            0x60000000, 0x00000000, 0x10000000, 0x16000000,
-            0x04000000, 0x08000000, 0x20000000, 0x40000000,
-            0x50000000, 0x70000000, 0x80000000, 0xC0000000
-        };
+        /* First, get reference values from accessible DMAP DRAM reads
+         * so we can match them against BAR2 scan results. */
+        uint32_t dram_ref_600000 = 0, dram_ref_700000 = 0;
+        kernel_copyout(dmap + 0x60600000ULL, &dram_ref_600000, 4);
+        kernel_copyout(dmap + 0x60700000ULL, &dram_ref_700000, 4);
+        printf("[REF] DMAP PA 0x60600000 = 0x%08x\n", dram_ref_600000);
+        printf("[REF] DMAP PA 0x60700000 = 0x%08x\n", dram_ref_700000);
 
-        printf("[*] Scanning %lu SMN base addresses for ELF magic...\n",
-               (unsigned long)(sizeof(smn_bases)/sizeof(smn_bases[0])));
+        /* Phase A: Coarse scan — every 0x10000 (64KB), 0 to 0x1000000 (16MB)
+         * This is 256 reads. Report only non-0xFFFFFFFF values and
+         * flag any ELF magic or DRAM content matches. */
+        printf("\n[*] Phase A: Coarse BAR2 scan (64KB stride, 16MB range)...\n");
+        uint32_t interesting_regions[32];
+        int n_interesting = 0;
 
-        for (uint32_t i = 0; i < sizeof(smn_bases)/sizeof(smn_bases[0]); i++) {
-            /* Read at SMN base + 0x100000 (A53 ELF offset) */
-            smn_addr = smn_bases[i] + 0x100000;
-            kernel_copyin(&smn_addr, smn_idx_kva, 4);
-            kernel_copyout(smn_dat_kva, &smn_data, 4);
-            printf("[SMN] 0x%08x = 0x%08x%s\n", smn_addr, smn_data,
-                   smn_data == 0x464C457F ? " <<< ELF MAGIC >>>" : "");
+        for (uint32_t off = 0; off < 0x1000000; off += 0x10000) {
+            probe = 0xFFFFFFFF;
+            rc = kernel_copyout(bar2_kva + off, &probe, 4);
+            if (probe == 0xFFFFFFFF && rc == 0)
+                continue;
 
-            /* Also try at the base itself (DRAM offset 0) */
-            smn_addr = smn_bases[i];
-            kernel_copyin(&smn_addr, smn_idx_kva, 4);
-            kernel_copyout(smn_dat_kva, &smn_data, 4);
-            if (smn_data == 0x464C457F) {
-                printf("[SMN] 0x%08x = 0x%08x <<< ELF MAGIC >>>\n",
-                       smn_addr, smn_data);
+            int is_elf = (probe == 0x464C457F);
+            int is_dram = (probe == dram_ref_600000 || probe == dram_ref_700000);
+
+            printf("[BAR2] +0x%07x = 0x%08x (rc=%d)%s%s\n",
+                   off, probe, rc,
+                   is_elf ? " <<< ELF MAGIC >>>" : "",
+                   is_dram ? " <<< DRAM MATCH >>>" : "");
+
+            if (n_interesting < 32)
+                interesting_regions[n_interesting++] = off;
+        }
+
+        /* Phase B: For each interesting region, scan at 4KB granularity
+         * in a ±128KB window around it. Look for ELF magic especially
+         * at +0x100000 from the region start (where A53 ELF would be). */
+        printf("\n[*] Phase B: Fine scan around %d interesting regions...\n",
+               n_interesting);
+        for (int i = 0; i < n_interesting; i++) {
+            uint32_t base = interesting_regions[i];
+            uint32_t scan_start = (base >= 0x20000) ? base - 0x20000 : 0;
+            uint32_t scan_end = base + 0x20000;
+            if (scan_end > 0x1000000) scan_end = 0x1000000;
+
+            for (uint32_t off = scan_start; off < scan_end; off += 0x1000) {
+                probe = 0xFFFFFFFF;
+                kernel_copyout(bar2_kva + off, &probe, 4);
+                if (probe != 0xFFFFFFFF) {
+                    printf("[BAR2] +0x%07x = 0x%08x%s%s\n",
+                           off, probe,
+                           probe == 0x464C457F ? " <<< ELF >>>" : "",
+                           (probe == dram_ref_600000 || probe == dram_ref_700000)
+                               ? " <<< DRAM >>>" : "");
+                }
+            }
+
+            /* Also try: if this region is a DRAM window base, check
+             * where the ELF would be at base + 0x100000. */
+            if (base + 0x100000 < 0x1000000) {
+                probe = 0;
+                kernel_copyout(bar2_kva + base + 0x100000, &probe, 4);
+                if (probe != 0xFFFFFFFF) {
+                    printf("[BAR2] +0x%07x = 0x%08x (ELF probe for window base 0x%x)%s\n",
+                           base + 0x100000, probe, base,
+                           probe == 0x464C457F ? " <<< ELF MAGIC! >>>" : "");
+                }
             }
         }
 
-        /* Also try fine-grained scan near the BAR2 SMN equivalent.
-         * BAR2 PA = 0xE0400000. AMD IP blocks often have their MMIO
-         * registers at SMN addresses like 0x1Fxxxxxxx or 0x0xxxx000.
-         * The c2p regs at BAR2+0xF6000 might be at SMN 0x100F6000
-         * or 0x0F6000. Scan nearby for DRAM. */
-        printf("[*] Fine-grained SMN scan near known register ranges...\n");
-        uint32_t fine_addrs[] = {
-            /* Try reading at known offsets where hook/QAF would be */
-            0x60108BD4, 0x60123B74, 0x600E0000,  /* system PA match */
-            0x00108BD4, 0x00123B74, 0x000E0000,  /* zero-based */
-            0x10108BD4, 0x10123B74, 0x100E0000,  /* 0x10000000 base */
+        /* Phase C: Targeted probes at known AMD SRAM/DRAM window register
+         * offsets. On AMD multimedia IPs, indirect access registers are
+         * typically at offsets like 0x10580/0x10584, 0x10500/0x10504,
+         * 0x10588/0x1058C, 0x30000+, etc.
+         *
+         * We read these to see if they look like address/data register
+         * pairs (one might contain an address-like value). */
+        printf("\n[*] Phase C: Probe known AMD indirect register offsets...\n");
+        uint32_t ind_offsets[] = {
+            0x10500, 0x10504, 0x10508, 0x1050C,
+            0x10510, 0x10514, 0x10518, 0x1051C,
+            0x10520, 0x10524, 0x10528, 0x1052C,
+            0x10580, 0x10584, 0x10588, 0x1058C,
+            0x10590, 0x10594, 0x10598, 0x1059C,
+            0x105A0, 0x105A4, 0x105A8, 0x105AC,
+            0x30000, 0x30004, 0x30008, 0x3000C,
+            0x30010, 0x30014, 0x30018, 0x3001C,
         };
-        for (uint32_t i = 0; i < sizeof(fine_addrs)/sizeof(fine_addrs[0]); i++) {
-            smn_addr = fine_addrs[i];
-            kernel_copyin(&smn_addr, smn_idx_kva, 4);
-            kernel_copyout(smn_dat_kva, &smn_data, 4);
-            printf("[SMN] 0x%08x = 0x%08x\n", smn_addr, smn_data);
+        for (uint32_t i = 0; i < sizeof(ind_offsets)/sizeof(ind_offsets[0]); i++) {
+            probe = 0;
+            kernel_copyout(bar2_kva + ind_offsets[i], &probe, 4);
+            if (probe != 0xFFFFFFFF && probe != 0)
+                printf("[BAR2] +0x%06x = 0x%08x\n", ind_offsets[i], probe);
         }
 
-        /* Test: read SMN at hook address. If we get something that looks
-         * like an AArch64 BL instruction (0x94xxxxxx or 0x97xxxxxx),
-         * we found the DRAM via SMN. */
-        printf("\n[*] Testing accessible DMAP DRAM reads for reference...\n");
-        uint32_t probe;
-        int32_t rc;
-        probe = 0;
-        rc = kernel_copyout(dmap + 0x60600000ULL, &probe, 4);
-        printf("[DMAP] PA 0x60600000 = 0x%08x (rc=%d) [reference]\n", probe, rc);
-        probe = 0;
-        rc = kernel_copyout(dmap + 0x60700000ULL, &probe, 4);
-        printf("[DMAP] PA 0x60700000 = 0x%08x (rc=%d) [reference]\n", probe, rc);
-
-        /* Read same addresses via SMN for comparison */
-        smn_addr = 0x60600000;
-        kernel_copyin(&smn_addr, smn_idx_kva, 4);
-        kernel_copyout(smn_dat_kva, &smn_data, 4);
-        printf("[SMN]  0x60600000 = 0x%08x [compare with DMAP above]\n", smn_data);
-        smn_addr = 0x60700000;
-        kernel_copyin(&smn_addr, smn_idx_kva, 4);
-        kernel_copyout(smn_dat_kva, &smn_data, 4);
-        printf("[SMN]  0x60700000 = 0x%08x [compare with DMAP above]\n", smn_data);
+        /* Phase D: Read c2p registers to verify BAR2 access works,
+         * then try reading adjacent registers that might be for
+         * SRAM/DRAM window control. */
+        printf("\n[*] Phase D: Scan around c2p registers (BAR2+0xF6000)...\n");
+        for (uint32_t off = 0xF5000; off < 0xFC000; off += 0x1000) {
+            probe = 0;
+            kernel_copyout(bar2_kva + off, &probe, 4);
+            printf("[BAR2] +0x%06x = 0x%08x\n", off, probe);
+        }
+        /* Also check if there are registers between c2p slots */
+        for (uint32_t off = 0xF6000; off < 0xF6100; off += 4) {
+            probe = 0;
+            kernel_copyout(bar2_kva + off, &probe, 4);
+            if (probe != 0)
+                printf("[BAR2] +0x%06x = 0x%08x (near c2p[0][0])\n", off, probe);
+        }
     }
 
     /* Phase 2: MP4 payload injection */
