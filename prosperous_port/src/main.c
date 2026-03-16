@@ -244,14 +244,20 @@ int prosperous_run(void)
 
     /* Diagnostic: read c2p reg 0 to see if a previous command is stuck */
     {
-        uint32_t c2p0_val;
-        uint64_t bar2_kva = ctx.dmap_base + MP4_BAR2_PA;
-        kernel_copyout(bar2_kva + MP4_C2P_REG(0, 0), &c2p0_val, sizeof(c2p0_val));
+        intptr_t bar2 = (intptr_t)(ctx.dmap_base + MP4_BAR2_PA);
+        uint32_t c2p0_val = kernel_getint(bar2 + MP4_C2P_REG(0, 0));
         printf("[DIAG] c2p reg 0 before ping: 0x%08x\n", c2p0_val);
 
+        /* Clear stale c2p reg 0 from DECI5S session before first ping */
+        if (c2p0_val != 0) {
+            kernel_setint(bar2 + MP4_C2P_REG(0, 0), 0);
+            usleep(10000); /* 10ms settle */
+            c2p0_val = kernel_getint(bar2 + MP4_C2P_REG(0, 0));
+            printf("[DIAG] c2p reg 0 after clear: 0x%08x\n", c2p0_val);
+        }
+
         /* Also read p2c reg 0 to check if A53 has sent anything */
-        uint32_t p2c0_val;
-        kernel_copyout(bar2_kva + MP4_P2C_REG0(0), &p2c0_val, sizeof(p2c0_val));
+        uint32_t p2c0_val = kernel_getint(bar2 + MP4_P2C_REG0(0));
         printf("[DIAG] p2c reg 0: 0x%08x\n", p2c0_val);
     }
 
