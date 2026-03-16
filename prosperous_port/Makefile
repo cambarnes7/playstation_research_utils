@@ -25,6 +25,7 @@ LDFLAGS +=
 SRCS    = src/main.c \
           src/tmr.c \
           src/mp4_inject.c \
+          src/deci5s.c \
           src/vmcb_patch.c
 
 OBJS    = $(patsubst %.c,$(ODIR)/%.o,$(SRCS))

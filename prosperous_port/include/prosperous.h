@@ -46,6 +46,9 @@ void tmr_restore_tmr20(struct phys_rw_ctx *ctx);
 int tmr_disable_hv_regions(struct phys_rw_ctx *ctx);
 void tmr_restore_hv_regions(struct phys_rw_ctx *ctx);
 
+/* DECI5S payload injection (bypasses nPT via A53 internal write) */
+int deci5s_inject_payload(struct phys_rw_ctx *ctx);
+
 /* MP4 payload operations */
 int mp4_inject_payload(struct phys_rw_ctx *ctx);
 int mp4_send_command(struct phys_rw_ctx *ctx, uint32_t cmd,
