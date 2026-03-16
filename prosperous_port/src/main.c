@@ -255,20 +255,86 @@ int prosperous_run(void)
         kernel_copyout(bar2 + MP4_P2C_REG0(0), &p2c0, 4);
         printf("[P2C] core0 reg0 = 0x%08x\n", p2c0);
 
-        /* Dump first 16 bytes of accessible DRAM at several offsets
-         * to look for A53 heap/stack data we could corrupt */
-        uint64_t probe_addrs[] = {
-            0x60600000ULL, 0x60610000ULL, 0x60620000ULL,
-            0x60700000ULL, 0x607E0000ULL, 0x607F0000ULL,
-        };
-        for (int i = 0; i < 6; i++) {
-            uint32_t w[4];
-            for (int j = 0; j < 4; j++)
-                kernel_copyout(dmap + probe_addrs[i] + j*4, &w[j], 4);
-            printf("[DRAM] PA 0x%llx: %08x %08x %08x %08x\n",
-                   (unsigned long long)probe_addrs[i],
-                   w[0], w[1], w[2], w[3]);
-        }
+        /* c2p command 0x20113001 appears to be a stock firmware
+         * "write to physical address" command (reg2=0xFEE00000 is LAPIC).
+         * Test: clear reg0 to 0, wait, re-read to see if firmware refills it.
+         * If it does, the firmware is actively sending commands and we can
+         * interleave our own. */
+        printf("\n[*] Testing c2p command cycle...\n");
+
+        /* Save original state */
+        uint32_t orig_c2p[5];
+        for (int r = 0; r < 5; r++)
+            kernel_copyout(bar2 + MP4_C2P_REG(0, r), &orig_c2p[r], 4);
+
+        /* Clear reg0 to acknowledge/consume the pending command */
+        uint32_t zero = 0;
+        kernel_copyin(&zero, bar2 + MP4_C2P_REG(0, 0), 4);
+
+        /* Wait briefly for firmware to potentially send a new command */
+        usleep(10000); /* 10ms */
+
+        /* Re-read c2p state */
+        uint32_t new_c2p[5];
+        for (int r = 0; r < 5; r++)
+            kernel_copyout(bar2 + MP4_C2P_REG(0, r), &new_c2p[r], 4);
+        printf("[C2P] After clear+10ms:\n");
+        for (int r = 0; r < 5; r++)
+            printf("[C2P]   reg%d: 0x%08x -> 0x%08x%s\n", r,
+                   orig_c2p[r], new_c2p[r],
+                   new_c2p[r] != orig_c2p[r] ? " CHANGED" : "");
+
+        /* Wait longer and check again */
+        usleep(100000); /* 100ms more */
+        for (int r = 0; r < 5; r++)
+            kernel_copyout(bar2 + MP4_C2P_REG(0, r), &new_c2p[r], 4);
+        printf("[C2P] After 110ms total:\n");
+        for (int r = 0; r < 5; r++)
+            printf("[C2P]   reg%d = 0x%08x\n", r, new_c2p[r]);
+
+        /* Now try: write a test value to DRAM via c2p.
+         * Use the stock firmware command format (0x2011xxxx).
+         * If 0x20113001 writes 32-bit to phys addr:
+         *   reg1 = value?, reg2 = dest PA, reg3 = ???
+         *
+         * TEST: Write 0x41424344 to PA 0x60600010 (accessible DRAM).
+         * We can verify the write by reading back via DMAP.
+         * First write a known pattern there so we can detect changes. */
+        uint32_t marker = 0x11111111;
+        kernel_copyin(&marker, dmap + 0x60600010ULL, 4);
+
+        /* Read back to confirm our marker is there */
+        uint32_t pre_val;
+        kernel_copyout(dmap + 0x60600010ULL, &pre_val, 4);
+        printf("[TEST] PA 0x60600010 before c2p: 0x%08x\n", pre_val);
+
+        /* Send stock-format command to write to DRAM PA 0x60600010.
+         * Guessing: reg1=value, reg2=PA, reg3=size/flags
+         * Based on observed: reg1=0x10000, reg2=0xFEE00000, reg3=0x68 */
+        uint32_t test_val = 0x41424344;
+        uint32_t test_pa = 0x60600010;
+        uint32_t test_arg3 = 0x00000004; /* maybe size=4? */
+        kernel_copyin(&test_val, bar2 + MP4_C2P_REG(0, 1), 4);
+        kernel_copyin(&test_pa, bar2 + MP4_C2P_REG(0, 2), 4);
+        kernel_copyin(&test_arg3, bar2 + MP4_C2P_REG(0, 3), 4);
+
+        /* Trigger: write command to reg0 */
+        uint32_t test_cmd = 0x20113001;
+        kernel_copyin(&test_cmd, bar2 + MP4_C2P_REG(0, 0), 4);
+
+        /* Wait for processing */
+        usleep(50000); /* 50ms */
+
+        /* Check if command was consumed (reg0 cleared) */
+        uint32_t post_cmd;
+        kernel_copyout(bar2 + MP4_C2P_REG(0, 0), &post_cmd, 4);
+        printf("[TEST] c2p reg0 after cmd: 0x%08x (0=consumed)\n", post_cmd);
+
+        /* Check if the value was written */
+        uint32_t post_val;
+        kernel_copyout(dmap + 0x60600010ULL, &post_val, 4);
+        printf("[TEST] PA 0x60600010 after c2p: 0x%08x (expect 0x41424344 if it worked)\n",
+               post_val);
     }
 
     /* Phase 2: MP4 payload injection */
