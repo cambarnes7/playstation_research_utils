@@ -212,30 +212,35 @@ int prosperous_run(void)
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
 
-    /* Phase 1.5: Extended SysHub TLB table dump
+    /* Phase 1.5: SysHub TLB analysis + SMN probe (correct registers)
      *
      * CONFIRMED:
      *   ACCESSIBLE: PA 0x605F0000-0x60FFFFFF (R/W works)
      *   BLOCKED:    PA 0x60000000-0x605EFFFF (nPT, rc=-1)
-     *   GPU MMIO:   HV-trapped (all 0xFFFFFFFF despite correct config)
-     *   BAR2+0x200000 = 0x00058184 (functional register)
-     *   Descriptor table at PA 0x607F0000 has SysHub TLB entries
+     *   GPU MMIO:   HV-trapped (all 0xFFFFFFFF)
+     *   SysHub TLB table at PA 0x607F0000 decoded (7 entries)
      *
-     * THIS ITERATION: Minimal safe diagnostics only.
-     *   A. Dump 512 bytes of SysHub TLB table at PA 0x607F0000
-     *   B. Verify accessible DRAM still works (single read)
-     *   All reads from proven-accessible DRAM. Zero MMIO reads.
+     * PREVIOUS CRASH ROOT CAUSE: Wrote SMN addresses to B0:D18:F2+0x64
+     *   (wrong register — that's a DF register, NOT SMN). Correct SMN
+     *   access is B0:D0:F0+0x60 (index) / +0x64 (data), which the TMR
+     *   code already uses successfully every run.
+     *
+     * THIS ITERATION:
+     *   A. SysHub TLB table (512 bytes, proven safe)
+     *   B. SMN probe via CORRECT B0:D0:F0+0x60/0x64 path
+     *      Targeting MP4 controller regs, NOT raw DRAM addresses.
+     *      Same mechanism TMR code uses — proven safe.
+     *   C. Read BAR2+0x200000 first 16 registers (known safe offset)
      */
-    printf("\n[*] Phase 1.5: SysHub TLB table analysis...\n");
+    printf("\n[*] Phase 1.5: TLB + SMN probe (correct path)...\n");
     {
         uint64_t dmap = ctx.dmap_base;
 
         /* === Part A: SysHub TLB descriptor table ===
-         * 512 bytes from PA 0x607F0000.
-         * SAFE: PD[0x103] range, proven accessible in all runs. */
+         * SAFE: PD[0x103] range, proven accessible. */
         printf("[*] Part A: SysHub TLB table (512 bytes)...\n");
         {
-            uint32_t buf[128]; /* 512 bytes */
+            uint32_t buf[128];
             for (int w = 0; w < 128; w++)
                 kernel_copyout(dmap + 0x607F0000ULL + w * 4, &buf[w], 4);
             for (int row = 0; row < 32; row++) {
@@ -245,13 +250,83 @@ int prosperous_run(void)
             }
         }
 
-        /* === Part B: Quick sanity check ===
-         * Single read from PA 0x60700000 to confirm DRAM access. */
-        printf("\n[*] Part B: DRAM sanity check...\n");
+        /* === Part B: SMN probe via B0:D0:F0+0x60/0x64 ===
+         * This is the CORRECT SMN indirect path. TMR code uses it
+         * every single run. We probe MP4-related controller regs.
+         *
+         * Known working SMN addrs (from TMR code):
+         *   0x00052000+ (DF F2 TMR registers)
+         *
+         * Probing (controller regs only, NOT 0x60xxxxxx DRAM):
+         *   0x00015000-0x00016000 (MP4 low config)
+         *   0x0003E000-0x0003F000 (SysHub TLB control)
+         *   0x15800000-0x15803000 (MP4 internal space, guess)
+         *   0x15C00000-0x15C03000 (MP4 internal space, guess)
+         *
+         * SAFE: Same register pair TMR uses. Non-existent SMN addrs
+         * return 0 or 0xFFFFFFFF without side effects. */
+        printf("\n[*] Part B: SMN probe (B0:D0:F0+0x60/0x64)...\n");
         {
-            uint32_t val = 0xDEADDEAD;
-            int32_t rc = kernel_copyout(dmap + 0x60700000ULL, &val, 4);
-            printf("[DRAM] PA 0x60700000 = 0x%08x (rc=%d)\n", val, rc);
+            uint64_t smn_idx = dmap + PCI_B0D0F0 + 0x60;
+            uint64_t smn_dat = dmap + PCI_B0D0F0 + 0x64;
+
+            /* First verify the mechanism works: read a known TMR reg */
+            uint32_t test_addr = 0x00052080; /* TMR 20 base reg */
+            kernel_copyin(&test_addr, smn_idx, 4);
+            uint32_t test_val;
+            kernel_copyout(smn_dat, &test_val, 4);
+            printf("[SMN] 0x%08x = 0x%08x (TMR20 base, expect 0x00006000)\n",
+                   test_addr, test_val);
+
+            /* Now probe MP4-related ranges */
+            uint32_t smn_addrs[] = {
+                /* Low MP4 config space */
+                0x00015000, 0x00015004, 0x00015008, 0x0001500C,
+                0x00016000, 0x00016004, 0x00016008, 0x0001600C,
+                /* SysHub TLB control */
+                0x0003E000, 0x0003E004, 0x0003E008, 0x0003E00C,
+                0x0003F000, 0x0003F004, 0x0003F008, 0x0003F00C,
+                /* MP4 internal (Aeolia/Belize typical) */
+                0x15800000, 0x15800004, 0x15800008, 0x1580000C,
+                0x15C00000, 0x15C00004, 0x15C00008, 0x15C0000C,
+                /* MP4 DRAM controller (speculation) */
+                0x15C10000, 0x15C10004, 0x15C10008, 0x15C1000C,
+                0x15C20000, 0x15C20004, 0x15C20008, 0x15C2000C,
+            };
+
+            for (int i = 0; i < 32; i++) {
+                uint32_t addr = smn_addrs[i];
+                kernel_copyin(&addr, smn_idx, 4);
+                uint32_t val;
+                kernel_copyout(smn_dat, &val, 4);
+
+                /* Print all values (even 0/FF) for first run to
+                 * understand what's at each address */
+                if (i % 4 == 0)
+                    printf("[SMN] 0x%08x:", addr);
+                printf(" %08x", val);
+                if (i % 4 == 3)
+                    printf("\n");
+            }
+        }
+
+        /* === Part C: BAR2+0x200000 first 16 registers ===
+         * BAR2+0x200000 returned 0x00058184 in multiple runs.
+         * Read the first 64 bytes at this offset only (no sweep).
+         * SAFE: single known-good offset, 16 reads. */
+        printf("\n[*] Part C: BAR2+0x200000 registers (64 bytes)...\n");
+        {
+            uint64_t bar2 = dmap + MP4_BAR2_PA;
+            for (int i = 0; i < 4; i++) {
+                uint32_t vals[4];
+                for (int j = 0; j < 4; j++) {
+                    kernel_copyout(bar2 + 0x200000 + (i*4+j)*4,
+                                   &vals[j], 4);
+                }
+                printf("[BAR2] +0x%03x: %08x %08x %08x %08x\n",
+                       0x200000 + i * 16, vals[0], vals[1],
+                       vals[2], vals[3]);
+            }
         }
     }
 
