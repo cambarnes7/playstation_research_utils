@@ -236,46 +236,24 @@ int mp4_inject_payload(struct phys_rw_ctx *ctx)
 }
 
 /*
- * Send a command to the MP4 payload via c2p mailbox registers.
+ * Send a command to the MP4 payload via DECI5S doorbell.
  *
- * The c2p registers are BAR2 MMIO registers. Writing to c2p reg 0
- * triggers a hardware interrupt (GIC 83/78) on the A53, which invokes
- * the IRQ handler where our payload hook lives.
+ * Writing to c2p registers via DMAP doesn't trigger the A53's GIC
+ * interrupt. We must use the DECI5S ioctl/doorbell mechanism to
+ * generate the interrupt that fires the IRQ handler where our
+ * payload hook lives.
  *
- * IMPORTANT: Must use kernel_setint/kernel_getint (volatile 32-bit
- * MMIO store/load) instead of kernel_copyin/kernel_copyout (memcpy
- * semantics). The MMIO write to reg 0 has a hardware side-effect
- * (interrupt generation) that copyin doesn't trigger properly.
- *
- * Protocol:
- *   1. Write arguments to c2p regs 1-4
- *   2. Write command to c2p reg 0 (triggers A53 interrupt)
- *   3. Poll c2p reg 0 until 0 (acknowledged) or timeout
+ * This delegates to deci5s_send_cmd() which:
+ *   1. Opens /dev/mp4/dump and sets coredump state
+ *   2. Writes args to c2p regs 1-3
+ *   3. Writes command to c2p reg 0 (triggers interrupt)
+ *   4. Polls c2p reg 0 until 0 (acknowledged) or timeout
  */
 int mp4_send_command(struct phys_rw_ctx *ctx, uint32_t cmd,
                      uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t ack)
 {
-    intptr_t bar2 = (intptr_t)(ctx->dmap_base + MP4_BAR2_PA);
-    uint32_t val;
-    int timeout = MP4_CMD_TIMEOUT;
-
-    /* Write arguments (c2p core 0 regs 1-4) using volatile MMIO stores */
-    kernel_setint(bar2 + MP4_C2P_REG(0, 1), arg1);
-    kernel_setint(bar2 + MP4_C2P_REG(0, 2), arg2);
-    kernel_setint(bar2 + MP4_C2P_REG(0, 3), arg3);
-    kernel_setint(bar2 + MP4_C2P_REG(0, 4), ack);
-
-    /* Write command — this triggers the A53 interrupt */
-    kernel_setint(bar2 + MP4_C2P_REG(0, 0), cmd);
-
-    /* Poll for completion using volatile MMIO loads */
-    while (timeout-- > 0) {
-        val = kernel_getint(bar2 + MP4_C2P_REG(0, 0));
-        if (val == 0)
-            return 0; /* Command completed */
-    }
-
-    return -1; /* Timeout */
+    (void)ctx; /* No longer needed — deci5s_send_cmd uses its own bar2 */
+    return deci5s_send_cmd(cmd, arg1, arg2, arg3, ack);
 }
 
 /* Read 32-bit value via MP4 */
@@ -283,12 +261,11 @@ uint32_t mp4_read32(struct phys_rw_ctx *ctx, uint64_t addr)
 {
     uint32_t lo = (uint32_t)addr;
     uint32_t hi = (uint32_t)(addr >> 32);
-    intptr_t bar2 = (intptr_t)(ctx->dmap_base + MP4_BAR2_PA);
 
     if (mp4_send_command(ctx, MP4_CMD_MEM_READ, lo, hi, MP4_MEM_SIZE_32, 0) != 0)
         return 0;
 
-    return kernel_getint(bar2 + MP4_C2P_REG(0, 1));
+    return deci5s_get_result(1);
 }
 
 /* Read 64-bit value via MP4 */
@@ -296,13 +273,12 @@ uint64_t mp4_read64(struct phys_rw_ctx *ctx, uint64_t addr)
 {
     uint32_t lo = (uint32_t)addr;
     uint32_t hi = (uint32_t)(addr >> 32);
-    intptr_t bar2 = (intptr_t)(ctx->dmap_base + MP4_BAR2_PA);
 
     if (mp4_send_command(ctx, MP4_CMD_MEM_READ, lo, hi, MP4_MEM_SIZE_64, 0) != 0)
         return 0;
 
-    uint32_t val_lo = kernel_getint(bar2 + MP4_C2P_REG(0, 1));
-    uint32_t val_hi = kernel_getint(bar2 + MP4_C2P_REG(0, 2));
+    uint32_t val_lo = deci5s_get_result(1);
+    uint32_t val_hi = deci5s_get_result(2);
     return ((uint64_t)val_hi << 32) | val_lo;
 }
 
@@ -338,11 +314,9 @@ int mp4_syshub_tlb_setup(struct phys_rw_ctx *ctx, uint32_t tlb, uint64_t addr)
 /* Ping the MP4 payload (verify it's alive) */
 int mp4_ping(struct phys_rw_ctx *ctx)
 {
-    intptr_t bar2 = (intptr_t)(ctx->dmap_base + MP4_BAR2_PA);
-
     if (mp4_send_command(ctx, MP4_CMD_PING, 0, 0, 0, 0) != 0)
         return -1;
 
-    uint32_t val = kernel_getint(bar2 + MP4_C2P_REG(0, 1));
+    uint32_t val = deci5s_get_result(1);
     return (val != 0) ? 0 : -1;
 }

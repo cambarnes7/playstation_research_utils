@@ -130,6 +130,108 @@ static int deci5s_send(struct deci5s_hdr *pkt, uint32_t pkt_len,
 }
 
 /*
+ * Send a payload command to the A53 using the DECI5S doorbell mechanism.
+ *
+ * The problem: writing to c2p reg 0 via DMAP doesn't trigger the A53's
+ * GIC interrupt. The DECI5S ioctl/kevent infrastructure sets up hardware
+ * state that enables interrupt delivery.
+ *
+ * This function uses the DECI5S doorbell to trigger the A53 interrupt,
+ * but writes OUR command code to c2p reg 0 instead of the coredump
+ * command. The A53 IRQ handler fires, reads c2p regs, and our hooked
+ * payload processes the command.
+ *
+ * Protocol:
+ *   1. Set up DECI5S state (ioctl, coredump flags)
+ *   2. Write args to c2p regs 1-4
+ *   3. Write OUR command to c2p reg 0 (triggers interrupt)
+ *   4. Poll c2p reg 0 until 0 (payload acknowledges)
+ *   5. Clean up DECI5S state
+ *
+ * Returns 0 on success, -1 on timeout.
+ */
+int deci5s_send_cmd(uint32_t cmd, uint32_t arg1, uint32_t arg2,
+                    uint32_t arg3, uint32_t ack)
+{
+    if (!g_deci5s_init) return -1;
+
+    uint64_t orig = swap_auth_to_syscore();
+
+    int fd = open("/dev/mp4/dump", 0, 0);
+    if (fd < 0) {
+        restore_auth(orig);
+        return -1;
+    }
+
+    int kq = kqueue();
+    struct kevent ev;
+    EV_SET(&ev, fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+
+    /* Set coredump state — this enables the interrupt delivery hardware */
+    kernel_setint(g_state_addr, ~0x10U);
+    kernel_setint(g_flags_addr, 0x210);
+    kevent(kq, &ev, 1, NULL, 0, NULL);
+
+    /* Write a minimal DECI5S packet to the buffer (A53 will try to
+     * parse it, but our payload processes the command first and returns
+     * before the stock firmware's coredump handler runs) */
+    intptr_t va = kernel_getlong(g_buf_kva);
+    struct deci5s_hdr dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    dummy.magic = DECI5S_MAGIC;
+    dummy.self_size = sizeof(dummy);
+    dummy.packet_size = sizeof(dummy);
+    dummy.timestamp = sceKernelReadTsc();
+    kernel_copyin(&dummy, va, sizeof(dummy));
+
+    /* Write OUR command arguments to c2p regs 1-4 */
+    kernel_setint(g_bar2_kva + 0xf7000, arg1);  /* c2p reg 1 */
+    kernel_setint(g_bar2_kva + 0xf8000, arg2);  /* c2p reg 2 */
+    kernel_setint(g_bar2_kva + 0xf9000, arg3);  /* c2p reg 3 */
+
+    /* Update driver request counter (needed for the interrupt mechanism) */
+    uint32_t req = kernel_getint(g_softc + 0x160) + 1;
+    kernel_setint(g_softc + 0x160, req);
+    kernel_setint(g_softc + 0x164, cmd);
+
+    /* Write OUR command to c2p reg 0 — this triggers the A53 interrupt.
+     * The A53 IRQ handler fires, reads reg 0 = our cmd, and our hooked
+     * BL is_qaf -> thunk -> payload processes it. */
+    kernel_setint(g_bar2_kva + 0xf6000, cmd);
+
+    /* Poll c2p reg 0 for acknowledgment (payload clears it to 0) */
+    int timeout = 10000;
+    uint32_t val;
+    int result = -1;
+    while (timeout-- > 0) {
+        val = kernel_getint(g_bar2_kva + 0xf6000);
+        if (val == 0) {
+            result = 0;
+            break;
+        }
+    }
+
+    /* Clean up DECI5S state */
+    uint32_t ctx[] = {8, 0};
+    /* Don't wait for kevent — our payload command doesn't generate
+     * a coredump response. Just clean up immediately. */
+    ioctl(fd, IOCTL_FINISH, ctx);
+    close(kq);
+    close(fd);
+    restore_auth(orig);
+    return result;
+}
+
+/*
+ * Read c2p result register after a successful deci5s_send_cmd.
+ */
+uint32_t deci5s_get_result(int reg)
+{
+    if (!g_deci5s_init || reg < 1 || reg > 4) return 0;
+    return kernel_getint(g_bar2_kva + 0xf6000 + reg * 0x1000);
+}
+
+/*
  * Write A53 memory via DECI5S WRITE_MEMORY command.
  * The A53 processes this internally and writes to its own DRAM.
  * Max 64 bytes per call.
