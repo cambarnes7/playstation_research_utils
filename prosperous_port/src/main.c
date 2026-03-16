@@ -414,43 +414,41 @@ int prosperous_run(void)
             printf("[DIAG] DRAM[0] after PCD: 0x%08x (rc=%d)\n",
                    test_val, rc);
         } else {
-            /* PDPT present, not 1GB page - check and fix PD entries */
+            /* PDPT present, not 1GB page - check PD entries and fix only
+             * the single entry we need (PD[pd_idx] covering MP4_DRAM_BASE).
+             * Minimise page table modifications to avoid kernel panics from
+             * speculative accesses or TLB coherency issues on other cores. */
             uint64_t pd_pa = pdpte & 0xFFFFFFFFFF000ULL;
-            printf("[*] PDPT -> PD at PA 0x%lx, fixing NP entries...\n", pd_pa);
+            printf("[*] PDPT -> PD at PA 0x%lx\n", pd_pa);
 
-            /* Scan PD entries covering the DRAM range and create 2MB UC
-             * entries for any that are not present.
-             * PD base PA for this 1GB range = 0x40000000
-             * PD[0x100] = PA 0x60000000, PD[0x101] = 0x60200000, etc. */
-            uint32_t dram_pd_start = (uint32_t)((MP4_DRAM_BASE - 0x40000000ULL) >> 21);
-            /* Cover up to end of payload area (0x607F1000 + margin) */
-            uint32_t dram_pd_end = (uint32_t)(((MP4_DRAM_BASE + 0x800000ULL) - 0x40000000ULL) >> 21);
-            uint32_t created = 0;
-
-            for (uint32_t i = dram_pd_start; i <= dram_pd_end; i++) {
+            /* Dump a few entries for diagnostics */
+            for (int i = 0; i < 5; i++) {
                 uint64_t pde;
-                kernel_copyout(dmap + pd_pa + i * 8, &pde, 8);
+                kernel_copyout(dmap + pd_pa + (pd_idx + i) * 8, &pde, 8);
                 printf("[DIAG] PD[0x%x] = 0x%016lx %s\n",
-                       i, pde, (pde & 1) ? "P" : "NP");
-
-                if (!(pde & 1)) {
-                    /* Create 2MB UC entry for DRAM */
-                    uint64_t pa = 0x40000000ULL + (uint64_t)i * 0x200000ULL;
-                    uint64_t new_pde = pa |
-                                       (1ULL << 0) |  /* Present */
-                                       (1ULL << 1) |  /* RW */
-                                       (1ULL << 4) |  /* PCD (uncacheable) */
-                                       (1ULL << 5) |  /* Accessed */
-                                       (1ULL << 6) |  /* Dirty */
-                                       (1ULL << 7);   /* PS (2MB) */
-                    kernel_copyin(&new_pde, dmap + pd_pa + i * 8, 8);
-                    printf("[+] Created PD[0x%x] = 0x%016lx (2MB UC, PA 0x%lx)\n",
-                           i, new_pde, pa);
-                    created++;
-                }
+                       pd_idx + i, pde, (pde & 1) ? "P" : "NP");
             }
 
-            printf("[+] Created %u new PD entries for DRAM range\n", created);
+            /* Only create PD[pd_idx] (covers PA 0x60000000-0x601FFFFF)
+             * which has the thunk (0x600E0000), hook (0x60108BD4), and
+             * QAF flags (0x60123B74). Payload at 0x607F1000 is already
+             * in PD[0x103] which exists. */
+            uint64_t pde;
+            kernel_copyout(dmap + pd_pa + pd_idx * 8, &pde, 8);
+
+            if (!(pde & 1)) {
+                uint64_t target_pa = 0x40000000ULL + (uint64_t)pd_idx * 0x200000ULL;
+                uint64_t new_pde = target_pa |
+                                   (1ULL << 0) |  /* Present */
+                                   (1ULL << 1) |  /* RW */
+                                   (1ULL << 4) |  /* PCD (uncacheable) */
+                                   (1ULL << 5) |  /* Accessed */
+                                   (1ULL << 6) |  /* Dirty */
+                                   (1ULL << 7);   /* PS (2MB) */
+                kernel_copyin(&new_pde, dmap + pd_pa + pd_idx * 8, 8);
+                printf("[+] Created PD[0x%x] = 0x%016lx (2MB UC, PA 0x%lx)\n",
+                       pd_idx, new_pde, target_pa);
+            }
 
             /* Verify DRAM access works now */
             uint32_t test_val = 0xDEADDEAD;
