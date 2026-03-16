@@ -37,6 +37,7 @@ struct phys_rw_ctx {
     uint64_t ktext_base;    /* kernel .text base (DMAP VA) */
     uint64_t ktext_base_pa; /* kernel .text base PA */
     uint64_t kpml4_pa;      /* kernel PML4 physical address */
+    uint64_t proc_cr3;      /* process PML4 physical address */
 };
 
 /* TMR operations */
