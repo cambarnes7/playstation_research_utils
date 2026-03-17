@@ -167,72 +167,41 @@ static uint64_t pci_read_bar(uint64_t cfg_pa, int bar_idx)
     return ((uint64_t)hi << 32) | (lo & ~0xFULL);
 }
 
+/*
+ * Scan a PCI bus for a GPU (class 0x03). Returns 0 if found and sets g_gpu_bar0_pa.
+ */
+static int scan_bus_for_gpu(uint8_t bus)
+{
+    for (int dev = 0; dev < 32; dev++) {
+        uint64_t cfg = pci_cfg_addr(bus, dev, 0, 0);
+        uint32_t id = 0;
+        kernel_copyout(g_dmap_base + cfg, &id, 4);
+        if ((id & 0xFFFF) == 0 || (id & 0xFFFF) == 0xFFFF) continue;
+
+        uint32_t cr = 0;
+        kernel_copyout(g_dmap_base + cfg + 0x08, &cr, 4);
+        uint8_t base_class = (cr >> 24) & 0xFF;
+        printf("[GPU] PCI %d:%02d.0 %04x:%04x class=%02x/%02x\n",
+               bus, dev, id & 0xFFFF, id >> 16,
+               base_class, (cr >> 16) & 0xFF);
+
+        if (base_class == PCI_CLASS_GPU) {
+            g_gpu_bar0_pa = pci_read_bar(cfg, 0);
+            printf("[GPU] Found GPU! BAR0=0x%llx\n",
+                   (unsigned long long)g_gpu_bar0_pa);
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static int gpu_find(void)
 {
     printf("[GPU] Scanning for AMD GPU...\n");
 
-    /* === Strategy 1: Check bridge 00:01.1 (GFX bridge on Zen 2 APUs) === */
-    {
-        uint64_t bridge_cfg = pci_cfg_addr(0, 1, 1, 0);
-        uint32_t bridge_id = 0;
-        kernel_copyout(g_dmap_base + bridge_cfg, &bridge_id, 4);
-
-        if ((bridge_id & 0xFFFF) != 0 && (bridge_id & 0xFFFF) != 0xFFFF) {
-            /* Read secondary bus number (offset 0x19) */
-            uint32_t bus_nums = 0;
-            kernel_copyout(g_dmap_base + bridge_cfg + 0x18, &bus_nums, 4);
-            uint8_t sec_bus = (bus_nums >> 8) & 0xFF;
-            uint8_t sub_bus = (bus_nums >> 16) & 0xFF;
-
-            printf("[GPU] Bridge 00:01.1 (dev=0x%04x): sec_bus=%d sub_bus=%d\n",
-                   bridge_id >> 16, sec_bus, sub_bus);
-
-            /* Scan the secondary bus for GPU (class 0x03) */
-            if (sec_bus > 0) {
-                for (int dev = 0; dev < 32; dev++) {
-                    for (int fn = 0; fn < 8; fn++) {
-                        uint64_t cfg = pci_cfg_addr(sec_bus, dev, fn, 0);
-                        uint32_t id = 0;
-                        kernel_copyout(g_dmap_base + cfg, &id, 4);
-                        if ((id & 0xFFFF) == 0 || (id & 0xFFFF) == 0xFFFF) continue;
-
-                        uint32_t cr = 0;
-                        kernel_copyout(g_dmap_base + cfg + 0x08, &cr, 4);
-                        uint8_t base_class = (cr >> 24) & 0xFF;
-                        printf("[GPU] PCI %d:%02d.%d %04x:%04x class=%02x/%02x\n",
-                               sec_bus, dev, fn, id & 0xFFFF, id >> 16,
-                               base_class, (cr >> 16) & 0xFF);
-
-                        /* Log all BARs for diagnostics */
-                        for (int bar = 0; bar < 6; bar++) {
-                            uint32_t bv = 0;
-                            kernel_copyout(g_dmap_base + cfg + 0x10 + bar * 4, &bv, 4);
-                            if (bv != 0 && bv != 0xFFFFFFFF)
-                                printf("[GPU]   BAR%d raw=0x%08x\n", bar, bv);
-                        }
-
-                        if (base_class == PCI_CLASS_GPU) {
-                            g_gpu_bar0_pa = pci_read_bar(cfg, 0);
-                            if (g_gpu_bar0_pa != 0) {
-                                printf("[GPU] Found GPU! BAR0=0x%llx\n",
-                                       (unsigned long long)g_gpu_bar0_pa);
-                                return 0;
-                            }
-                        }
-
-                        /* Only check fn>0 if device is multi-function */
-                        if (fn == 0) {
-                            uint32_t hdr = 0;
-                            kernel_copyout(g_dmap_base + cfg + 0x0C, &hdr, 4);
-                            if (!((hdr >> 16) & 0x80)) break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /* === Strategy 2: Check bridge 00:08.1 (Internal GPP bridge) === */
+    /* === Strategy 1: Check bridge 00:08.1 (Internal GPP bridge) ===
+     * On PS5, the GPU (1002:13fb) is at 32:00.0 behind this bridge.
+     */
     {
         uint64_t bridge_cfg = pci_cfg_addr(0, 8, 1, 0);
         uint32_t bridge_id = 0;
@@ -242,50 +211,31 @@ static int gpu_find(void)
             uint32_t bus_nums = 0;
             kernel_copyout(g_dmap_base + bridge_cfg + 0x18, &bus_nums, 4);
             uint8_t sec_bus = (bus_nums >> 8) & 0xFF;
-            uint8_t sub_bus = (bus_nums >> 16) & 0xFF;
 
-            printf("[GPU] Bridge 00:08.1 (dev=0x%04x): sec_bus=%d sub_bus=%d\n",
-                   bridge_id >> 16, sec_bus, sub_bus);
+            printf("[GPU] Bridge 00:08.1 (dev=0x%04x): sec_bus=%d\n",
+                   bridge_id >> 16, sec_bus);
 
-            if (sec_bus > 0) {
-                for (int dev = 0; dev < 32; dev++) {
-                    for (int fn = 0; fn < 8; fn++) {
-                        uint64_t cfg = pci_cfg_addr(sec_bus, dev, fn, 0);
-                        uint32_t id = 0;
-                        kernel_copyout(g_dmap_base + cfg, &id, 4);
-                        if ((id & 0xFFFF) == 0 || (id & 0xFFFF) == 0xFFFF) continue;
+            if (sec_bus > 0 && scan_bus_for_gpu(sec_bus) == 0)
+                return 0;
+        }
+    }
 
-                        uint32_t cr = 0;
-                        kernel_copyout(g_dmap_base + cfg + 0x08, &cr, 4);
-                        uint8_t base_class = (cr >> 24) & 0xFF;
-                        printf("[GPU] PCI %d:%02d.%d %04x:%04x class=%02x/%02x\n",
-                               sec_bus, dev, fn, id & 0xFFFF, id >> 16,
-                               base_class, (cr >> 16) & 0xFF);
+    /* === Strategy 2: Check bridge 00:01.1 (GFX bridge, has I/O devices) === */
+    {
+        uint64_t bridge_cfg = pci_cfg_addr(0, 1, 1, 0);
+        uint32_t bridge_id = 0;
+        kernel_copyout(g_dmap_base + bridge_cfg, &bridge_id, 4);
 
-                        for (int bar = 0; bar < 6; bar++) {
-                            uint32_t bv = 0;
-                            kernel_copyout(g_dmap_base + cfg + 0x10 + bar * 4, &bv, 4);
-                            if (bv != 0 && bv != 0xFFFFFFFF)
-                                printf("[GPU]   BAR%d raw=0x%08x\n", bar, bv);
-                        }
+        if ((bridge_id & 0xFFFF) != 0 && (bridge_id & 0xFFFF) != 0xFFFF) {
+            uint32_t bus_nums = 0;
+            kernel_copyout(g_dmap_base + bridge_cfg + 0x18, &bus_nums, 4);
+            uint8_t sec_bus = (bus_nums >> 8) & 0xFF;
 
-                        if (base_class == PCI_CLASS_GPU) {
-                            g_gpu_bar0_pa = pci_read_bar(cfg, 0);
-                            if (g_gpu_bar0_pa != 0) {
-                                printf("[GPU] Found GPU! BAR0=0x%llx\n",
-                                       (unsigned long long)g_gpu_bar0_pa);
-                                return 0;
-                            }
-                        }
+            printf("[GPU] Bridge 00:01.1 (dev=0x%04x): sec_bus=%d\n",
+                   bridge_id >> 16, sec_bus);
 
-                        if (fn == 0) {
-                            uint32_t hdr = 0;
-                            kernel_copyout(g_dmap_base + cfg + 0x0C, &hdr, 4);
-                            if (!((hdr >> 16) & 0x80)) break;
-                        }
-                    }
-                }
-            }
+            if (sec_bus > 0 && scan_bus_for_gpu(sec_bus) == 0)
+                return 0;
         }
     }
 
