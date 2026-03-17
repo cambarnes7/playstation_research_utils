@@ -142,7 +142,9 @@ static int gpu_find(void)
     printf("[GPU] Scanning PCI ECAM (base 0x%llx) for AMD GPU...\n",
            (unsigned long long)MMCFG_BASE);
 
-    for (int bus = 0; bus < 8; bus++) {
+    /* First pass: enumerate ALL devices to find GPU */
+    int found_any = 0;
+    for (int bus = 0; bus < 16; bus++) {
         for (int dev = 0; dev < 32; dev++) {
             for (int fn = 0; fn < 8; fn++) {
                 uint64_t cfg = pci_cfg_addr(bus, dev, fn, 0);
@@ -150,43 +152,84 @@ static int gpu_find(void)
                 uint32_t id = 0;
                 kernel_copyout(g_dmap_base + cfg, &id, 4);
                 uint16_t vendor = id & 0xFFFF;
+                uint16_t device = id >> 16;
                 if (vendor == 0xFFFF || vendor == 0) continue;
 
                 uint32_t class_rev = 0;
                 kernel_copyout(g_dmap_base + cfg + 0x08, &class_rev, 4);
                 uint8_t base_class = (class_rev >> 24) & 0xFF;
+                uint8_t sub_class = (class_rev >> 16) & 0xFF;
 
-                /* Log all AMD devices */
-                if (vendor == PCI_VENDOR_AMD) {
-                    printf("[GPU] PCI %d:%02d.%d AMD dev=0x%04x class=0x%02x\n",
-                           bus, dev, fn, id >> 16, base_class);
+                /* Log every device for diagnostics */
+                printf("[PCI] %02d:%02d.%d %04x:%04x class=%02x/%02x",
+                       bus, dev, fn, vendor, device, base_class, sub_class);
+
+                /* Check for GPU: class 0x03 (display) with any vendor,
+                 * or AMD vendor 0x1002/0x1022 with VGA/3D class */
+                int is_gpu = 0;
+                if (base_class == PCI_CLASS_GPU) {
+                    is_gpu = 1;
+                    printf(" <-- DISPLAY");
                 }
 
-                if (vendor != PCI_VENDOR_AMD || base_class != PCI_CLASS_GPU)
-                    continue;
+                /* Read BARs for GPU devices */
+                if (is_gpu) {
+                    found_any = 1;
+                    printf("\n");
 
-                printf("[GPU] Found GPU at %d:%02d.%d (dev=0x%04x)\n",
-                       bus, dev, fn, id >> 16);
+                    for (int bar = 0; bar < 6; bar++) {
+                        uint32_t lo = 0, hi = 0;
+                        kernel_copyout(g_dmap_base + cfg + 0x10 + bar * 4,
+                                       &lo, 4);
+                        if ((lo & 0x6) == 0x4 && bar < 5) {
+                            kernel_copyout(g_dmap_base + cfg + 0x14 + bar * 4,
+                                           &hi, 4);
+                            uint64_t addr = ((uint64_t)hi << 32) |
+                                            (lo & ~0xFULL);
+                            printf("[PCI]   BAR%d = 0x%llx (64-bit)\n",
+                                   bar, (unsigned long long)addr);
+                            if (bar == 0 && addr != 0) {
+                                g_gpu_bar0_pa = addr;
+                            }
+                            bar++; /* skip hi half */
+                        } else if (lo & 1) {
+                            printf("[PCI]   BAR%d = 0x%x (I/O)\n",
+                                   bar, lo & ~0x3);
+                        } else if (lo) {
+                            uint64_t addr = lo & ~0xFULL;
+                            printf("[PCI]   BAR%d = 0x%llx (32-bit)\n",
+                                   bar, (unsigned long long)addr);
+                            if (bar == 0 && addr != 0 && g_gpu_bar0_pa == 0) {
+                                g_gpu_bar0_pa = addr;
+                            }
+                        }
+                    }
 
-                /* Read BAR0 (64-bit MMIO) */
-                uint32_t bar0_lo = 0, bar0_hi = 0;
-                kernel_copyout(g_dmap_base + cfg + 0x10, &bar0_lo, 4);
-                if ((bar0_lo & 0x6) == 0x4)
-                    kernel_copyout(g_dmap_base + cfg + 0x14, &bar0_hi, 4);
-
-                g_gpu_bar0_pa = ((uint64_t)bar0_hi << 32) | (bar0_lo & ~0xFULL);
-                printf("[GPU] BAR0 = 0x%llx\n", (unsigned long long)g_gpu_bar0_pa);
-
-                if (g_gpu_bar0_pa == 0) {
-                    printf("[!] GPU: BAR0 is zero\n");
-                    continue;
+                    if (g_gpu_bar0_pa != 0) {
+                        printf("[GPU] Using BAR0 = 0x%llx\n",
+                               (unsigned long long)g_gpu_bar0_pa);
+                        return 0;
+                    }
+                } else {
+                    printf("\n");
                 }
-                return 0;
+
+                /* Skip to next device if fn0 has no multi-function bit */
+                if (fn == 0) {
+                    uint32_t hdr_type = 0;
+                    kernel_copyout(g_dmap_base + cfg + 0x0C, &hdr_type, 4);
+                    if (!((hdr_type >> 16) & 0x80))
+                        break; /* not multi-function, skip fn 1-7 */
+                }
             }
         }
     }
 
-    printf("[!] GPU: No AMD display controller found\n");
+    if (!found_any)
+        printf("[!] GPU: No display controller (class 0x03) found on any bus\n");
+    else
+        printf("[!] GPU: Found display device but BAR0 is zero\n");
+
     return -1;
 }
 
