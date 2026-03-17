@@ -321,6 +321,55 @@ int deci5s_read_mem(uint64_t a53_pa, void *dst, uint32_t len)
 }
 
 /*
+ * Read from an A53 EL3 VA using DECI5S (EL3_VA_TO_EL3_VA access type).
+ *
+ * Unlike deci5s_read (PA_TO_EL3_VA), this passes the address directly as a VA.
+ * Used to trigger SYSHUB violations: the A53 reads from an unmapped SYSHUB VA
+ * (e.g., 0x70000000), which passes the EL3 MMU but fails at the SYSHUB TLB,
+ * generating GIC IRQ 33.
+ *
+ * Returns: bytes read on success, or negative on error/timeout.
+ * When used as a SYSHUB trigger, this will likely timeout (the A53 longjmps
+ * out of the read handler), which is expected — the side effect is the goal.
+ */
+int deci5s_read_el3_va(uint64_t el3_va, void *dst, uint32_t len)
+{
+    if (!g_deci5s_init) return -1;
+
+    struct {
+        struct deci5s_cmd_hdr h;
+        struct { uint32_t ss, ts, ty; uint32_t p[4]; uint32_t na; } c;
+        struct deci5s_mem_arg a;
+    } pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.h.header.magic        = DECI5S_MAGIC;
+    pkt.h.header.self_size    = sizeof(struct deci5s_hdr);
+    pkt.h.header.packet_size  = sizeof(pkt);
+    pkt.h.header.src          = DECI5S_SRC_KERNEL;
+    pkt.h.header.dst          = DECI5S_DST_MP4;
+    pkt.h.header.protocol_id  = DECI5S_PROTO_SDBGP;
+    pkt.h.dcmp                = DECI5S_DCMP;
+    pkt.h.code                = DECI5S_CODE;
+    pkt.h.num_commands        = 1;
+    pkt.c.ss                  = sizeof(pkt.c);
+    pkt.c.ts                  = sizeof(pkt.c) + sizeof(struct deci5s_mem_arg);
+    pkt.c.ty                  = SDBGP_READ_MEMORY;
+    pkt.c.na                  = 1;
+    pkt.a.self_size           = sizeof(struct deci5s_mem_arg);
+    pkt.a.access_size_and_type = mp4_mem_arg_pack(4, MP4_MEM_EL3_VA_TO_EL3_VA);
+    pkt.a.addr                = el3_va;
+    pkt.a.size                = len;
+
+    intptr_t va = kernel_getlong(g_buf_kva);
+    int ret = deci5s_send(&pkt.h.header, sizeof(pkt), NULL, 0);
+    if (ret != 0) return ret;
+    int64_t nr = (int64_t)kernel_getlong(va + 0xf8);
+    if (nr > 0 && dst)
+        kernel_copyout(va + 0x108, dst, len);
+    return (int)nr;
+}
+
+/*
  * Write a buffer to A53 memory in 64-byte chunks via DECI5S.
  */
 static int deci5s_write_buf(uint64_t a53_pa, const void *buf, uint32_t total_len)

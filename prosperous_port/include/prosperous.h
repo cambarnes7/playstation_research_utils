@@ -57,6 +57,9 @@ uint32_t deci5s_get_result(int reg);
 /* DECI5S memory read (for diagnostics from main.c) */
 int deci5s_read_mem(uint64_t a53_pa, void *dst, uint32_t len);
 
+/* DECI5S read from EL3 VA (for triggering SYSHUB violations) */
+int deci5s_read_el3_va(uint64_t el3_va, void *dst, uint32_t len);
+
 /* MP4 payload operations */
 int mp4_inject_payload(struct phys_rw_ctx *ctx);
 int mp4_send_command(struct phys_rw_ctx *ctx, uint32_t cmd,

