@@ -667,23 +667,35 @@ int deci5s_inject_payload(struct phys_rw_ctx *ctx)
            verify, *(const uint32_t *)mp4_thunk_bin,
            verify == *(const uint32_t *)mp4_thunk_bin ? "OK" : "MISMATCH");
 
-    /* Diagnostic: check if thunk has fired by reading TLB34 sub_page_rw.
-     * The verify reads above used DECI5S, which triggers the IRQ handler.
-     * If the hook is active, the thunk writes 0xFFFFFFFF to 0x03230464.
-     * NOTE: This read itself triggers the IRQ handler too. */
-    uint32_t tlb34_rw = 0;
-    deci5s_read(SYSHUB_TLB_REG_BASE + SYSHUB_TLB_SUB_PAGE_RW_OFF + 33 * 4,
-                &tlb34_rw, 4);
-    printf("[DECI5S] TLB34 sub_page_rw: 0x%08x (0xFFFFFFFF = thunk active)\n",
-           tlb34_rw);
-
-    /* Also verify first 4 bytes of payload at new location */
+    /* Verify payload at new address (DRAM only — DO NOT read MMIO via DECI5S,
+     * PA_TO_EL3_VA doesn't handle MMIO and will crash the A53) */
     uint32_t payload_verify = 0;
     deci5s_read(A53_DRAM_PA_BASE + MP4_PAYLOAD_OFFSET, &payload_verify, 4);
     printf("[DECI5S] Payload[0] at PA 0x%llx: 0x%08x (expect 0x%08x) %s\n",
            (unsigned long long)(A53_DRAM_PA_BASE + MP4_PAYLOAD_OFFSET),
            payload_verify, *(const uint32_t *)mp4_payload_bin,
            payload_verify == *(const uint32_t *)mp4_payload_bin ? "OK" : "MISMATCH");
+
+    /* Dump firmware code around hook site to analyze the QA code path.
+     * After is_qaf returns 1 (QAF flag is set), the handler enters QA-specific
+     * processing. We need to understand this path to find a DATA-based hook
+     * (code patches don't work due to I-cache coherency). */
+    printf("[DECI5S] Dumping firmware around hook site 0x%x...\n", A53_HOOK_ADDR);
+    uint32_t fw_dump[64]; /* 256 bytes = 64 instructions */
+    uint64_t dump_start = A53_DRAM_PA_BASE + (A53_HOOK_ADDR - A53_ELF_BASE) - 64;
+    memset(fw_dump, 0, sizeof(fw_dump));
+    /* Read in 32-byte chunks (8 words) to stay under 64-byte DECI5S limit */
+    for (int i = 0; i < 8; i++) {
+        deci5s_read(dump_start + i * 32, &fw_dump[i * 8], 32);
+    }
+    uint32_t hook_va_start = A53_HOOK_ADDR - 64;
+    for (int i = 0; i < 64; i++) {
+        uint32_t va = hook_va_start + i * 4;
+        const char *marker = "";
+        if (va == A53_HOOK_ADDR) marker = " <-- HOOK (BL is_qaf)";
+        if (fw_dump[i] != 0)
+            printf("[FW] 0x%06x: %08x%s\n", va, fw_dump[i], marker);
+    }
 
     printf("[+] DECI5S: Payload injection complete\n");
     return 0;
