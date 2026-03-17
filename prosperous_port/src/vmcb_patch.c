@@ -32,6 +32,7 @@
 #include <sys/mman.h>
 #include <ps5/kernel.h>
 #include "prosperous.h"
+#include "pci.h"
 
 /* Number of vCPU contexts to patch */
 #define MAX_VCPUS   16
@@ -40,8 +41,7 @@
 #define VCPU_CTX_SIZE       0x320
 #define VCPU_CTX_VMCB_OFF   0x08
 
-/* PCI ECAM for GPU discovery */
-#define GPU_ECAM_BASE   0xE0000000ULL
+/* PCI for GPU discovery */
 #define PCI_VENDOR_AMD  0x1002
 #define PCI_CLASS_GPU   0x03
 
@@ -139,24 +139,33 @@ static uint64_t va_to_pa(uint64_t va)
 
 static int gpu_find(void)
 {
-    printf("[GPU] Scanning PCI ECAM for AMD GPU...\n");
+    printf("[GPU] Scanning PCI ECAM (base 0x%llx) for AMD GPU...\n",
+           (unsigned long long)MMCFG_BASE);
 
-    for (int bus = 0; bus < 3; bus++) {
+    for (int bus = 0; bus < 8; bus++) {
         for (int dev = 0; dev < 32; dev++) {
             for (int fn = 0; fn < 8; fn++) {
-                uint64_t cfg = GPU_ECAM_BASE +
-                    ((uint64_t)bus << 20) + ((uint64_t)dev << 15) +
-                    ((uint64_t)fn << 12);
+                uint64_t cfg = pci_cfg_addr(bus, dev, fn, 0);
 
                 uint32_t id = 0;
                 kernel_copyout(g_dmap_base + cfg, &id, 4);
-                if ((id & 0xFFFF) != PCI_VENDOR_AMD) continue;
+                uint16_t vendor = id & 0xFFFF;
+                if (vendor == 0xFFFF || vendor == 0) continue;
 
                 uint32_t class_rev = 0;
                 kernel_copyout(g_dmap_base + cfg + 0x08, &class_rev, 4);
-                if (((class_rev >> 24) & 0xFF) != PCI_CLASS_GPU) continue;
+                uint8_t base_class = (class_rev >> 24) & 0xFF;
 
-                printf("[GPU] Found at %d:%02d.%d (dev=0x%04x)\n",
+                /* Log all AMD devices */
+                if (vendor == PCI_VENDOR_AMD) {
+                    printf("[GPU] PCI %d:%02d.%d AMD dev=0x%04x class=0x%02x\n",
+                           bus, dev, fn, id >> 16, base_class);
+                }
+
+                if (vendor != PCI_VENDOR_AMD || base_class != PCI_CLASS_GPU)
+                    continue;
+
+                printf("[GPU] Found GPU at %d:%02d.%d (dev=0x%04x)\n",
                        bus, dev, fn, id >> 16);
 
                 /* Read BAR0 (64-bit MMIO) */
