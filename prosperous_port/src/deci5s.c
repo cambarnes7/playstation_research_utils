@@ -370,6 +370,41 @@ int deci5s_read_el3_va(uint64_t el3_va, void *dst, uint32_t len)
 }
 
 /*
+ * Write to an A53 EL3 VA using DECI5S (EL3_VA_TO_EL3_VA access type).
+ * Used for writing SYSHUB TLB control registers and VMCB data.
+ * Max 64 bytes per call.
+ */
+int deci5s_write_el3_va(uint64_t el3_va, const void *src, uint32_t len)
+{
+    if (!g_deci5s_init || len == 0 || len > 64) return -1;
+
+    struct {
+        struct deci5s_cmd_hdr h;
+        struct { uint32_t ss, ts, ty; uint32_t p0[5]; uint32_t na; uint32_t p1; } c;
+        struct deci5s_mem_arg a;
+    } pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.h.header.magic        = DECI5S_MAGIC;
+    pkt.h.header.self_size    = sizeof(struct deci5s_hdr);
+    pkt.h.header.packet_size  = sizeof(pkt) + len;
+    pkt.h.header.src          = DECI5S_SRC_KERNEL;
+    pkt.h.header.dst          = DECI5S_DST_MP4;
+    pkt.h.header.protocol_id  = DECI5S_PROTO_SDBGP;
+    pkt.h.dcmp                = DECI5S_DCMP;
+    pkt.h.code                = DECI5S_CODE;
+    pkt.h.num_commands        = 1;
+    pkt.c.ss                  = sizeof(pkt.c);
+    pkt.c.ts                  = sizeof(pkt.c) + sizeof(struct deci5s_mem_arg);
+    pkt.c.ty                  = SDBGP_WRITE_MEMORY;
+    pkt.c.na                  = 1;
+    pkt.a.self_size           = sizeof(struct deci5s_mem_arg);
+    pkt.a.access_size_and_type = mp4_mem_arg_pack(4, MP4_MEM_EL3_VA_TO_EL3_VA);
+    pkt.a.addr                = el3_va;
+    pkt.a.size                = len;
+    return deci5s_send(&pkt.h.header, sizeof(pkt) + len, src, len);
+}
+
+/*
  * Write a buffer to A53 memory in 64-byte chunks via DECI5S.
  */
 static int deci5s_write_buf(uint64_t a53_pa, const void *buf, uint32_t total_len)
@@ -619,12 +654,13 @@ static int deci5s_init_state(void)
  * A53 PA = 0x88000000 + DRAM_offset
  * (where DRAM_offset = x86_PA - 0x60000000)
  */
-/* Pre-compiled MP4 payload binary (same as in mp4_inject.c) */
-extern const unsigned char mp4_payload_bin[];
-extern const unsigned int mp4_payload_bin_len;
-
-int deci5s_inject_payload(struct phys_rw_ctx *ctx)
+/*
+ * Initialize DECI5S communication (find MP4 device, start coredump session).
+ * Must be called before any deci5s_read/write operations.
+ */
+int deci5s_init(struct phys_rw_ctx *ctx)
 {
+    (void)ctx;
     int ret;
 
     printf("[*] DECI5S: Finding MP4 device...\n");
@@ -639,6 +675,34 @@ int deci5s_inject_payload(struct phys_rw_ctx *ctx)
     if (ret != 0) {
         printf("[!] DECI5S: Init failed: %d\n", ret);
         return ret;
+    }
+
+    /* Verify: read ELF magic from A53 DRAM */
+    uint32_t elf_magic = 0;
+    ret = deci5s_read(A53_DRAM_PA_BASE + 0x100000, &elf_magic, 4);
+    printf("[DECI5S] Read A53 PA 0x88100000: 0x%08x (ret=%d) %s\n",
+           elf_magic, ret, elf_magic == 0x464C457F ? "ELF magic OK" : "");
+    if (elf_magic != 0x464C457F) {
+        printf("[!] DECI5S: Cannot read A53 ELF — aborting\n");
+        return -1;
+    }
+
+    printf("[+] DECI5S initialized\n");
+    return 0;
+}
+
+/* Pre-compiled MP4 payload binary (same as in mp4_inject.c) */
+extern const unsigned char mp4_payload_bin[];
+extern const unsigned int mp4_payload_bin_len;
+
+int deci5s_inject_payload(struct phys_rw_ctx *ctx)
+{
+    int ret;
+
+    /* Ensure DECI5S is initialized */
+    if (!g_deci5s_init) {
+        ret = deci5s_init(ctx);
+        if (ret != 0) return ret;
     }
 
     /* Test: read ELF magic from A53 DRAM to verify DECI5S works */

