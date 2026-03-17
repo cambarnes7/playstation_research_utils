@@ -187,25 +187,45 @@ static int gpu_find(void)
             printf("[GPU] Bridge 00:01.1 (dev=0x%04x): sec_bus=%d sub_bus=%d\n",
                    bridge_id >> 16, sec_bus, sub_bus);
 
-            /* Scan the secondary bus for the GPU */
+            /* Scan the secondary bus for GPU (class 0x03) */
             if (sec_bus > 0) {
                 for (int dev = 0; dev < 32; dev++) {
-                    uint64_t cfg = pci_cfg_addr(sec_bus, dev, 0, 0);
-                    uint32_t id = 0;
-                    kernel_copyout(g_dmap_base + cfg, &id, 4);
-                    if ((id & 0xFFFF) == 0 || (id & 0xFFFF) == 0xFFFF) continue;
+                    for (int fn = 0; fn < 8; fn++) {
+                        uint64_t cfg = pci_cfg_addr(sec_bus, dev, fn, 0);
+                        uint32_t id = 0;
+                        kernel_copyout(g_dmap_base + cfg, &id, 4);
+                        if ((id & 0xFFFF) == 0 || (id & 0xFFFF) == 0xFFFF) continue;
 
-                    uint32_t cr = 0;
-                    kernel_copyout(g_dmap_base + cfg + 0x08, &cr, 4);
-                    printf("[GPU] PCI %d:%02d.0 %04x:%04x class=%02x/%02x\n",
-                           sec_bus, dev, id & 0xFFFF, id >> 16,
-                           (cr >> 24) & 0xFF, (cr >> 16) & 0xFF);
+                        uint32_t cr = 0;
+                        kernel_copyout(g_dmap_base + cfg + 0x08, &cr, 4);
+                        uint8_t base_class = (cr >> 24) & 0xFF;
+                        printf("[GPU] PCI %d:%02d.%d %04x:%04x class=%02x/%02x\n",
+                               sec_bus, dev, fn, id & 0xFFFF, id >> 16,
+                               base_class, (cr >> 16) & 0xFF);
 
-                    g_gpu_bar0_pa = pci_read_bar(cfg, 0);
-                    if (g_gpu_bar0_pa != 0) {
-                        printf("[GPU] BAR0 = 0x%llx (from bridge secondary bus)\n",
-                               (unsigned long long)g_gpu_bar0_pa);
-                        return 0;
+                        /* Log all BARs for diagnostics */
+                        for (int bar = 0; bar < 6; bar++) {
+                            uint32_t bv = 0;
+                            kernel_copyout(g_dmap_base + cfg + 0x10 + bar * 4, &bv, 4);
+                            if (bv != 0 && bv != 0xFFFFFFFF)
+                                printf("[GPU]   BAR%d raw=0x%08x\n", bar, bv);
+                        }
+
+                        if (base_class == PCI_CLASS_GPU) {
+                            g_gpu_bar0_pa = pci_read_bar(cfg, 0);
+                            if (g_gpu_bar0_pa != 0) {
+                                printf("[GPU] Found GPU! BAR0=0x%llx\n",
+                                       (unsigned long long)g_gpu_bar0_pa);
+                                return 0;
+                            }
+                        }
+
+                        /* Only check fn>0 if device is multi-function */
+                        if (fn == 0) {
+                            uint32_t hdr = 0;
+                            kernel_copyout(g_dmap_base + cfg + 0x0C, &hdr, 4);
+                            if (!((hdr >> 16) & 0x80)) break;
+                        }
                     }
                 }
             }
@@ -222,61 +242,124 @@ static int gpu_find(void)
             uint32_t bus_nums = 0;
             kernel_copyout(g_dmap_base + bridge_cfg + 0x18, &bus_nums, 4);
             uint8_t sec_bus = (bus_nums >> 8) & 0xFF;
+            uint8_t sub_bus = (bus_nums >> 16) & 0xFF;
 
-            printf("[GPU] Bridge 00:08.1 (dev=0x%04x): sec_bus=%d\n",
-                   bridge_id >> 16, sec_bus);
+            printf("[GPU] Bridge 00:08.1 (dev=0x%04x): sec_bus=%d sub_bus=%d\n",
+                   bridge_id >> 16, sec_bus, sub_bus);
 
             if (sec_bus > 0) {
                 for (int dev = 0; dev < 32; dev++) {
-                    uint64_t cfg = pci_cfg_addr(sec_bus, dev, 0, 0);
-                    uint32_t id = 0;
-                    kernel_copyout(g_dmap_base + cfg, &id, 4);
-                    if ((id & 0xFFFF) == 0 || (id & 0xFFFF) == 0xFFFF) continue;
+                    for (int fn = 0; fn < 8; fn++) {
+                        uint64_t cfg = pci_cfg_addr(sec_bus, dev, fn, 0);
+                        uint32_t id = 0;
+                        kernel_copyout(g_dmap_base + cfg, &id, 4);
+                        if ((id & 0xFFFF) == 0 || (id & 0xFFFF) == 0xFFFF) continue;
 
-                    uint32_t cr = 0;
-                    kernel_copyout(g_dmap_base + cfg + 0x08, &cr, 4);
-                    printf("[GPU] PCI %d:%02d.0 %04x:%04x class=%02x/%02x\n",
-                           sec_bus, dev, id & 0xFFFF, id >> 16,
-                           (cr >> 24) & 0xFF, (cr >> 16) & 0xFF);
+                        uint32_t cr = 0;
+                        kernel_copyout(g_dmap_base + cfg + 0x08, &cr, 4);
+                        uint8_t base_class = (cr >> 24) & 0xFF;
+                        printf("[GPU] PCI %d:%02d.%d %04x:%04x class=%02x/%02x\n",
+                               sec_bus, dev, fn, id & 0xFFFF, id >> 16,
+                               base_class, (cr >> 16) & 0xFF);
 
-                    g_gpu_bar0_pa = pci_read_bar(cfg, 0);
-                    if (g_gpu_bar0_pa != 0) {
-                        printf("[GPU] BAR0 = 0x%llx (from GPP bridge)\n",
-                               (unsigned long long)g_gpu_bar0_pa);
-                        return 0;
+                        for (int bar = 0; bar < 6; bar++) {
+                            uint32_t bv = 0;
+                            kernel_copyout(g_dmap_base + cfg + 0x10 + bar * 4, &bv, 4);
+                            if (bv != 0 && bv != 0xFFFFFFFF)
+                                printf("[GPU]   BAR%d raw=0x%08x\n", bar, bv);
+                        }
+
+                        if (base_class == PCI_CLASS_GPU) {
+                            g_gpu_bar0_pa = pci_read_bar(cfg, 0);
+                            if (g_gpu_bar0_pa != 0) {
+                                printf("[GPU] Found GPU! BAR0=0x%llx\n",
+                                       (unsigned long long)g_gpu_bar0_pa);
+                                return 0;
+                            }
+                        }
+
+                        if (fn == 0) {
+                            uint32_t hdr = 0;
+                            kernel_copyout(g_dmap_base + cfg + 0x0C, &hdr, 4);
+                            if (!((hdr >> 16) & 0x80)) break;
+                        }
                     }
                 }
             }
         }
     }
 
-    /* === Strategy 3: Read GPU BAR0 from NBIO registers via SMN ===
+    /* === Strategy 3: Read GPU registers via SMN ===
      *
-     * On AMD APUs, the GPU's BAR0 address can be read from NBIO
-     * BIF (Bus Interface) registers through the SMN fabric.
-     * Try several known NBIO register addresses.
+     * On PS5's Oberon APU, the GPU is tightly integrated and may not
+     * appear as a standard PCI device. GPU registers are accessible
+     * via SMN (System Management Network) at known base addresses.
+     *
+     * Key insight: We don't necessarily need BAR0 PA. If we can access
+     * GPU SDMA registers directly via SMN, we can skip BAR0 entirely.
+     * The SDMA engine on RDNA2 has SMN addresses in the 0x00012xxx-0x00013xxx
+     * range, and GC (Graphics Core) in the 0x00028xxx range.
+     *
+     * Also probe NBIO BIF for BAR configuration.
      */
-    printf("[GPU] Probing NBIO via SMN for GPU BAR0...\n");
+    printf("[GPU] Probing GPU registers via SMN...\n");
     {
-        /* NBIO BIF register candidates for BAR0 address */
-        struct { uint32_t smn_addr; const char *name; } nbio_regs[] = {
+        struct { uint32_t smn_addr; const char *name; } smn_regs[] = {
+            /* NBIO BIF - BAR configuration */
             { 0x00100010, "BIF_BX0_PCIE_BAR0_CNTL" },
             { 0x00100020, "BIF_BX0_PCIE_BAR0_ADDR_LO" },
             { 0x00100024, "BIF_BX0_PCIE_BAR0_ADDR_HI" },
-            { 0x000100A0, "BIF_BX0_GPU_BAR0" },
-            { 0x000100A4, "BIF_BX0_GPU_BAR0_HI" },
-            /* Alternative NBIO offsets used by some AMD APUs */
-            { 0x00010420, "BIF_BX1_BAR0_LO" },
-            { 0x00010424, "BIF_BX1_BAR0_HI" },
-            { 0x00013800, "SDMA0_cntl (SMN)" },
-            { 0x00012600, "SDMA0_alt (SMN)" },
+            { 0x000100A0, "BIF_BX0_GPU_HDP_FLUSH_REQ" },
+            { 0x000100A4, "BIF_BX0_GPU_HDP_FLUSH_DONE" },
+            /* NBIO BIF - device ID / revision */
+            { 0x00100000, "BIF_BX0_PCIE_VENDOR_ID" },
+            { 0x00100008, "BIF_BX0_PCIE_REV_CLASS" },
+            /* GC (Graphics Core) block via SMN */
+            { 0x00028000, "GC_GRBM_STATUS" },
+            { 0x00028004, "GC_GRBM_STATUS_SE0" },
+            { 0x00028008, "GC_GRBM_STATUS2" },
+            { 0x00028040, "GC_GRBM_STATUS_SE1" },
+            /* GPU identity registers */
+            { 0x0000A000, "GPU_HW_ID" },
+            { 0x0000D000, "GC_CAC_ID" },
+            { 0x00030000, "GC_CONFIG" },
+            /* SDMA0 via SMN (Navi1x/2x known offsets) */
+            { 0x00012400, "SDMA0_UCODE_ADDR" },
+            { 0x00012404, "SDMA0_UCODE_DATA" },
+            { 0x00012580, "SDMA0_STATUS_REG (SMN)" },
+            { 0x00012600, "SDMA0_GFX_RB_CNTL (SMN)" },
+            { 0x00012604, "SDMA0_GFX_RB_BASE (SMN)" },
+            { 0x00012608, "SDMA0_GFX_RB_BASE_HI (SMN)" },
+            { 0x0001260C, "SDMA0_GFX_RB_RPTR (SMN)" },
+            { 0x00012614, "SDMA0_GFX_RB_WPTR (SMN)" },
+            /* SDMA0 alternate offsets (Navi2x shifted) */
+            { 0x00013200, "SDMA0_v2_STATUS_REG" },
+            { 0x00013280, "SDMA0_v2_GFX_RB_CNTL" },
+            { 0x00013284, "SDMA0_v2_GFX_RB_BASE" },
+            { 0x00013288, "SDMA0_v2_GFX_RB_BASE_HI" },
+            { 0x0001328C, "SDMA0_v2_GFX_RB_RPTR" },
+            { 0x00013294, "SDMA0_v2_GFX_RB_WPTR" },
+            /* MMHUB - memory controller hub (BAR aperture config) */
+            { 0x0003A000, "MMHUB_VM_FB_LOCATION_BASE" },
+            { 0x0003A004, "MMHUB_VM_FB_LOCATION_TOP" },
+            { 0x0003A010, "MMHUB_VM_FB_OFFSET" },
+            /* NBIO doorbell aperture */
+            { 0x000100C0, "BIF_BX0_DOORBELL_RANGE" },
+            { 0x000100C8, "BIF_BX0_DOORBELL_CTRL" },
         };
 
-        for (int i = 0; i < (int)(sizeof(nbio_regs)/sizeof(nbio_regs[0])); i++) {
-            uint32_t val = gpu_smn_read32(nbio_regs[i].smn_addr);
-            printf("[SMN] 0x%08x (%s) = 0x%08x\n",
-                   nbio_regs[i].smn_addr, nbio_regs[i].name, val);
+        for (int i = 0; i < (int)(sizeof(smn_regs)/sizeof(smn_regs[0])); i++) {
+            uint32_t val = gpu_smn_read32(smn_regs[i].smn_addr);
+            if (val != 0 && val != 0xFFFFFFFF)
+                printf("[SMN] 0x%08x (%s) = 0x%08x\n",
+                       smn_regs[i].smn_addr, smn_regs[i].name, val);
         }
+
+        /* Check BIF vendor/class to confirm GPU is present */
+        uint32_t bif_id = gpu_smn_read32(0x00100000);
+        uint32_t bif_class = gpu_smn_read32(0x00100008);
+        printf("[SMN] BIF vendor:device = %04x:%04x  class = %08x\n",
+               bif_id & 0xFFFF, bif_id >> 16, bif_class);
 
         /* Try to reconstruct BAR0 from BIF registers */
         uint32_t bar0_lo = gpu_smn_read32(0x00100020);
@@ -289,14 +372,12 @@ static int gpu_find(void)
             return 0;
         }
 
-        bar0_lo = gpu_smn_read32(0x000100A0);
-        bar0_hi = gpu_smn_read32(0x000100A4);
-        bar0 = ((uint64_t)bar0_hi << 32) | (bar0_lo & ~0xFULL);
-        if (bar0 != 0 && bar0 != 0xFFFFFFFFFFFFFFFFULL) {
-            printf("[GPU] BAR0 from GPU_BAR0 regs: 0x%llx\n",
-                   (unsigned long long)bar0);
-            g_gpu_bar0_pa = bar0;
-            return 0;
+        /* Check if GRBM is accessible via SMN — if so, the GPU is alive
+         * and we can potentially use SMN-based SDMA access instead of MMIO */
+        uint32_t grbm = gpu_smn_read32(0x00028000);
+        if (grbm != 0 && grbm != 0xFFFFFFFF) {
+            printf("[GPU] GRBM_STATUS via SMN: 0x%08x — GPU is alive!\n", grbm);
+            /* We'll try SMN-based SDMA access below */
         }
     }
 
@@ -341,7 +422,8 @@ static int gpu_find(void)
         }
     }
 
-    printf("[!] GPU: All discovery methods failed\n");
+    printf("[!] GPU: All PCI/MMIO discovery methods failed\n");
+    printf("[!] GPU: Will need SMN-based SDMA access (see SMN dump above)\n");
     return -1;
 }
 
