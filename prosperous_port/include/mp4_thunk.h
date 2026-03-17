@@ -11,7 +11,7 @@
  * The thunk:
  *   1. Sets SysHub TLB entry 34 sub_page_rw = 0xFFFFFFFF (enable access)
  *   2. Shuffles registers into _start(core, cmd, arg1, arg2, arg3) ABI
- *   3. Calls main payload at 0x887F1000 (G6 addr = DRAM+0x7F1000)
+ *   3. Calls main payload at 0x883F1000 (DRAM+0x3F1000)
  *   4. Returns 0 (command handled, skip firmware dispatch)
  *
  * Disassembly (16 instructions, 64 bytes):
@@ -26,7 +26,7 @@
  *   MOV  X3, X23                  ; c2p_arg2 → arg3
  *   MOV  X4, X22                  ; c2p_arg3 → arg4
  *   MOVZ X29, #0x1000             ; payload addr lo
- *   MOVK X29, #0x887F, LSL #16   ; payload addr hi (0x887F1000)
+ *   MOVK X29, #0x883F, LSL #16   ; payload addr hi (0x883F1000)
  *   BLR  X29                      ; call payload
  *   LDP  X29, X30, [SP], #0x10   ; restore frame
  *   MOV  W0, #0                   ; return 0 (handled)
@@ -44,7 +44,7 @@ static const unsigned char mp4_thunk_bin[] = {
     0xE3, 0x03, 0x17, 0xAA,  /* MOV  X3, X23  (arg2)          */
     0xE4, 0x03, 0x16, 0xAA,  /* MOV  X4, X22  (arg3)          */
     0x1D, 0x00, 0x82, 0xD2,  /* MOVZ X29, #0x1000             */
-    0xFD, 0x0F, 0xB1, 0xF2,  /* MOVK X29, #0x887F, LSL #16   */
+    0xFD, 0x07, 0xB1, 0xF2,  /* MOVK X29, #0x883F, LSL #16   */
     0xA0, 0x03, 0x3F, 0xD6,  /* BLR  X29                      */
     0xFD, 0x7B, 0xC1, 0xA8,  /* LDP  X29, X30, [SP], #0x10   */
     0x00, 0x00, 0x80, 0x52,  /* MOV  W0, #0                   */

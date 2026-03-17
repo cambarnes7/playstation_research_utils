@@ -81,9 +81,11 @@
 #define A53_ELF_BASE          0x100000   /* Base address of A53 ELF in DRAM */
 #define A53_QAF_FLAGS_OFF     0x123B74   /* dword_123B74: mm4p QAF flag in .data */
 
-/* Payload placement addresses (in MP4 DRAM, relative to 0x60000000) */
+/* Payload placement addresses (in MP4 DRAM, relative to 0x60000000)
+ * DRAM is ~5.875MB (0x5E0000 bytes), so all offsets must be < 0x5E0000.
+ * Firmware ELF occupies ~0x100000-0x140000, leaving 0x140000-0x5E0000 free. */
 #define MP4_THUNK_OFFSET      0xE0000   /* Thunk code: 0x600E0000 */
-#define MP4_PAYLOAD_OFFSET    0x7F1000  /* Main payload: 0x607F1000 */
+#define MP4_PAYLOAD_OFFSET    0x3F1000  /* Main payload: 0x603F1000 */
 
 struct mp4_access {
     uint64_t dmap_base;

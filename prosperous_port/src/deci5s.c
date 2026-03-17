@@ -211,10 +211,15 @@ int deci5s_send_cmd(uint32_t cmd, uint32_t arg1, uint32_t arg2,
         }
     }
 
+    /* Diagnostic: print reg state after command attempt */
+    uint32_t diag_c2p0 = kernel_getint(g_bar2_kva + 0xf6000);
+    uint32_t diag_c2p1 = kernel_getint(g_bar2_kva + 0xf7000);
+    printf("[DIAG] send_cmd(0x%08x): c2p[0]=0x%08x c2p[1]=0x%08x %s\n",
+           cmd, diag_c2p0, diag_c2p1,
+           result == 0 ? "OK" : "TIMEOUT");
+
     /* Clean up DECI5S state */
     uint32_t ctx[] = {8, 0};
-    /* Don't wait for kevent — our payload command doesn't generate
-     * a coredump response. Just clean up immediately. */
     ioctl(fd, IOCTL_FINISH, ctx);
     close(kq);
     close(fd);
@@ -661,6 +666,24 @@ int deci5s_inject_payload(struct phys_rw_ctx *ctx)
     printf("[DECI5S] Verify thunk[0]: 0x%08x (expect 0x%08x) %s\n",
            verify, *(const uint32_t *)mp4_thunk_bin,
            verify == *(const uint32_t *)mp4_thunk_bin ? "OK" : "MISMATCH");
+
+    /* Diagnostic: check if thunk has fired by reading TLB34 sub_page_rw.
+     * The verify reads above used DECI5S, which triggers the IRQ handler.
+     * If the hook is active, the thunk writes 0xFFFFFFFF to 0x03230464.
+     * NOTE: This read itself triggers the IRQ handler too. */
+    uint32_t tlb34_rw = 0;
+    deci5s_read(SYSHUB_TLB_REG_BASE + SYSHUB_TLB_SUB_PAGE_RW_OFF + 33 * 4,
+                &tlb34_rw, 4);
+    printf("[DECI5S] TLB34 sub_page_rw: 0x%08x (0xFFFFFFFF = thunk active)\n",
+           tlb34_rw);
+
+    /* Also verify first 4 bytes of payload at new location */
+    uint32_t payload_verify = 0;
+    deci5s_read(A53_DRAM_PA_BASE + MP4_PAYLOAD_OFFSET, &payload_verify, 4);
+    printf("[DECI5S] Payload[0] at PA 0x%llx: 0x%08x (expect 0x%08x) %s\n",
+           (unsigned long long)(A53_DRAM_PA_BASE + MP4_PAYLOAD_OFFSET),
+           payload_verify, *(const uint32_t *)mp4_payload_bin,
+           payload_verify == *(const uint32_t *)mp4_payload_bin ? "OK" : "MISMATCH");
 
     printf("[+] DECI5S: Payload injection complete\n");
     return 0;
