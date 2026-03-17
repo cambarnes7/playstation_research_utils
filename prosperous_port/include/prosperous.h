@@ -57,8 +57,9 @@ uint32_t deci5s_get_result(int reg);
 /* DECI5S initialization (must be called before any DECI5S operations) */
 int deci5s_init(struct phys_rw_ctx *ctx);
 
-/* DECI5S memory read (for diagnostics from main.c) */
+/* DECI5S memory read/write using PA_TO_EL3_VA (works for DRAM and identity-mapped MMIO) */
 int deci5s_read_mem(uint64_t a53_pa, void *dst, uint32_t len);
+int deci5s_write_mem(uint64_t a53_pa, const void *src, uint32_t len);
 
 /* DECI5S read/write using EL3 VA (for SYSHUB TLB registers and VMCB access) */
 int deci5s_read_el3_va(uint64_t el3_va, void *dst, uint32_t len);

