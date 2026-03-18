@@ -136,10 +136,12 @@ static uint32_t sdma_reg_to_smn(uint32_t reg_idx)
 
 static uint32_t gpu_read32(uint32_t reg_idx)
 {
-    uint32_t smn = sdma_reg_to_smn(reg_idx);
-    if (smn) return gpu_smn_read32(smn);
+    if (g_smn_sdma0_status) {
+        uint32_t smn = sdma_reg_to_smn(reg_idx);
+        if (smn) return gpu_smn_read32(smn);
+    }
 
-    /* Fallback to MMIO (will panic if BAR0 not NPT-mapped) */
+    /* MMIO via DMAP — works on 4.03 where NPT maps GPU BAR0 */
     uint32_t val = 0;
     kernel_copyout(g_dmap_base + g_gpu_bar0_pa + (uint64_t)reg_idx * 4,
                    &val, sizeof(val));
@@ -148,15 +150,18 @@ static uint32_t gpu_read32(uint32_t reg_idx)
 
 static void gpu_write32(uint32_t reg_idx, uint32_t val)
 {
-    uint32_t smn = sdma_reg_to_smn(reg_idx);
-    if (smn) {
-        uint64_t idx_kva = g_dmap_base + PCI_B0D0F0 + SMN_INDEX_OFFSET;
-        uint64_t dat_kva = g_dmap_base + PCI_B0D0F0 + SMN_DATA_OFFSET;
-        kernel_copyin(&smn, idx_kva, 4);
-        kernel_copyin(&val, dat_kva, 4);
-        return;
+    if (g_smn_sdma0_status) {
+        uint32_t smn = sdma_reg_to_smn(reg_idx);
+        if (smn) {
+            uint64_t idx_kva = g_dmap_base + PCI_B0D0F0 + SMN_INDEX_OFFSET;
+            uint64_t dat_kva = g_dmap_base + PCI_B0D0F0 + SMN_DATA_OFFSET;
+            kernel_copyin(&smn, idx_kva, 4);
+            kernel_copyin(&val, dat_kva, 4);
+            return;
+        }
     }
 
+    /* MMIO via DMAP */
     kernel_copyin(&val, g_dmap_base + g_gpu_bar0_pa + (uint64_t)reg_idx * 4,
                   sizeof(val));
 }
@@ -691,8 +696,11 @@ int vmcb_patch_disable_np(struct phys_rw_ctx *ctx)
             }
         }
         if (g_smn_sdma0_status == 0) {
-            printf("[!] No working SMN SDMA0 address found\n");
-            return -1;
+            printf("[GPU] No working SMN SDMA0 found — will use MMIO via BAR0\n");
+            if (g_gpu_bar0_pa == 0) {
+                printf("[!] No SMN SDMA0 and no BAR0 — cannot access SDMA\n");
+                return -1;
+            }
         }
     }
 
