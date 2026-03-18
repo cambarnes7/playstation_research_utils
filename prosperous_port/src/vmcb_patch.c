@@ -69,8 +69,9 @@
 #define regSDMA0_GFX_RB_WPTR_HI     (SDMA0_BASE + 0x86)
 #define regSDMA0_GFX_DOORBELL       (SDMA0_BASE + 0x92)
 
-/* Status register */
+/* Status and control registers */
 #define regSDMA0_STATUS_REG         (SDMA0_BASE + 0x08)
+#define regSDMA0_F32_CNTL           (SDMA0_BASE + 0x09)  /* bit 0 = HALT */
 
 /* SDMA opcodes */
 #define SDMA_OP_NOP     0
@@ -104,6 +105,7 @@ static uint32_t g_smn_sdma0_status;  /* SMN addr of SDMA0 STATUS */
 /* Offsets from g_smn_sdma0_status for other SDMA0 registers.
  * These are identical for both v1 (0x12580) and v2 (0x13200) layouts. */
 #define SMN_SDMA0_OFF_STATUS      0x00
+#define SMN_SDMA0_OFF_F32_CNTL    0x04
 #define SMN_SDMA0_OFF_RB_CNTL     0x80
 #define SMN_SDMA0_OFF_RB_BASE     0x84
 #define SMN_SDMA0_OFF_RB_BASE_HI  0x88
@@ -127,6 +129,7 @@ static uint32_t sdma_reg_to_smn(uint32_t reg_idx)
 {
     uint32_t off;
     if      (reg_idx == regSDMA0_STATUS_REG)    off = SMN_SDMA0_OFF_STATUS;
+    else if (reg_idx == regSDMA0_F32_CNTL)       off = SMN_SDMA0_OFF_F32_CNTL;
     else if (reg_idx == regSDMA0_GFX_RB_CNTL)   off = SMN_SDMA0_OFF_RB_CNTL;
     else if (reg_idx == regSDMA0_GFX_RB_BASE)    off = SMN_SDMA0_OFF_RB_BASE;
     else if (reg_idx == regSDMA0_GFX_RB_BASE_HI) off = SMN_SDMA0_OFF_RB_BASE_HI;
@@ -531,7 +534,13 @@ static int sdma_self_init(void)
     printf("[SDMA] Allocated ring: VA=%p PA=0x%llx size=%u\n",
            rb_va, (unsigned long long)rb_pa, SDMA_RB_BYTES);
 
-    /* Step 1: Halt — clear RB_ENABLE (write 0 to RB_CNTL) */
+    /* Check F32 state before init */
+    uint32_t f32_pre = gpu_read32(regSDMA0_F32_CNTL);
+    printf("[SDMA] F32_CNTL before init: 0x%08x (HALT=%u)\n",
+           f32_pre, f32_pre & 1);
+
+    /* Step 1: Halt F32 + disable ring */
+    gpu_write32(regSDMA0_F32_CNTL, 1);  /* HALT=1 */
     gpu_write32(regSDMA0_GFX_RB_CNTL, 0);
 
     /* Step 2: Set ring base address (hardware expects PA >> 8) */
@@ -549,11 +558,17 @@ static int sdma_self_init(void)
     uint32_t rb_cntl = (SDMA_RB_SIZE_LOG2 << 1) | 1;
     gpu_write32(regSDMA0_GFX_RB_CNTL, rb_cntl);
 
+    /* Step 5: Unhalt F32 — MUST come after ring setup (per AMD driver) */
+    gpu_write32(regSDMA0_F32_CNTL, 0);  /* HALT=0 */
+
     /* Verify */
     uint32_t verify_cntl = gpu_read32(regSDMA0_GFX_RB_CNTL);
     uint32_t verify_base = gpu_read32(regSDMA0_GFX_RB_BASE);
-    printf("[SDMA] Verify: RB_CNTL=0x%08x RB_BASE=0x%08x (expect 0x%08x, 0x%08x)\n",
-           verify_cntl, verify_base, rb_cntl, (uint32_t)(rb_pa >> 8));
+    uint32_t f32_post = gpu_read32(regSDMA0_F32_CNTL);
+    printf("[SDMA] Verify: RB_CNTL=0x%08x RB_BASE=0x%08x F32_CNTL=0x%08x\n",
+           verify_cntl, verify_base, f32_post);
+    printf("[SDMA] Expected: RB_CNTL=0x%08x RB_BASE=0x%08x F32_CNTL=0x00000000\n",
+           rb_cntl, (uint32_t)(rb_pa >> 8));
 
     if (verify_cntl != rb_cntl) {
         printf("[!] SDMA: RB_CNTL verify failed\n");
@@ -565,7 +580,7 @@ static int sdma_self_init(void)
     g_rb_pa = rb_pa;
     g_rb_size = 1 << (((rb_cntl >> 1) & 0x1F) + 1);
 
-    printf("[SDMA] Ring initialized: PA=0x%llx size=%u bytes\n",
+    printf("[SDMA] Ring initialized: PA=0x%llx size=%u bytes F32 running\n",
            (unsigned long long)g_rb_pa, g_rb_size);
     return 0;
 }
