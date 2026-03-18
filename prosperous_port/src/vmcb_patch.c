@@ -108,7 +108,9 @@ static uint32_t g_smn_sdma0_status;  /* SMN addr of SDMA0 STATUS */
 #define SMN_SDMA0_OFF_RB_BASE     0x84
 #define SMN_SDMA0_OFF_RB_BASE_HI  0x88
 #define SMN_SDMA0_OFF_RB_RPTR     0x8C
+#define SMN_SDMA0_OFF_RB_RPTR_HI  0x90
 #define SMN_SDMA0_OFF_RB_WPTR     0x94
+#define SMN_SDMA0_OFF_RB_WPTR_HI  0x98
 
 /* ================================================================
  * Helpers
@@ -129,7 +131,9 @@ static uint32_t sdma_reg_to_smn(uint32_t reg_idx)
     else if (reg_idx == regSDMA0_GFX_RB_BASE)    off = SMN_SDMA0_OFF_RB_BASE;
     else if (reg_idx == regSDMA0_GFX_RB_BASE_HI) off = SMN_SDMA0_OFF_RB_BASE_HI;
     else if (reg_idx == regSDMA0_GFX_RB_RPTR)    off = SMN_SDMA0_OFF_RB_RPTR;
+    else if (reg_idx == regSDMA0_GFX_RB_RPTR_HI) off = SMN_SDMA0_OFF_RB_RPTR_HI;
     else if (reg_idx == regSDMA0_GFX_RB_WPTR)    off = SMN_SDMA0_OFF_RB_WPTR;
+    else if (reg_idx == regSDMA0_GFX_RB_WPTR_HI) off = SMN_SDMA0_OFF_RB_WPTR_HI;
     else return 0;
     return g_smn_sdma0_status + off;
 }
@@ -489,9 +493,86 @@ static int gpu_find(void)
  * ================================================================ */
 
 /*
- * Initialize SDMA by reading current ring buffer configuration.
- * The kernel/driver has already set up the SDMA engine — we
- * piggyback on the existing ring buffer.
+ * Allocate and configure SDMA GFX ring buffer from scratch.
+ * Used when the driver hasn't initialized SDMA (ring PA=0, RB_CNTL=0).
+ *
+ * Follows the AMD SDMA v5.x init sequence:
+ *   1. Halt ring (clear RB_ENABLE)
+ *   2. Set RB_BASE / RB_BASE_HI
+ *   3. Zero RPTR / WPTR
+ *   4. Set RB_CNTL with size + RB_ENABLE
+ */
+#define SDMA_RB_PAGES     1                    /* 4KB ring */
+#define SDMA_RB_BYTES     (SDMA_RB_PAGES * 4096)
+#define SDMA_RB_SIZE_LOG2 10                   /* log2(4096/4) = 10 dwords */
+
+static void *g_sdma_rb_va;  /* our allocated ring, NULL if piggy-backing */
+
+static int sdma_self_init(void)
+{
+    printf("[SDMA] Ring not initialized — setting up from scratch\n");
+
+    /* Allocate ring buffer page(s) */
+    void *rb_va = mmap(NULL, SDMA_RB_BYTES, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (rb_va == MAP_FAILED) {
+        printf("[!] SDMA: mmap ring buffer failed\n");
+        return -1;
+    }
+    memset(rb_va, 0, SDMA_RB_BYTES);
+
+    uint64_t rb_pa = va_to_pa((uint64_t)rb_va);
+    if (rb_pa == 0) {
+        printf("[!] SDMA: va_to_pa for ring buffer failed\n");
+        munmap(rb_va, SDMA_RB_BYTES);
+        return -2;
+    }
+
+    printf("[SDMA] Allocated ring: VA=%p PA=0x%llx size=%u\n",
+           rb_va, (unsigned long long)rb_pa, SDMA_RB_BYTES);
+
+    /* Step 1: Halt — clear RB_ENABLE (write 0 to RB_CNTL) */
+    gpu_write32(regSDMA0_GFX_RB_CNTL, 0);
+
+    /* Step 2: Set ring base address (hardware expects PA >> 8) */
+    gpu_write32(regSDMA0_GFX_RB_BASE,    (uint32_t)(rb_pa >> 8));
+    gpu_write32(regSDMA0_GFX_RB_BASE_HI, (uint32_t)(rb_pa >> 40));
+
+    /* Step 3: Zero read/write pointers */
+    gpu_write32(regSDMA0_GFX_RB_RPTR,    0);
+    gpu_write32(regSDMA0_GFX_RB_RPTR_HI, 0);
+    gpu_write32(regSDMA0_GFX_RB_WPTR,    0);
+    gpu_write32(regSDMA0_GFX_RB_WPTR_HI, 0);
+
+    /* Step 4: Set size + enable.
+     * RB_CNTL: bit 0 = RB_ENABLE, bits [6:1] = RB_SIZE (log2 of dwords) */
+    uint32_t rb_cntl = (SDMA_RB_SIZE_LOG2 << 1) | 1;
+    gpu_write32(regSDMA0_GFX_RB_CNTL, rb_cntl);
+
+    /* Verify */
+    uint32_t verify_cntl = gpu_read32(regSDMA0_GFX_RB_CNTL);
+    uint32_t verify_base = gpu_read32(regSDMA0_GFX_RB_BASE);
+    printf("[SDMA] Verify: RB_CNTL=0x%08x RB_BASE=0x%08x (expect 0x%08x, 0x%08x)\n",
+           verify_cntl, verify_base, rb_cntl, (uint32_t)(rb_pa >> 8));
+
+    if (verify_cntl != rb_cntl) {
+        printf("[!] SDMA: RB_CNTL verify failed\n");
+        munmap(rb_va, SDMA_RB_BYTES);
+        return -3;
+    }
+
+    g_sdma_rb_va = rb_va;
+    g_rb_pa = rb_pa;
+    g_rb_size = 1 << (((rb_cntl >> 1) & 0x1F) + 1);
+
+    printf("[SDMA] Ring initialized: PA=0x%llx size=%u bytes\n",
+           (unsigned long long)g_rb_pa, g_rb_size);
+    return 0;
+}
+
+/*
+ * Initialize SDMA — piggyback on existing ring if available,
+ * otherwise set up from scratch.
  */
 static int sdma_init(void)
 {
@@ -510,12 +591,13 @@ static int sdma_init(void)
            (unsigned long long)g_rb_pa, g_rb_size);
     printf("[SDMA] rptr=0x%x wptr=0x%x\n", rb_rptr, rb_wptr);
 
-    if (g_rb_pa == 0 || g_rb_size == 0) {
-        printf("[!] SDMA: Ring buffer not initialized by driver\n");
-        return -1;
+    if (g_rb_pa != 0 && (rb_cntl & 1)) {
+        printf("[SDMA] Using existing driver ring buffer\n");
+        return 0;
     }
 
-    return 0;
+    /* Driver didn't initialize SDMA — do it ourselves */
+    return sdma_self_init();
 }
 
 /*
