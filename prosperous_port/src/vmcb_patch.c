@@ -687,9 +687,14 @@ int vmcb_patch_disable_np(struct phys_rw_ctx *ctx)
         const char *smn_names[] = { "v1(0x12580)", "v2(0x13200)" };
         g_smn_sdma0_status = 0;
         for (int i = 0; i < 2; i++) {
-            uint32_t rb_cntl = gpu_smn_read32(smn_bases[i] + SMN_SDMA0_OFF_RB_CNTL);
-            printf("[SMN] SDMA0 %s RB_CNTL=0x%08x\n", smn_names[i], rb_cntl);
-            if (rb_cntl != 0 && rb_cntl != 0xFFFFFFFF) {
+            /* Probe STATUS register (offset 0x00) to detect SDMA presence.
+             * 0xFFFFFFFF = unmapped SMN address (no device).
+             * 0x00000000 = valid (SDMA idle).  Do NOT probe RB_CNTL for
+             * discovery — it's 0 when the ring is unconfigured (normal),
+             * and probing wrong SMN ranges can panic on Oberon. */
+            uint32_t status = gpu_smn_read32(smn_bases[i] + SMN_SDMA0_OFF_STATUS);
+            printf("[SMN] SDMA0 %s STATUS=0x%08x\n", smn_names[i], status);
+            if (status != 0xFFFFFFFF) {
                 g_smn_sdma0_status = smn_bases[i];
                 printf("[GPU] Using SMN SDMA0 base: %s\n", smn_names[i]);
                 break;
