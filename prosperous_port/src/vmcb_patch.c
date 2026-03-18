@@ -509,6 +509,30 @@ static int gpu_find(void)
 #define SDMA_RB_BYTES     (SDMA_RB_PAGES * 4096)
 #define SDMA_RB_SIZE_LOG2 10                   /* log2(4096/4) = 10 dwords */
 
+/*
+ * Dump SDMA engine state for diagnostics.
+ */
+static void sdma_dump_state(const char *label)
+{
+    uint32_t status   = gpu_read32(regSDMA0_STATUS_REG);
+    uint32_t f32_cntl = gpu_read32(regSDMA0_F32_CNTL);
+    uint32_t rb_cntl  = gpu_read32(regSDMA0_GFX_RB_CNTL);
+    uint32_t rb_base  = gpu_read32(regSDMA0_GFX_RB_BASE);
+    uint32_t rb_rptr  = gpu_read32(regSDMA0_GFX_RB_RPTR);
+    uint32_t rb_wptr  = gpu_read32(regSDMA0_GFX_RB_WPTR);
+
+    printf("[SDMA] %s: STATUS=0x%08x F32_CNTL=0x%08x RB_CNTL=0x%08x\n",
+           label, status, f32_cntl, rb_cntl);
+    printf("[SDMA] %s: RB_BASE=0x%08x RPTR=0x%x WPTR=0x%x\n",
+           label, rb_base, rb_rptr, rb_wptr);
+
+    /* Check firmware presence via UCODE registers (SMN direct) */
+    uint32_t ucode_addr = gpu_smn_read32(g_smn_sdma0_status - 0x180);  /* 0x12400 */
+    uint32_t ucode_data = gpu_smn_read32(g_smn_sdma0_status - 0x17C);  /* 0x12404 */
+    printf("[SDMA] %s: UCODE_ADDR=0x%08x UCODE_DATA=0x%08x\n",
+           label, ucode_addr, ucode_data);
+}
+
 static void *g_sdma_rb_va;  /* our allocated ring, NULL if piggy-backing */
 
 static int sdma_self_init(void)
@@ -580,38 +604,21 @@ static int sdma_self_init(void)
     g_rb_pa = rb_pa;
     g_rb_size = 1 << (((rb_cntl >> 1) & 0x1F) + 1);
 
-    printf("[SDMA] Ring initialized: PA=0x%llx size=%u bytes F32 running\n",
+    printf("[SDMA] Ring initialized: PA=0x%llx size=%u bytes\n",
            (unsigned long long)g_rb_pa, g_rb_size);
+
+    sdma_dump_state("post-init");
     return 0;
 }
 
 /*
- * Initialize SDMA — piggyback on existing ring if available,
- * otherwise set up from scratch.
+ * Initialize SDMA — always set up a fresh ring buffer.
+ * We cannot trust stale register state from previous runs
+ * since the backing memory has been freed.
  */
 static int sdma_init(void)
 {
-    uint32_t status = gpu_read32(regSDMA0_STATUS_REG);
-    uint32_t rb_cntl = gpu_read32(regSDMA0_GFX_RB_CNTL);
-    uint32_t rb_base_lo = gpu_read32(regSDMA0_GFX_RB_BASE);
-    uint32_t rb_base_hi = gpu_read32(regSDMA0_GFX_RB_BASE_HI);
-    uint32_t rb_rptr = gpu_read32(regSDMA0_GFX_RB_RPTR);
-    uint32_t rb_wptr = gpu_read32(regSDMA0_GFX_RB_WPTR);
-
-    g_rb_pa = ((uint64_t)rb_base_hi << 32) | ((uint64_t)rb_base_lo << 8);
-    g_rb_size = 1 << (((rb_cntl >> 1) & 0x1F) + 1);
-
-    printf("[SDMA] status=0x%08x cntl=0x%08x\n", status, rb_cntl);
-    printf("[SDMA] ring PA=0x%llx size=%u bytes\n",
-           (unsigned long long)g_rb_pa, g_rb_size);
-    printf("[SDMA] rptr=0x%x wptr=0x%x\n", rb_rptr, rb_wptr);
-
-    if (g_rb_pa != 0 && (rb_cntl & 1)) {
-        printf("[SDMA] Using existing driver ring buffer\n");
-        return 0;
-    }
-
-    /* Driver didn't initialize SDMA — do it ourselves */
+    sdma_dump_state("pre-init");
     return sdma_self_init();
 }
 
